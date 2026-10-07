@@ -2,7 +2,8 @@
 
 Darwin/Wine integration of [FEX](https://github.com/FEX-Emu/FEX), based on `FEX-2609.1`.
 Builds the x64 ARM64EC emulator (`xtajit64.dll`) and x86 WoW64 emulator (`xtajit.dll`)
-for ARM64-native Wine on macOS. Upstream source and licenses are retained.
+for ARM64-native Wine on macOS. Darwin modifications are licensed under [MIT](LICENSE);
+upstream FEX notices are retained in [LICENSE.upstream](LICENSE.upstream).
 
 ## Darwin patches
 
