@@ -1,0 +1,452 @@
+diff --git a/Source/Windows/WOW64/Module.cpp b/Source/Windows/WOW64/Module.cpp
+index 62a8dd2..aa31b29 100644
+--- a/Source/Windows/WOW64/Module.cpp
++++ b/Source/Windows/WOW64/Module.cpp
+@@ -129,6 +129,12 @@ namespace BridgeInstrs {
+   void* UnixCall {};
+ } // namespace BridgeInstrs
+ 
++uint64_t GuestBase {};
++
++void* GuestPtr(uint64_t Address) {
++  return Address ? reinterpret_cast<void*>(GuestBase + static_cast<uint32_t>(Address)) : nullptr;
++}
++
+ fextl::unique_ptr<FEXCore::Context::Context> CTX;
+ fextl::unique_ptr<FEX::DummyHandlers::DummySignalDelegator> SignalDelegator;
+ fextl::unique_ptr<WowSyscallHandler> SyscallHandler;
+@@ -218,6 +224,7 @@ void LoadStateFromWowContext(FEXCore::Core::InternalThreadState* Thread, uint64_
+ 
+   // The TEB is the only populated GDT entry by default
+   auto GDT = State.GetSegmentFromIndex(State, (Context->SegFs & 0xffff));
++  WowTEB = static_cast<uint32_t>(WowTEB - GuestBase);
+   State.SetGDTBase(GDT, WowTEB);
+   State.SetGDTLimit(GDT, 0xF'FFFFU);
+   State.fs_cached = WowTEB;
+@@ -450,7 +457,7 @@ public:
+   WowSyscallHandler() = default;
+ 
+   static void HandleSyscallImpl(FEXCore::Core::CpuStateFrame* Frame) {
+-    const uint64_t ReturnRIP = *(uint32_t*)(Frame->State.gregs[FEXCore::X86State::REG_RSP]); // Return address from the stack
++    const uint64_t ReturnRIP = *static_cast<uint32_t*>(GuestPtr(Frame->State.gregs[FEXCore::X86State::REG_RSP])); // Return address from the stack
+     uint64_t ReturnRSP = Frame->State.gregs[FEXCore::X86State::REG_RSP] + 4;                 // Stack pointer after popping return address
+     uint64_t ReturnRAX = 0;
+ 
+@@ -459,14 +466,14 @@ public:
+         unixlib_handle_t Handle;
+         UINT32 ID;
+         ULONG32 Args;
+-      }* StackArgs = reinterpret_cast<StackLayout*>(ReturnRSP);
++      }* StackArgs = static_cast<StackLayout*>(GuestPtr(ReturnRSP));
+ 
+       Frame->State.gregs[FEXCore::X86State::REG_RSP] = ReturnRSP + sizeof(StackLayout);
+       Frame->State.rip = ReturnRIP;
+ 
+       const auto TLS = GetTLS();
+       Context::UnlockJITContext(TLS);
+-      ReturnRAX = static_cast<uint64_t>(WineUnixCall(StackArgs->Handle, StackArgs->ID, ULongToPtr(StackArgs->Args)));
++      ReturnRAX = static_cast<uint64_t>(WineUnixCall(StackArgs->Handle, StackArgs->ID, GuestPtr(StackArgs->Args)));
+       Context::LockJITContext(TLS);
+       Frame->State.gregs[FEXCore::X86State::REG_RAX] = ReturnRAX;
+     } else if (Frame->State.rip == (uint64_t)BridgeInstrs::Syscall) {
+@@ -478,7 +485,7 @@ public:
+       const auto TLS = GetTLS();
+       Context::UnlockJITContext(TLS);
+       Wow64ProcessPendingCrossProcessItems();
+-      ReturnRAX = static_cast<uint64_t>(Wow64SystemServiceEx(static_cast<UINT>(EntryRAX), reinterpret_cast<UINT*>(ReturnRSP + 4)));
++      ReturnRAX = static_cast<uint64_t>(Wow64SystemServiceEx(static_cast<UINT>(EntryRAX), static_cast<UINT*>(GuestPtr(ReturnRSP + 4))));
+       Context::LockJITContext(TLS);
+       Frame->State.gregs[FEXCore::X86State::REG_RAX] = ReturnRAX;
+     }
+@@ -494,27 +501,29 @@ public:
+   }
+ 
+   std::optional<FEXCore::ExecutableFileSectionInfo> LookupExecutableFileSection(FEXCore::Core::InternalThreadState*, uint64_t Address) override {
+-    return ImageTracker->LookupExecutableFileSection(Address);
++    return ImageTracker->LookupExecutableFileSection(GuestBase + Address);
+   }
+ 
+   void MarkGuestExecutableRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) override {
+-    InvalidationTracker->ReprotectRWXIntervals(Start, Length);
++    InvalidationTracker->ReprotectRWXIntervals(GuestBase + Start, Length);
+   }
+ 
+   void InvalidateGuestCodeRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) override {
+-    InvalidationTracker->InvalidateAlignedInterval(Start, Length, false);
++    InvalidationTracker->InvalidateAlignedInterval(GuestBase + Start, Length, false);
+   }
+ 
+   void MarkOvercommitRange(uint64_t Start, uint64_t Length) override {
+     OvercommitTracker->MarkRange(Start, Length);
+   }
+ 
+   void UnmarkOvercommitRange(uint64_t Start, uint64_t Length) override {
+     OvercommitTracker->UnmarkRange(Start, Length);
+   }
+ 
+   FEXCore::HLE::ExecutableRangeInfo QueryGuestExecutableRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Address) override {
+-    return InvalidationTracker->QueryExecutableRange(Address);
++    auto Info = InvalidationTracker->QueryExecutableRange(GuestBase + Address);
++    if (Info.Size) Info.Base -= GuestBase;
++    return Info;
+   }
+ 
+   void PreCompile() override {
+@@ -533,6 +542,11 @@ void BTCpuProcessInit() {
+ 
+   FEXCore::Config::Set(FEXCore::Config::CONFIG_INTERPRETER_INSTALLED, "0");
+   FEXCore::Config::Set(FEXCore::Config::CONFIG_IS64BIT_MODE, "0");
++#ifdef FEX_GUEST_WINDOW
++  LOGMAN_THROW_A_FMT(NtQueryInformationProcess(NtCurrentProcess(), static_cast<PROCESSINFOCLASS>(1010), &GuestBase, sizeof(GuestBase), nullptr) == 0 &&
++                      GuestBase && !(GuestBase & 0xffffffffULL), "Wine guest window is unavailable or misaligned");
++  FEXCore::Config::Set(FEXCore::Config::CONFIG_GUEST32BASE, std::to_string(GuestBase));
++#endif
+   FEXCore::Config::Set(FEXCore::Config::CONFIG_APP_FILENAME, ExecutablePath);
+   FEXCore::Config::Set(FEXCore::Config::CONFIG_APP_CONFIG_NAME, ExecutableName);
+ 
+@@ -559,8 +573,8 @@ void BTCpuProcessInit() {
+   CTX->SetSyscallHandler(SyscallHandler.get());
+   CTX->InitCore();
+   Context::HandlerConfig.emplace(*CTX);
+-  InvalidationTracker.emplace(*CTX, Threads);
+-  ImageTracker.emplace(*CTX, false);
++  InvalidationTracker.emplace(*CTX, Threads, GuestBase);
++  ImageTracker.emplace(*CTX, false, GuestBase);
+ 
+   auto MainModule = reinterpret_cast<__TEB*>(NtCurrentTeb())->Peb->ImageBaseAddress;
+   HandleImageMap(reinterpret_cast<uint64_t>(MainModule), true);
+@@ -576,8 +590,8 @@ void BTCpuProcessInit() {
+   NtAllocateVirtualMemory(NtCurrentProcess(), &Addr, (1U << 31) - 1, &Size, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+   InvalidationTracker->HandleMemoryProtectionNotification(reinterpret_cast<uint64_t>(Addr), Size, PAGE_EXECUTE);
+   *reinterpret_cast<uint32_t*>(Addr) = 0x2ecd2ecd;
+-  BridgeInstrs::Syscall = Addr;
+-  BridgeInstrs::UnixCall = reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(Addr) + 2);
++  BridgeInstrs::Syscall = reinterpret_cast<void*>(static_cast<uint32_t>(reinterpret_cast<uint64_t>(Addr) - GuestBase));
++  BridgeInstrs::UnixCall = reinterpret_cast<void*>(static_cast<uint32_t>(reinterpret_cast<uint64_t>(Addr) - GuestBase + 2));
+ 
+   const auto Sym = GetProcAddress(NtDll, "__wine_unix_call_dispatcher");
+   if (Sym) {
+@@ -909,7 +923,7 @@ bool BTCpuResetToConsistentStateImpl(EXCEPTION_POINTERS* Ptrs) {
+       FEXCORE_PROFILE_INSTANT_INCREMENT(Thread, AccumulatedSMCCount, 1);
+       if (InvalidationTracker->HandleRWXAccessViolation(Thread, Context->Pc, FaultAddress)) {
+         if (CTX->IsAddressInCodeBuffer(Thread, Context->Pc) && !CTX->IsCurrentBlockSingleInst(Thread) &&
+-            CTX->IsAddressInCurrentBlock(Thread, FaultAddress & FEXCore::Utils::FEX_PAGE_MASK, FEXCore::Utils::FEX_PAGE_SIZE)) {
++            CTX->IsAddressInCurrentBlock(Thread, static_cast<uint32_t>(FaultAddress - GuestBase) & FEXCore::Utils::FEX_PAGE_MASK, FEXCore::Utils::FEX_PAGE_SIZE)) {
+           Context::ReconstructThreadState(TLS, Context);
+           LogMan::Msg::DFmt("Handled inline self-modifying code: pc: {:X} rip: {:X} fault: {:X}", Context->Pc,
+                             Thread->CurrentFrame->State.rip, FaultAddress);
+@@ -945,6 +959,7 @@ bool BTCpuResetToConsistentStateImpl(EXCEPTION_POINTERS* Ptrs) {
+   BOOL FirstChance = TRUE;
+   EXCEPTION_RECORD GuestException =
+     FEX::Windows::HandleGuestException(Fault, *Exception, WowContext.Eip, WowContext.Eax, WowContext.Ecx, FirstChance);
++  GuestException.ExceptionAddress = GuestPtr(reinterpret_cast<uint64_t>(GuestException.ExceptionAddress));
+   if (GuestException.ExceptionCode == EXCEPTION_SINGLE_STEP) {
+     WowContext.EFlags &= ~(1 << FEXCore::X86State::RFLAG_TF_RAW_LOC);
+   }
+diff --git a/Source/Windows/Common/InvalidationTracker.h b/Source/Windows/Common/InvalidationTracker.h
+index d2a80bc..b8c4f0f 100644
+--- a/Source/Windows/Common/InvalidationTracker.h
++++ b/Source/Windows/Common/InvalidationTracker.h
+@@ -22,7 +22,7 @@ namespace FEX::Windows {
+  */
+ class InvalidationTracker {
+ public:
+-  InvalidationTracker(FEXCore::Context::Context& CTX, const std::unordered_map<DWORD, FEXCore::Core::InternalThreadState*>& Threads);
++  InvalidationTracker(FEXCore::Context::Context& CTX, const std::unordered_map<DWORD, FEXCore::Core::InternalThreadState*>& Threads, uint64_t GuestBase = 0);
+   void HandleMemoryProtectionNotification(uint64_t Address, uint64_t Size, ULONG Prot);
+   void HandleProcessExecuteFlagsChange(ULONG Flags);
+   void HandleImageMap(std::string_view Name, uint64_t Address);
+@@ -63,6 +63,7 @@ private:
+   std::shared_mutex IntervalsLock;
+   FEXCore::Context::Context& CTX;
+   const std::unordered_map<DWORD, FEXCore::Core::InternalThreadState*>& Threads;
++  const uint64_t GuestBase;
+   bool SMCDetectionDisabled {false};                    // Protected by IntervalsLock
+   bool DEPDisabled {false};                             // Protected by IntervalsLock
+   FEXCore::IntervalList<uint64_t> DEPPromotedIntervals; // Protected by IntervalsLock
+diff --git a/Source/Windows/Common/InvalidationTracker.cpp b/Source/Windows/Common/InvalidationTracker.cpp
+index 155403d..adbafb4 100644
+--- a/Source/Windows/Common/InvalidationTracker.cpp
++++ b/Source/Windows/Common/InvalidationTracker.cpp
+@@ -11,16 +11,17 @@
+ #include <winternl.h>
+ 
+ namespace FEX::Windows {
+-InvalidationTracker::InvalidationTracker(FEXCore::Context::Context& CTX, const std::unordered_map<DWORD, FEXCore::Core::InternalThreadState*>& Threads)
++InvalidationTracker::InvalidationTracker(FEXCore::Context::Context& CTX, const std::unordered_map<DWORD, FEXCore::Core::InternalThreadState*>& Threads, uint64_t GuestBase)
+   : CTX {CTX}
+-  , Threads {Threads} {
++  , Threads {Threads}
++  , GuestBase {GuestBase} {
+   FEX_CONFIG_OPT(SMCChecks, SMCCHECKS);
+   SMCDetectionDisabled = (SMCChecks == FEXCore::Config::CONFIG_SMC_NONE);
+ 
+   MEMORY_BASIC_INFORMATION Info;
+-  uint64_t Address = 0;
++  uint64_t Address = GuestBase;
+ 
+-  while (VirtualQuery(reinterpret_cast<LPCVOID>(Address), &Info, sizeof(Info))) {
++  while ((!GuestBase || Address - GuestBase < (1ULL << 32)) && VirtualQuery(reinterpret_cast<LPCVOID>(Address), &Info, sizeof(Info))) {
+     uint64_t BaseAddress = reinterpret_cast<uint64_t>(Info.BaseAddress);
+     if (Info.State == MEM_COMMIT) {
+       HandleMemoryProtectionNotification(BaseAddress, Info.RegionSize, Info.Protect);
+@@ -272,7 +273,8 @@ void InvalidationTracker::DetectMonoBackpatcherBlock(FEXCore::Core::InternalThre
+     return;
+   }
+ 
+-  uint64_t RIP = CTX.RestoreRIPFromHostPC(Thread, HostPc);
++  uint64_t GuestRIP = CTX.RestoreRIPFromHostPC(Thread, HostPc);
++  uint64_t RIP = GuestBase + GuestRIP;
+   if (!RIP || RIP < MonoBase || RIP >= MonoEnd) {
+     return;
+   }
+@@ -289,7 +291,7 @@ void InvalidationTracker::DetectMonoBackpatcherBlock(FEXCore::Core::InternalThre
+     std::scoped_lock CodeLock(CTX.GetCodeInvalidationMutex());
+     CTX.MarkMonoBackpatcherBlock(BlockEntry);
+   }
+-  InvalidateAlignedInterval(BlockEntry, FEXCore::Utils::FEX_PAGE_SIZE, false);
++  InvalidateAlignedInterval(GuestBase + BlockEntry, FEXCore::Utils::FEX_PAGE_SIZE, false);
+ }
+ 
+ void InvalidationTracker::DisableSMCDetection() {
+@@ -331,7 +333,11 @@ void InvalidationTracker::InvalidateIntervalInternal(uint64_t Address, uint64_t
+ }
+ 
+ void InvalidationTracker::InvalidateIntervalInternalLocked(uint64_t Address, uint64_t Size) {
+-  // NOTE: This assumes CodeInvalidationMutex is locked by the caller
++  // Host intervals are converted only at the FEX guest-cache boundary.
++  if (GuestBase) {
++    if (Address < GuestBase || Address - GuestBase >= (1ULL << 32)) return;
++    Address -= GuestBase;
++  }
+   CTX.InvalidateCodeBuffersCodeRange(Address, Size);
+   for (auto Thread : Threads) {
+     CTX.InvalidateThreadCachedCodeRange(Thread.second, Address, Size);
+diff --git a/Source/Windows/Common/ImageTracker.h b/Source/Windows/Common/ImageTracker.h
+index 438bcbc..b0df7da 100644
+--- a/Source/Windows/Common/ImageTracker.h
++++ b/Source/Windows/Common/ImageTracker.h
+@@ -38,7 +38,7 @@ FEXCore::CodeMapFileId ComputeCodeMapId(std::string_view FileName, uint32_t Time
+  */
+ class ImageTracker : public FEXCore::CodeMapOpener {
+ public:
+-  ImageTracker(FEXCore::Context::Context& CTX, bool IsGeneratingCache);
++  ImageTracker(FEXCore::Context::Context& CTX, bool IsGeneratingCache, uint64_t GuestBase = 0);
+   FEXCore::ExecutableFileSectionInfo HandleImageMap(std::string_view Path, uint64_t Address, bool MainImage);
+   void HandleImageUnmap(uint64_t Address, uint64_t Size);
+ 
+@@ -72,6 +72,7 @@ private:
+ 
+   std::string ActiveCodeMapPath;
+   bool IsGeneratingCache;
++  const uint64_t GuestBase;
+ };
+ 
+ } // namespace FEX::Windows
+diff --git a/Source/Windows/Common/ImageTracker.cpp b/Source/Windows/Common/ImageTracker.cpp
+index c459c44..f38cd1e 100644
+--- a/Source/Windows/Common/ImageTracker.cpp
++++ b/Source/Windows/Common/ImageTracker.cpp
+@@ -41,7 +41,7 @@ FEXCore::CodeMapFileId ComputeCodeMapId(std::string_view FileName, uint32_t Time
+ }
+ 
+ static void LoadImageVolatileMetadata(fextl::set<uint64_t>& VolatileInstructions, FEXCore::IntervalList<uint64_t>& VolatileValidRanges,
+-                                      HMODULE Module, ArchImageNtHeaders* Nt, uint64_t Address, uint64_t EndAddress) {
++                                      HMODULE Module, ArchImageNtHeaders* Nt, uint64_t Address, uint64_t EndAddress, uint64_t GuestBase) {
+   ULONG Size;
+ 
+   const auto* LoadConfig =
+@@ -50,11 +50,11 @@ static void LoadImageVolatileMetadata(fextl::set<uint64_t>& VolatileInstructions
+     return;
+   }
+ 
+-  if (LoadConfig->VolatileMetadataPointer < Address || LoadConfig->VolatileMetadataPointer + sizeof(IMAGE_VOLATILE_METADATA) >= EndAddress) {
++  if (GuestBase + LoadConfig->VolatileMetadataPointer < Address || GuestBase + LoadConfig->VolatileMetadataPointer + sizeof(IMAGE_VOLATILE_METADATA) >= EndAddress) {
+     return;
+   }
+ 
+-  const auto* VolatileMetadata = reinterpret_cast<IMAGE_VOLATILE_METADATA*>(LoadConfig->VolatileMetadataPointer);
++  const auto* VolatileMetadata = reinterpret_cast<IMAGE_VOLATILE_METADATA*>(GuestBase + LoadConfig->VolatileMetadataPointer);
+   if (!VolatileMetadata || Address + VolatileMetadata->VolatileAccessTable + VolatileMetadata->VolatileAccessTableSize >= EndAddress ||
+       Address + VolatileMetadata->VolatileInfoRangeTable + VolatileMetadata->VolatileInfoRangeTableSize >= EndAddress) {
+     return;
+@@ -64,14 +64,14 @@ static void LoadImageVolatileMetadata(fextl::set<uint64_t>& VolatileInstructions
+   const auto* VolatileAccessTableEnd =
+     VolatileAccessTableBegin + (VolatileMetadata->VolatileAccessTableSize / sizeof(IMAGE_VOLATILE_RVA_METADATA));
+   for (auto It = VolatileAccessTableBegin; It != VolatileAccessTableEnd; It++) {
+-    VolatileInstructions.emplace(Address + It->Rva);
++    VolatileInstructions.emplace(Address - GuestBase + It->Rva);
+   }
+ 
+   const auto* VolatileInfoRangeTableBegin = reinterpret_cast<IMAGE_VOLATILE_RANGE_METADATA*>(Address + VolatileMetadata->VolatileInfoRangeTable);
+   const auto* VolatileInfoRangeTableEnd =
+     VolatileInfoRangeTableBegin + (VolatileMetadata->VolatileInfoRangeTableSize / sizeof(IMAGE_VOLATILE_RANGE_METADATA));
+   for (auto It = VolatileInfoRangeTableBegin; It != VolatileInfoRangeTableEnd; It++) {
+-    VolatileValidRanges.Insert({Address + It->Rva, Address + It->Rva + It->Size});
++    VolatileValidRanges.Insert({Address - GuestBase + It->Rva, Address - GuestBase + It->Rva + It->Size});
+   }
+ }
+ 
+@@ -112,10 +112,11 @@ static fextl::robin_map<uint32_t, FEXCore::GuestRelocationType> LoadImageRelocat
+   return Result;
+ }
+ 
+-ImageTracker::ImageTracker(FEXCore::Context::Context& CTX, bool IsGeneratingCache)
++ImageTracker::ImageTracker(FEXCore::Context::Context& CTX, bool IsGeneratingCache, uint64_t GuestBase)
+   : CTX {CTX}
+   , ExtendedMetaData {FEX::VolatileMetadata::ParseExtendedVolatileMetadata(ExtendedVolatileMetadataConfig())}
+-  , IsGeneratingCache {IsGeneratingCache} {}
++  , IsGeneratingCache {IsGeneratingCache}
++  , GuestBase {GuestBase} {}
+ 
+ ImageTracker::MappedImageInfo::MappedImageInfo(std::string_view Path, uint64_t Address, ArchImageNtHeaders* Nt,
+                                                fextl::robin_map<uint32_t, FEXCore::GuestRelocationType> Relocations)
+@@ -139,7 +140,7 @@ FEXCore::ExecutableFileSectionInfo ImageTracker::HandleImageMap(std::string_view
+     }();
+     std::unique_lock Lk {ImagesLock};
+     auto [It, Inserted] = MappedImages.emplace(std::piecewise_construct, std::forward_as_tuple(Address),
+-                                               std::forward_as_tuple(Path, Address, Nt, std::move(Relocations)));
++                                               std::forward_as_tuple(Path, Address - GuestBase, Nt, std::move(Relocations)));
+ 
+     if (!Inserted) {
+       return It->second.SectionInfo;
+@@ -185,12 +186,12 @@ FEXCore::ExecutableFileSectionInfo ImageTracker::HandleImageMap(std::string_view
+   uint64_t EndAddress = Address + Nt->OptionalHeader.SizeOfImage;
+   fextl::set<uint64_t> VolatileInstructions {};
+   FEXCore::IntervalList<uint64_t> VolatileValidRanges {};
+-  LoadImageVolatileMetadata(VolatileInstructions, VolatileValidRanges, Module, Nt, Address, EndAddress);
++  LoadImageVolatileMetadata(VolatileInstructions, VolatileValidRanges, Module, Nt, Address, EndAddress, GuestBase);
+   if (auto It = ExtendedMetaData.find(ID); It != ExtendedMetaData.end()) {
+-    FEX::VolatileMetadata::ApplyFEXExtendedVolatileMetadata(It->second, VolatileInstructions, VolatileValidRanges, Address, EndAddress);
++    FEX::VolatileMetadata::ApplyFEXExtendedVolatileMetadata(It->second, VolatileInstructions, VolatileValidRanges, Address - GuestBase, EndAddress - GuestBase);
+   }
+   if (auto It = ExtendedMetaData.find(fextl::string {ModuleName}); It != ExtendedMetaData.end()) {
+-    FEX::VolatileMetadata::ApplyFEXExtendedVolatileMetadata(It->second, VolatileInstructions, VolatileValidRanges, Address, EndAddress);
++    FEX::VolatileMetadata::ApplyFEXExtendedVolatileMetadata(It->second, VolatileInstructions, VolatileValidRanges, Address - GuestBase, EndAddress - GuestBase);
+   }
+ 
+   if (!VolatileInstructions.empty() || !VolatileValidRanges.Empty()) {
+@@ -203,7 +204,7 @@ FEXCore::ExecutableFileSectionInfo ImageTracker::HandleImageMap(std::string_view
+ 
+ void ImageTracker::HandleImageUnmap(uint64_t Address, uint64_t Size) {
+   std::scoped_lock Lock(CTX.GetCodeInvalidationMutex());
+-  CTX.RemoveForceTSOInformation(Address, Size);
++  CTX.RemoveForceTSOInformation(Address - GuestBase, Size);
+ 
+   std::unique_lock Lk {ImagesLock};
+   MappedImages.erase(Address);
+@@ -212,7 +213,7 @@ void ImageTracker::HandleImageUnmap(uint64_t Address, uint64_t Size) {
+ std::optional<FEXCore::ExecutableFileSectionInfo> ImageTracker::LookupExecutableFileSection(uint64_t Address) {
+   std::shared_lock Lk {ImagesLock};
+   auto It = MappedImages.upper_bound(Address);
+-  if (It == MappedImages.begin() || std::prev(It)->second.SectionInfo.EndVA <= Address) {
++  if (It == MappedImages.begin() || std::prev(It)->second.SectionInfo.EndVA + GuestBase <= Address) {
+     return {};
+   }
+   return std::prev(It)->second.SectionInfo;
+diff --git a/FEXCore/Source/Interface/Core/DiskCache.cpp b/FEXCore/Source/Interface/Core/DiskCache.cpp
+index 1ee8d6c..0ad8dbb 100644
+--- a/FEXCore/Source/Interface/Core/DiskCache.cpp
++++ b/FEXCore/Source/Interface/Core/DiskCache.cpp
+@@ -501,7 +501,7 @@ namespace DiskCache {
+       if (!AnonCaching) {
+         return std::nullopt;
+       }
+-      Thread->FrontendDecoder->DecodeLoop(reinterpret_cast<const uint8_t*>(GuestRIP), AnonPrefixGuestBytes);
++      Thread->FrontendDecoder->DecodeLoop(reinterpret_cast<const uint8_t*>(CTX->GetGuestBase() + GuestRIP), AnonPrefixGuestBytes);
+       const auto* BlockInfo = Thread->FrontendDecoder->GetDecodedBlockInfo();
+ 
+       XXH3_state_t HashState;
+@@ -513,11 +513,11 @@ namespace DiskCache {
+         uint64_t HashStart = SubBlock.Entry;
+         // skip over masked in-block data and data/etc gaps between blocks
+         for (auto& DataMask : SubBlock.DataMasks) {
+-          XXH3_64bits_update(&HashState, reinterpret_cast<const uint8_t*>(HashStart), DataMask.FieldAddress - HashStart);
++          XXH3_64bits_update(&HashState, reinterpret_cast<const uint8_t*>(CTX->GetGuestBase() + HashStart), DataMask.FieldAddress - HashStart);
+           HashStart = DataMask.FieldAddress + DataMask.ValueSize;
+         }
+         if (HashStart != SubBlock.Entry + SubBlock.Size) {
+-          XXH3_64bits_update(&HashState, reinterpret_cast<const uint8_t*>(HashStart), SubBlock.Size - (HashStart - SubBlock.Entry));
++          XXH3_64bits_update(&HashState, reinterpret_cast<const uint8_t*>(CTX->GetGuestBase() + HashStart), SubBlock.Size - (HashStart - SubBlock.Entry));
+         }
+       }
+       GuestCodeKey = XXH3_64bits_digest(&HashState);
+@@ -623,7 +623,7 @@ namespace DiskCache {
+           XXH3_state_t HashState;
+           XXH3_128bits_reset(&HashState);
+           for (uint32_t i = 0; i < Entry.GuestExtents.size(); i += 2) {
+-            XXH3_128bits_update(&HashState, reinterpret_cast<uint8_t*>(GuestRIP) + Entry.GuestExtents[i], Entry.GuestExtents[i + 1]);
++            XXH3_128bits_update(&HashState, reinterpret_cast<uint8_t*>(CTX->GetGuestBase() + GuestRIP) + Entry.GuestExtents[i], Entry.GuestExtents[i + 1]);
+           }
+           LiveGuestHash = XXH3_128bits_digest(&HashState);
+           LastFootprintHashed = CurrentFootprint;
+@@ -637,7 +637,7 @@ namespace DiskCache {
+           fextl::vector<uint8_t> GuestCode(Entry.GuestSize);
+           if (Entry.Size >= Entry.GuestSize && Entry.DB->ReadCacheBlob(Entry.Offset + Entry.Size - Entry.GuestSize, GuestCode)) {
+             const uint8_t* CachedGuest = GuestCode.data();
+-            const uint8_t* LiveGuest = reinterpret_cast<const uint8_t*>(GuestRIP);
++            const uint8_t* LiveGuest = reinterpret_cast<const uint8_t*>(CTX->GetGuestBase() + GuestRIP);
+             uint64_t DiffCount = 0;
+             uint64_t DiffOffset = 0;
+             for (uint32_t i = 0; i < Entry.GuestExtents.size(); i += 2) {
+diff --git a/FEXCore/Source/Interface/Core/CodeCache.cpp b/FEXCore/Source/Interface/Core/CodeCache.cpp
+index f6feedc..4dbad38 100644
+--- a/FEXCore/Source/Interface/Core/CodeCache.cpp
++++ b/FEXCore/Source/Interface/Core/CodeCache.cpp
+@@ -538,15 +538,15 @@ ApplyRIPMoveRelocation(ContextImpl& CTX, uint64_t GuestRIP, uint8_t RegisterInde
+   Emitter.LoadConstant(ARMEmitter::Size::i64Bit, ARMEmitter::Register(RegisterIndex), Pointer, CPU::Arm64Emitter::PadType::DOPAD);
+ }
+ 
+-static inline void ApplyPatchableDataRelocation(uint64_t SiteAddress, uint8_t ValueSize, uint8_t RegisterIndex, CPU::Arm64Emitter& Emitter) {
++static inline void ApplyPatchableDataRelocation(ContextImpl& CTX, uint64_t SiteAddress, uint8_t ValueSize, uint8_t RegisterIndex, CPU::Arm64Emitter& Emitter) {
+   uint64_t Value = 0;
+-  memcpy(&Value, reinterpret_cast<const void*>(SiteAddress), ValueSize);
++  memcpy(&Value, reinterpret_cast<const void*>(CTX.GetGuestBase() + SiteAddress), ValueSize);
+   Emitter.LoadConstant(ARMEmitter::Size::i64Bit, ARMEmitter::Register(RegisterIndex), Value, CPU::Arm64Emitter::PadType::DOPAD);
+ }
+ 
+-static inline int64_t ReadLiveGuestDisplacement(uint64_t SiteAddress, uint8_t ValueSize) {
++static inline int64_t ReadLiveGuestDisplacement(ContextImpl& CTX, uint64_t SiteAddress, uint8_t ValueSize) {
+   uint64_t Raw = 0;
+-  memcpy(&Raw, reinterpret_cast<const void*>(SiteAddress), ValueSize);
++  memcpy(&Raw, reinterpret_cast<const void*>(CTX.GetGuestBase() + SiteAddress), ValueSize);
+   // manual sign-extension from guest live bytes
+   // 1/2 sizes not permitted in DetectDataMasks currently
+   if (ValueSize == 4) {
+@@ -556,12 +556,12 @@ static inline int64_t ReadLiveGuestDisplacement(uint64_t SiteAddress, uint8_t Va
+   }
+ }
+ 
+-static inline void ApplyPatchableRIPLiteralRelocation(uint64_t SiteAddress, uint8_t ValueSize, CPU::Arm64Emitter& Emitter) {
+-  Emitter.dc64(SiteAddress + ValueSize + ReadLiveGuestDisplacement(SiteAddress, ValueSize));
++static inline void ApplyPatchableRIPLiteralRelocation(ContextImpl& CTX, uint64_t SiteAddress, uint8_t ValueSize, CPU::Arm64Emitter& Emitter) {
++  Emitter.dc64(SiteAddress + ValueSize + ReadLiveGuestDisplacement(CTX, SiteAddress, ValueSize));
+ }
+ 
+-static inline void ApplyPatchableRIPMoveRelocation(uint64_t SiteAddress, uint8_t ValueSize, uint8_t RegisterIndex, CPU::Arm64Emitter& Emitter) {
+-  const uint64_t Target = SiteAddress + ValueSize + ReadLiveGuestDisplacement(SiteAddress, ValueSize);
++static inline void ApplyPatchableRIPMoveRelocation(ContextImpl& CTX, uint64_t SiteAddress, uint8_t ValueSize, uint8_t RegisterIndex, CPU::Arm64Emitter& Emitter) {
++  const uint64_t Target = SiteAddress + ValueSize + ReadLiveGuestDisplacement(CTX, SiteAddress, ValueSize);
+   Emitter.LoadConstant(ARMEmitter::Size::i64Bit, ARMEmitter::Register(RegisterIndex), Target, CPU::Arm64Emitter::PadType::DOPAD);
+ }
+ 
+@@ -586,16 +586,16 @@ bool CodeCache::ApplyPackedCodeRelocations(uint64_t GuestEntry, std::span<std::b
+       break;
+     }
+     case FEXCore::CPU::RelocationTypes::RELOC_GUEST_PATCHABLE_DATA_MOVE: {
+-      ApplyPatchableDataRelocation(GuestEntry + Reloc.PatchableData.SiteOffset, Reloc.PatchableData.ValueSize,
++      ApplyPatchableDataRelocation(CTX, GuestEntry + Reloc.PatchableData.SiteOffset, Reloc.PatchableData.ValueSize,
+                                    Reloc.PatchableData.RegisterIndex, Emitter);
+       break;
+     }
+     case FEXCore::CPU::RelocationTypes::RELOC_GUEST_PATCHABLE_RIP_LITERAL: {
+-      ApplyPatchableRIPLiteralRelocation(GuestEntry + Reloc.PatchableData.SiteOffset, Reloc.PatchableData.ValueSize, Emitter);
++      ApplyPatchableRIPLiteralRelocation(CTX, GuestEntry + Reloc.PatchableData.SiteOffset, Reloc.PatchableData.ValueSize, Emitter);
+       break;
+     }
+     case FEXCore::CPU::RelocationTypes::RELOC_GUEST_PATCHABLE_RIP_MOVE: {
+-      ApplyPatchableRIPMoveRelocation(GuestEntry + Reloc.PatchableData.SiteOffset, Reloc.PatchableData.ValueSize,
++      ApplyPatchableRIPMoveRelocation(CTX, GuestEntry + Reloc.PatchableData.SiteOffset, Reloc.PatchableData.ValueSize,
+                                       Reloc.PatchableData.RegisterIndex, Emitter);
+       break;
+     }

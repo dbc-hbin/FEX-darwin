@@ -1,0 +1,40 @@
+Upstream: 517a1836ee7e71de504e9cc61aaf5791ac28f1a5
+Upstream: b1e54d803ba1473d2c3b6b8a92b377ef431b2394
+Wait for actual suspension before releasing another thread's emulator state.
+
+--- a/Source/Windows/ARM64EC/Module.cpp
++++ b/Source/Windows/ARM64EC/Module.cpp
+@@ -1043,5 +1043,5 @@
+ 
+-  auto ThreadDup = FEX::Windows::DupHandle(Thread, THREAD_QUERY_INFORMATION | THREAD_SUSPEND_RESUME);
++  auto ThreadDup = FEX::Windows::DupHandle(Thread, THREAD_QUERY_INFORMATION | THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT);
+ 
+   THREAD_BASIC_INFORMATION Info;
+   if (auto Err = NtQueryInformationThread(*ThreadDup, ThreadBasicInformation, &Info, sizeof(Info), nullptr); Err) {
+@@ -1057,5 +1057,6 @@
+     NtSuspendThread(*ThreadDup, NULL);
+     // This will wait for the thread to be suspended
++    TmpContext.ContextFlags = CONTEXT_CONTROL;
+     NtGetContextThread(*ThreadDup, &TmpContext);
+   }
+ 
+--- a/Source/Windows/WOW64/Module.cpp
++++ b/Source/Windows/WOW64/Module.cpp
+@@ -670,5 +670,5 @@
+ 
+-  auto ThreadDup = FEX::Windows::DupHandle(Thread, THREAD_QUERY_INFORMATION | THREAD_SUSPEND_RESUME);
++  auto ThreadDup = FEX::Windows::DupHandle(Thread, THREAD_QUERY_INFORMATION | THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT);
+ 
+   THREAD_BASIC_INFORMATION Info;
+   if (auto Err = NtQueryInformationThread(*ThreadDup, ThreadBasicInformation, &Info, sizeof(Info), nullptr); Err) {
+@@ -680,6 +680,10 @@
+   bool Self = ThreadTID == GetCurrentThreadId();
+   if (!Self) {
++    CONTEXT TmpContext;
+     // If we are suspending a thread that isn't ourselves, try to suspend it first so we know internal JIT locks aren't being held.
+     RtlWow64SuspendThread(*ThreadDup, NULL);
++    // This will wait for the thread to be suspended
++    TmpContext.ContextFlags = CONTEXT_CONTROL;
++    NtGetContextThread(*ThreadDup, &TmpContext);
+   }
+ 

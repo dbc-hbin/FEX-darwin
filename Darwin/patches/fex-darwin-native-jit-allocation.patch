@@ -1,0 +1,49 @@
+diff --git a/FEXCore/include/FEXCore/Utils/AllocatorHooks.h b/FEXCore/include/FEXCore/Utils/AllocatorHooks.h
+--- a/FEXCore/include/FEXCore/Utils/AllocatorHooks.h
++++ b/FEXCore/include/FEXCore/Utils/AllocatorHooks.h
+@@ -38,5 +38,7 @@
+ using VirtualNamePtr = void (*)(const char*, const void*, size_t);
+ using VirtualTHPPtr = void (*)(const void*, size_t, THPControl);
++using VirtualNativeJitPtr = long (*)(void**, size_t*);
++FEX_DEFAULT_VISIBILITY extern VirtualNativeJitPtr VirtualNativeJit;
+ struct HookPtrs {
+   VirtualNamePtr VirtualName;
+   VirtualTHPPtr VirtualTHPControl;
+@@ -45,3 +47,4 @@
+   VirtualJitWriteProtectPtr VirtualJitWriteProtect {};
++  VirtualNativeJitPtr VirtualNativeJit {};
+ };
+ FEX_DEFAULT_VISIBILITY void SetupHooks(size_t PageSize, HookPtrs Ptrs);
+@@ -55,3 +58,9 @@
+   if (Execute && VirtualJitWriteProtect) Flags &= ~MEM_TOP_DOWN;
++#ifndef ARCHITECTURE_arm64ec
++  if (Execute && VirtualNativeJit) {
++    if (!Commit || VirtualNativeJit(&Base, &Size)) return nullptr;
++    return Base;
++  }
++#endif
+ #ifdef ARCHITECTURE_arm64ec
+   MEM_EXTENDED_PARAMETER Parameter {};
+diff --git a/FEXCore/Source/Utils/Allocator.cpp b/FEXCore/Source/Utils/Allocator.cpp
+--- a/FEXCore/Source/Utils/Allocator.cpp
++++ b/FEXCore/Source/Utils/Allocator.cpp
+@@ -315,4 +315,5 @@
+ VirtualTHPPtr VirtualTHPControl {VirtualTHPNOP};
+ VirtualJitWriteProtectPtr VirtualJitWriteProtect {};
++VirtualNativeJitPtr VirtualNativeJit {};
+ 
+ void SetupHooks(size_t PageSize, HookPtrs Ptrs) {
+@@ -323,3 +324,4 @@
+   VirtualJitWriteProtect = Ptrs.VirtualJitWriteProtect;
++  VirtualNativeJit = Ptrs.VirtualNativeJit;
+   SetupAllocatorHooks(VirtualName);
+ }
+diff --git a/Source/Windows/Common/Allocator.cpp b/Source/Windows/Common/Allocator.cpp
+--- a/Source/Windows/Common/Allocator.cpp
++++ b/Source/Windows/Common/Allocator.cpp
+@@ -25,3 +25,5 @@
+     .VirtualJitWriteProtect = JitWriteProtect && JitWriteProtect(2) != UINT32_MAX ? JitWriteProtect : nullptr,
++    .VirtualNativeJit = reinterpret_cast<FEXCore::Allocator::VirtualNativeJitPtr>(
++      GetProcAddress(ntdll, "__wine_allocate_native_jit")),
+   };
+ 

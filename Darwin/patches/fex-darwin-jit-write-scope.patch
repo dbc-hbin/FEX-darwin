@@ -1,0 +1,223 @@
+diff --git a/FEXCore/include/FEXCore/Utils/AllocatorHooks.h b/FEXCore/include/FEXCore/Utils/AllocatorHooks.h
+--- a/FEXCore/include/FEXCore/Utils/AllocatorHooks.h
++++ b/FEXCore/include/FEXCore/Utils/AllocatorHooks.h
+@@ -3,6 +3,7 @@
+ #include <FEXCore/Utils/CompilerDefs.h>
+ #include <FEXCore/Utils/EnumOperators.h>
+ #include <FEXCore/Utils/LogManager.h>
++#include <FEXCore/Utils/JitWriteScope.h>
+ 
+ #ifndef _WIN32
+ #include <stdlib.h>
+@@ -37,8 +38,9 @@
+ using VirtualNamePtr = void (*)(const char*, const void*, size_t);
+ using VirtualTHPPtr = void (*)(const void*, size_t, THPControl);
+ struct HookPtrs {
+   VirtualNamePtr VirtualName;
+   VirtualTHPPtr VirtualTHPControl;
++  VirtualJitWriteProtectPtr VirtualJitWriteProtect {};
+ };
+ FEX_DEFAULT_VISIBILITY void SetupHooks(size_t PageSize, HookPtrs Ptrs);
+ #endif
+@@ -50,3 +52,4 @@
+   // Allocate top-down to avoid polluting the lower VA space, as even on 64-bit some programs (i.e. LuaJIT) require allocations below 4GB.
+   DWORD Flags = (Commit ? MEM_COMMIT : 0) | MEM_RESERVE | MEM_TOP_DOWN;
++  if (Execute && VirtualJitWriteProtect) Flags &= ~MEM_TOP_DOWN;
+ #ifdef ARCHITECTURE_arm64ec
+diff --git a/FEXCore/include/FEXCore/Utils/JitWriteScope.h b/FEXCore/include/FEXCore/Utils/JitWriteScope.h
+new file mode 100644
+--- /dev/null
++++ b/FEXCore/include/FEXCore/Utils/JitWriteScope.h
+@@ -0,0 +1,31 @@
++// SPDX-License-Identifier: MIT
++#pragma once
++#include <FEXCore/Utils/CompilerDefs.h>
++#include <cstdint>
++
++namespace FEXCore::Allocator {
++using VirtualJitWriteProtectPtr = uint32_t (*)(uint32_t);
++#ifdef _WIN32
++FEX_DEFAULT_VISIBILITY extern VirtualJitWriteProtectPtr VirtualJitWriteProtect;
++#endif
++
++// Restore the previous thread mode, including nested compilation/patching scopes.
++// Other threads retain their executable mapping throughout code publication.
++class JitWriteScope {
++public:
++  JitWriteScope() {
++#ifdef _WIN32
++    if (VirtualJitWriteProtect) Previous = VirtualJitWriteProtect(0);
++#endif
++  }
++  ~JitWriteScope() {
++#ifdef _WIN32
++    if (VirtualJitWriteProtect) VirtualJitWriteProtect(Previous);
++#endif
++  }
++  JitWriteScope(const JitWriteScope&) = delete;
++  JitWriteScope& operator=(const JitWriteScope&) = delete;
++private:
++  uint32_t Previous {1};
++};
++} // namespace FEXCore::Allocator
+diff --git a/FEXCore/Source/Utils/Allocator.cpp b/FEXCore/Source/Utils/Allocator.cpp
+--- a/FEXCore/Source/Utils/Allocator.cpp
++++ b/FEXCore/Source/Utils/Allocator.cpp
+@@ -313,11 +313,13 @@
+ 
+ VirtualNamePtr VirtualName {VirtualNameNOP};
+ VirtualTHPPtr VirtualTHPControl {VirtualTHPNOP};
++VirtualJitWriteProtectPtr VirtualJitWriteProtect {};
+ 
+ void SetupHooks(size_t PageSize, HookPtrs Ptrs) {
+   VirtualName = Ptrs.VirtualName;
+   VirtualTHPControl = Ptrs.VirtualTHPControl;
++  VirtualJitWriteProtect = Ptrs.VirtualJitWriteProtect;
+   SetupAllocatorHooks(VirtualName);
+ }
+ 
+ #endif
+diff --git a/Source/Windows/Common/Allocator.cpp b/Source/Windows/Common/Allocator.cpp
+--- a/Source/Windows/Common/Allocator.cpp
++++ b/Source/Windows/Common/Allocator.cpp
+@@ -18,8 +18,11 @@
+   FEXCore::Allocator::HookPtrs Ptrs {};
+ 
++  const auto JitWriteProtect = reinterpret_cast<FEXCore::Allocator::VirtualJitWriteProtectPtr>(
++    GetProcAddress(ntdll, "__wine_jit_write_protect"));
+   Ptrs = {
+     .VirtualName = UnixLib::VirtualName,
+     .VirtualTHPControl = UnixLib::VirtualTHPControl,
++    .VirtualJitWriteProtect = JitWriteProtect && JitWriteProtect(2) != UINT32_MAX ? JitWriteProtect : nullptr,
+   };
+ 
+   SYSTEM_INFO system_info {};
+diff --git a/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp b/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp
+--- a/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp
++++ b/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp
+@@ -53,6 +53,7 @@
+ 
+ void Dispatcher::EmitDispatcher() {
++  FEXCore::Allocator::JitWriteScope Writable;
+   // Don't modify TMP3 since it contains our RIP once the block doesn't exist
+   auto RipReg = TMP3;
+ #ifdef VIXL_DISASSEMBLER
+   const auto DisasmBegin = GetCursorAddress<const vixl::aarch64::Instruction*>();
+diff --git a/FEXCore/Source/Interface/Core/JIT/JIT.cpp b/FEXCore/Source/Interface/Core/JIT/JIT.cpp
+--- a/FEXCore/Source/Interface/Core/JIT/JIT.cpp
++++ b/FEXCore/Source/Interface/Core/JIT/JIT.cpp
+@@ -25,6 +25,7 @@
+ #include <FEXCore/Core/X86Enums.h>
+ #include <FEXCore/Debug/InternalThreadState.h>
+ #include <FEXCore/Utils/Allocator.h>
++#include <FEXCore/Utils/AllocatorHooks.h>
+ #include <FEXCore/Utils/CompilerDefs.h>
+ #include <FEXCore/Utils/EnumUtils.h>
+ #include <FEXCore/Utils/LogManager.h>
+@@ -499,6 +500,7 @@
+ 
+ static void DirectBlockDelinker(FEXCore::Context::ExitFunctionLinkData* Record, bool Call) {
++  FEXCore::Allocator::JitWriteScope Writable;
+   uintptr_t JumpThunkStartAddress = reinterpret_cast<uintptr_t>(Record) - 0x10;
+   uintptr_t CallerAddress = JumpThunkStartAddress + Record->CallerOffset;
+   auto BranchOffset = JumpThunkStartAddress / 4 - CallerAddress / 4;
+ 
+@@ -517,6 +519,7 @@
+ 
+ static void IndirectBlockDelinker(FEXCore::Context::ExitFunctionLinkData* Record) {
++  FEXCore::Allocator::JitWriteScope Writable;
+   uintptr_t JumpThunkStartAddress = reinterpret_cast<uintptr_t>(Record) - 0x10;
+   uint32_t BranchInst = 0;
+   ARMEmitter::Emitter BranchEmit(reinterpret_cast<uint8_t*>(&BranchInst), 4);
+   // Restore branch +2 instructions to jump to the linker block
+@@ -530,6 +533,7 @@
+ 
+ uint64_t Arm64JITCore::ExitFunctionLink(FEXCore::Core::CpuStateFrame* Frame, FEXCore::Context::ExitFunctionLinkData* Record) {
++  FEXCore::Allocator::JitWriteScope Writable;
+   auto Thread = Frame->Thread;
+   bool TFSet = Thread->CurrentFrame->State.flags[X86State::RFLAG_TF_RAW_LOC];
+   uintptr_t HostCode {};
+   auto GuestRip = Record->GuestRIP;
+@@ -843,6 +847,7 @@
+ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size, bool SingleInst, const FEXCore::IR::IRListView* IR,
+                                                    FEXCore::Core::DebugData* DebugData, bool CheckTF) {
++  FEXCore::Allocator::JitWriteScope Writable;
+   FEXCORE_PROFILE_SCOPED("Arm64::CompileCode");
+ 
+   const auto PrevNumAllocations = Relocations.size();
+ 
+@@ -1166,6 +1171,7 @@
+ 
+ CPUBackend::CompiledCode Arm64JITCore::LoadCachedCode(std::span<const uint8_t> HostBytes) {
++  FEXCore::Allocator::JitWriteScope Writable;
+   // we stored it aligned, better still be?
+   LOGMAN_THROW_A_FMT(HostBytes.size() % 16 == 0, "Needs to be 16B aligned!");
+   auto AllocatedInfo = AllocateCodeBufferInSharedCache(HostBytes.size());
+ 
+diff --git a/FEXCore/Source/Interface/Core/CodeCache.cpp b/FEXCore/Source/Interface/Core/CodeCache.cpp
+--- a/FEXCore/Source/Interface/Core/CodeCache.cpp
++++ b/FEXCore/Source/Interface/Core/CodeCache.cpp
+@@ -929,6 +929,7 @@
+ 
+ void CodeCache::FinalizeCodePages(MappedCodeCacheFile& Code, std::span<std::byte> CodeRange) {
++  FEXCore::Allocator::JitWriteScope Writable;
+   const size_t StartOffset = CodeRange.data() - Code.CodeBuffer.data();
+   const auto StartPage = StartOffset / Utils::FEX_PAGE_SIZE;
+   const auto EndPage = StartPage + CodeRange.size_bytes() / Utils::FEX_PAGE_SIZE;
+   const size_t Size = CodeRange.size_bytes();
+diff --git a/FEXCore/Source/Interface/Core/SharedCodeBufferManager.h b/FEXCore/Source/Interface/Core/SharedCodeBufferManager.h
+--- a/FEXCore/Source/Interface/Core/SharedCodeBufferManager.h
++++ b/FEXCore/Source/Interface/Core/SharedCodeBufferManager.h
+@@ -69,7 +69,7 @@
+ 
+   // Returns the total number of bytes available for storing code
+   size_t UsableSize() const {
+-    return AllocatedSize - FEXCore::Utils::FEX_PAGE_SIZE;
++    return AllocatedSize - GuardSize;
+   }
+ 
+   // Returns the full size of the buffer, including the guard page.
+@@ -95,6 +95,7 @@
+   uint8_t* Ptr;
+   uint8_t* CodeBufferEnd;
+   size_t AllocatedSize; // including guard page; see UsableSize()
++  size_t GuardSize {FEXCore::Utils::FEX_PAGE_SIZE};
+ 
+   // Code buffer allocation information.
+   std::atomic<uint8_t*> CodeBufferOffset {};
+diff --git a/FEXCore/Source/Interface/Core/SharedCodeBufferManager.cpp b/FEXCore/Source/Interface/Core/SharedCodeBufferManager.cpp
+--- a/FEXCore/Source/Interface/Core/SharedCodeBufferManager.cpp
++++ b/FEXCore/Source/Interface/Core/SharedCodeBufferManager.cpp
+@@ -21,9 +21,12 @@
+   Ptr = static_cast<uint8_t*>(FEXCore::Allocator::VirtualAlloc(Size, true));
+   LOGMAN_THROW_A_FMT(!!Ptr, "Couldn't allocate code buffer");
+ 
++#ifdef _WIN32
++  if (FEXCore::Allocator::VirtualJitWriteProtect) GuardSize = 16384;
++#endif
+   // Protect the last page of the allocated buffer to trigger SIGSEGV on write access
+-  uintptr_t LastPageAddr = AlignDown(reinterpret_cast<uintptr_t>(Ptr) + Size - 1, FEXCore::Utils::FEX_PAGE_SIZE);
+-  if (!FEXCore::Allocator::VirtualProtect(reinterpret_cast<void*>(LastPageAddr), FEXCore::Utils::FEX_PAGE_SIZE,
++  uintptr_t LastPageAddr = AlignDown(reinterpret_cast<uintptr_t>(Ptr) + Size - 1, GuardSize);
++  if (!FEXCore::Allocator::VirtualProtect(reinterpret_cast<void*>(LastPageAddr), GuardSize,
+                                           FEXCore::Allocator::ProtectOptions::None)) {
+     LogMan::Msg::EFmt("Failed to mprotect last page of code buffer.");
+   }
+diff --git a/FEXCore/Source/Utils/ArchHelpers/Arm64.cpp b/FEXCore/Source/Utils/ArchHelpers/Arm64.cpp
+--- a/FEXCore/Source/Utils/ArchHelpers/Arm64.cpp
++++ b/FEXCore/Source/Utils/ArchHelpers/Arm64.cpp
+@@ -3,6 +3,7 @@
+ #include "Interface/Core/CPUBackend.h"
+ #include "Interface/Context/Context.h"
+ #include <FEXCore/Utils/SpinWaitLock.h>
++#include <FEXCore/Utils/JitWriteScope.h>
+ 
+ #include <FEXCore/Debug/InternalThreadState.h>
+ #include <FEXCore/Utils/EnumUtils.h>
+@@ -1931,5 +1932,6 @@
+ [[nodiscard]]
+ std::optional<int32_t> HandleUnalignedAccess(FEXCore::Core::InternalThreadState* Thread, UnalignedHandlerType HandleType,
+                                              uintptr_t ProgramCounter, uint64_t* GPRs, bool IsJIT) {
++  const FEXCore::Allocator::JitWriteScope JitWrite;
+ #ifdef ARCHITECTURE_arm64
+   constexpr bool is_arm64 = true;
