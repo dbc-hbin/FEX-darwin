@@ -25,7 +25,7 @@ SUBMODULES = ("External/fmt", "External/range-v3", "External/rpmalloc",
               "External/unordered_dense", "External/xxhash", "Source/Common/cpp-optparse")
 VARIANTS = (("arm64ec", "arm64ec-w64-mingw32", "arm64ecfex", "ARM64EC", "xtajit64.dll"),
             ("wow64", "aarch64-w64-mingw32", "wow64fex", "WOW64", "xtajit.dll"))
-LICENSES = {"LICENSE": "MIT", "External/fmt/LICENSE": "MIT",
+LICENSES = {"LICENSE": "MIT", "LICENSE.upstream": "MIT (upstream FEX)", "External/fmt/LICENSE": "MIT",
             "External/range-v3/LICENSE.txt": "BSL-1.0 and bundled notices",
             "External/rpmalloc/LICENSE": "permissive no-attribution grant",
             "External/unordered_dense/LICENSE": "MIT", "External/xxhash/LICENSE": "BSD-2-Clause",
