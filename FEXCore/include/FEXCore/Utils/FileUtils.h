@@ -6,6 +6,7 @@
 #include <FEXCore/Utils/CompilerDefs.h>
 
 namespace FEXCore::FileUtils {
+// Paths and returned entry names use UTF-8, including on Windows.
 /**
  * @brief Removes an entirely directory passed in. Including the path itself.
  *
@@ -17,3 +18,4 @@ FEX_DEFAULT_VISIBILITY void WalkDirectory(std::string_view Directory,
                                           fextl::move_only_function<void(std::string_view name, bool is_dir, const void* user_data)> Callback,
                                           const void* user_data);
 } // namespace FEXCore::FileUtils
+

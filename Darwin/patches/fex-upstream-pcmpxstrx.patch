@@ -1,0 +1,749 @@
+# Selected FEX SSE4.2 string-comparison backport onto the Darwin FEX-2609.1 build.
+# Upstream: 638329278cb81ae1f30032c110d428e33c7f4250
+# Follow-ups: e2f0cf41d8434510e40ccbcf4171a5ea128acaec,
+# 0206479a08e2667177d93beb3181e752de54990a, af8770005b3258e2674c7278a95b2b3b27584171.
+# Excludes generated InstructionCountCI data; fex_pcmp_probe.cpp checks all modes.
+# The companion disk-cache patch assigns a distinct owned code-cache version.
+diff --git a/FEXCore/Source/Interface/Core/CPUBackend.cpp b/FEXCore/Source/Interface/Core/CPUBackend.cpp
+index ed77028..ac39051 100644
+--- a/FEXCore/Source/Interface/Core/CPUBackend.cpp
++++ b/FEXCore/Source/Interface/Core/CPUBackend.cpp
+@@ -16,6 +16,7 @@ namespace CPU {
+   constexpr static uint64_t NamedVectorConstants[FEXCore::IR::NamedVectorConstant::NAMED_VECTOR_CONST_POOL_MAX][2] = {
+     {0x0003'0002'0001'0000ULL, 0x0007'0006'0005'0004ULL}, // NAMED_VECTOR_INCREMENTAL_U16_INDEX
+     {0x000B'000A'0009'0008ULL, 0x000F'000E'000D'000CULL}, // NAMED_VECTOR_INCREMENTAL_U16_INDEX_UPPER
++    {0x0706'0504'0302'0100ULL, 0x0F0E'0D0C'0B0A'0908ULL}, // NAMED_VECTOR_INCREMENTAL_U8_INDEX
+     {0x0000'0000'8000'0000ULL, 0x0000'0000'8000'0000ULL}, // NAMED_VECTOR_PADDSUBPS_INVERT
+     {0x0000'0000'8000'0000ULL, 0x0000'0000'8000'0000ULL}, // NAMED_VECTOR_PADDSUBPS_INVERT_UPPER
+     {0x8000'0000'0000'0000ULL, 0x0000'0000'0000'0000ULL}, // NAMED_VECTOR_PADDSUBPD_INVERT
+diff --git a/FEXCore/Source/Interface/Core/Interpreter/Fallbacks/InterpreterFallbacks.cpp b/FEXCore/Source/Interface/Core/Interpreter/Fallbacks/InterpreterFallbacks.cpp
+index a5dcd28..f203ba9 100644
+--- a/FEXCore/Source/Interface/Core/Interpreter/Fallbacks/InterpreterFallbacks.cpp
++++ b/FEXCore/Source/Interface/Core/Interpreter/Fallbacks/InterpreterFallbacks.cpp
+@@ -100,6 +100,7 @@ void InterpreterOps::FillFallbackIndexPointers(Core::FallbackABIInfo* Info, uint
+                                   reinterpret_cast<uint64_t>(&FEXCore::CPU::OpHandlers<IR::OP_F64SCALE>::handle)};
+ 
+   // SSE4.2 string instructions
++  // NOTE: Currently unused. See VectorFallbacks.h.
+   Info[Core::OPINDEX_VPCMPESTRX] = {ABIHandlers[FABI_I32_I64_I64_V128_V128_I16],
+                                     reinterpret_cast<uint64_t>(&FEXCore::CPU::OpHandlers<IR::OP_VPCMPESTRX>::handle)};
+   Info[Core::OPINDEX_VPCMPISTRX] = {ABIHandlers[FABI_I32_V128_V128_I16],
+diff --git a/FEXCore/Source/Interface/Core/Interpreter/Fallbacks/StringCompareFallbacks.cpp b/FEXCore/Source/Interface/Core/Interpreter/Fallbacks/StringCompareFallbacks.cpp
+index 8658a3e..0801c36 100644
+--- a/FEXCore/Source/Interface/Core/Interpreter/Fallbacks/StringCompareFallbacks.cpp
++++ b/FEXCore/Source/Interface/Core/Interpreter/Fallbacks/StringCompareFallbacks.cpp
+@@ -8,6 +8,7 @@
+ 
+ #include <cstring>
+ 
++// NOTE: Currently unused. See VectorFallbacks.h.
+ namespace FEXCore::CPU {
+ #ifdef ARCHITECTURE_arm64
+ FEXCORE_PRESERVE_ALL_ATTR static int32_t GetImplicitLength(FEXCore::VectorRegType data, uint16_t control) {
+diff --git a/FEXCore/Source/Interface/Core/Interpreter/Fallbacks/VectorFallbacks.h b/FEXCore/Source/Interface/Core/Interpreter/Fallbacks/VectorFallbacks.h
+index 391c724..b197712 100644
+--- a/FEXCore/Source/Interface/Core/Interpreter/Fallbacks/VectorFallbacks.h
++++ b/FEXCore/Source/Interface/Core/Interpreter/Fallbacks/VectorFallbacks.h
+@@ -13,29 +13,33 @@
+ 
+ namespace FEXCore::CPU {
+ 
++// PCMPXSTRX control byte fields
++enum class AggregationOp {
++  EqualAny = 0b00,
++  Ranges = 0b01,
++  EqualEach = 0b10,
++  EqualOrdered = 0b11,
++};
++
++enum class SourceData {
++  U8,
++  U16,
++  S8,
++  S16,
++};
++
++enum class Polarity {
++  Positive,
++  Negative,
++  PositiveMasked,
++  NegativeMasked,
++};
++
++// NB: The fallback handlers for the *PMCP*STR* instructions
++// are no longer used since we now emit inline ASM for them.
++// We preserve this as a reference implementation.
+ template<>
+ struct OpHandlers<IR::OP_VPCMPESTRX> {
+-  enum class AggregationOp {
+-    EqualAny = 0b00,
+-    Ranges = 0b01,
+-    EqualEach = 0b10,
+-    EqualOrdered = 0b11,
+-  };
+-
+-  enum class SourceData {
+-    U8,
+-    U16,
+-    S8,
+-    S16,
+-  };
+-
+-  enum class Polarity {
+-    Positive,
+-    Negative,
+-    PositiveMasked,
+-    NegativeMasked,
+-  };
+-
+   FEXCORE_PRESERVE_ALL_ATTR static uint32_t handle(uint64_t RAX, uint64_t RDX, VectorRegType lhs_v, VectorRegType rhs_v, uint16_t control) {
+     __uint128_t lhs;
+     memcpy(&lhs, &lhs_v, sizeof(lhs));
+diff --git a/FEXCore/Source/Interface/Core/JIT/VectorOps.cpp b/FEXCore/Source/Interface/Core/JIT/VectorOps.cpp
+index 58160e9..196e763 100644
+--- a/FEXCore/Source/Interface/Core/JIT/VectorOps.cpp
++++ b/FEXCore/Source/Interface/Core/JIT/VectorOps.cpp
+@@ -2167,6 +2167,46 @@ DEF_OP(VCMPGT) {
+   }
+ }
+ 
++DEF_OP(VUCMPGT) {
++  const auto Op = IROp->C<IR::IROp_VUCMPGT>();
++  const auto OpSize = IROp->Size;
++
++  const auto ElementSize = Op->Header.ElementSize;
++  const auto SubRegSize = ConvertSubRegSizePair16(IROp);
++  const auto IsScalar = ElementSize == OpSize;
++  const auto Is256Bit = OpSize == IR::OpSize::i256Bit;
++  LOGMAN_THROW_A_FMT(!Is256Bit || HostSupportsSVE256, "Need SVE256 support in order to use {} with 256-bit operation", __func__);
++
++  const auto Dst = GetVReg(Node);
++  const auto Vector1 = GetVReg(Op->Vector1);
++  const auto Vector2 = GetVReg(Op->Vector2);
++
++  if (HostSupportsSVE256 && Is256Bit) {
++    const auto Mask = PRED_TMP_32B.Zeroing();
++    const auto ComparePred = ARMEmitter::PReg::p0;
++
++    // FIXME: We should rework this op to avoid the NZCV spill/fill dance.
++    mrs(TMP1, ARMEmitter::SystemRegister::NZCV);
++
++    // General idea is to compare for unsigned greater-than, bitwise NOT
++    // the valid values, then ORR the NOTed values with the original
++    // values to form entries that are all 1s.
++    cmphi(SubRegSize.Vector, ComparePred, Mask, Vector1.Z(), Vector2.Z());
++    not_(SubRegSize.Vector, VTMP1.Z(), ComparePred.Merging(), Vector1.Z());
++    movprfx(SubRegSize.Vector, Dst.Z(), ComparePred.Zeroing(), Vector1.Z());
++    orr(SubRegSize.Vector, Dst.Z(), ComparePred.Merging(), Dst.Z(), VTMP1.Z());
++
++    // Restore NZCV
++    msr(ARMEmitter::SystemRegister::NZCV, TMP1);
++  } else {
++    if (IsScalar) {
++      cmhi(SubRegSize.Scalar, Dst, Vector1, Vector2);
++    } else {
++      cmhi(SubRegSize.Vector, Dst.Q(), Vector1.Q(), Vector2.Q());
++    }
++  }
++}
++
+ DEF_OP(VCMPGTZ) {
+   const auto Op = IROp->C<IR::IROp_VCMPGTZ>();
+   const auto OpSize = IROp->Size;
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher.h b/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
+index ff5c389..47855a7 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
+@@ -1384,6 +1384,11 @@ private:
+                     const X86Tables::DecodedOperand& Imm, bool IsAVX);
+ 
+   void PCMPXSTRXOpImpl(OpcodeArgs, bool IsExplicit, bool IsMask, bool IsAVX);
++  Ref PCMPXSTRXSaturateExplicitLength(IR::OpSize ElementSize, IR::OpSize LengthSize, Ref RawLength);
++  Ref PCMPXSTRXEqualAny(IR::OpSize ElementSize, Ref Src1, Ref Src2, Ref Src1ValidElements, Ref Src2ValidElements);
++  Ref PCMPXSTRXRanges(IR::OpSize ElementSize, Ref Src1, Ref Src2, Ref Src1ValidElements, Ref Src2ValidElements, bool IsSigned);
++  Ref PCMPXSTRXEqualEach(IR::OpSize ElementSize, Ref Src1, Ref Src2, Ref Src1ValidElements, Ref Src2ValidElements);
++  Ref PCMPXSTRXEqualOrdered(IR::OpSize ElementSize, Ref Src1, Ref Src2, Ref Src1Length, Ref Src2Length, Ref Src1ValidElements, Ref Indices);
+ 
+   Ref PHADDSOpImpl(OpSize Size, Ref Src1, Ref Src2);
+ 
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher/Vector.cpp b/FEXCore/Source/Interface/Core/OpcodeDispatcher/Vector.cpp
+index 97d1292..a159862 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher/Vector.cpp
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher/Vector.cpp
+@@ -8,6 +8,7 @@ $end_info$
+ 
+ #include "Interface/Context/Context.h"
+ #include "Interface/Core/OpcodeDispatcher.h"
++#include "Interface/Core/Interpreter/Fallbacks/VectorFallbacks.h"
+ #include "Interface/Core/X86Tables/X86Tables.h"
+ #include "Interface/IR/IR.h"
+ 
+@@ -5360,6 +5361,132 @@ void OpDispatchBuilder::VPERMILRegOp(OpcodeArgs, IR::OpSize ElementSize) {
+   StoreResultFPR(Op, Result);
+ }
+ 
++// Computes the number of valid elements in a string for the explicit case,
++// where "valid" means that the character is not after the Nth character in the string.
++Ref OpDispatchBuilder::PCMPXSTRXSaturateExplicitLength(OpSize ElementSize, OpSize LengthSize, Ref RawLength) {
++  const uint32_t NumElements = IR::NumElements(OpSize::i128Bit, ElementSize);
++
++  SaveNZCV();
++  _SubNZCV(LengthSize, RawLength, Constant(0));
++  Ref AbsLength = _Neg(LengthSize, RawLength, CondClass::MI);
++  return _Select(OpSize::i32Bit, LengthSize, CondClass::ULT, AbsLength, Constant(NumElements), AbsLength, Constant(NumElements));
++}
++
++// Equal Any is a "is character in set" operation.
++// The set of characters is passed in Src1, and we then check if every
++// character in Src2 is in that set.
++Ref OpDispatchBuilder::PCMPXSTRXEqualAny(OpSize ElementSize, Ref Src1, Ref Src2, Ref Src1ValidElements, Ref Src2ValidElements) {
++  const uint32_t NumElements = IR::NumElements(OpSize::i128Bit, ElementSize);
++
++  // First we sanitize Src1, and zero out elements after the end of the string,
++  // removing them from the matching set.
++  Ref Src1Element0 = _VDupElement(OpSize::i128Bit, ElementSize, Src1, 0);
++  Ref SanitizedSrc1 = _VBSL(OpSize::i128Bit, Src1ValidElements, Src1, Src1Element0);
++
++  // Now walk through every element in Src1, broadcast it into a temporary vector,
++  // and compare it against every element in Src2, then OR the results
++  // together to get the final match vector.
++  Ref Matches = _VCMPEQ(OpSize::i128Bit, ElementSize, Src2, Src1Element0);
++  for (uint32_t i = 1; i < NumElements; i++) {
++    Ref Src1Element = _VDupElement(OpSize::i128Bit, ElementSize, SanitizedSrc1, i);
++    Ref ElementMatches = _VCMPEQ(OpSize::i128Bit, ElementSize, Src2, Src1Element);
++    Matches = _VOr(OpSize::i128Bit, Matches, ElementMatches);
++  }
++
++  // Handle the case where Src1 was entirely empty, and also sanitize the results
++  // for any NULLs in Src2, since those don't count towards matching.
++  Ref Src1NotEmpty = _VDupElement(OpSize::i128Bit, ElementSize, Src1ValidElements, 0);
++  Matches = _VAnd(OpSize::i128Bit, Matches, Src1NotEmpty);
++  return _VAnd(OpSize::i128Bit, Matches, Src2ValidElements);
++}
++
++
++// The ranges aggregation is a weird one. It checks if every character in Src2 is
++// within a character range (ie. a-z or A-Z) similar to regex.
++// Ranges are passed in Src1 as pairs of characters in adjacent lanes.
++Ref OpDispatchBuilder::PCMPXSTRXRanges(OpSize ElementSize, Ref Src1, Ref Src2, Ref Src1ValidElements, Ref Src2ValidElements, bool IsSigned) {
++  const uint32_t NumElements = IR::NumElements(OpSize::i128Bit, ElementSize);
++
++  // Signed or unsigned greater than comparison, based on the Imm8 value
++  const auto GreaterThan = [&](Ref Lhs, Ref Rhs) {
++    return IsSigned ? _VCMPGT(OpSize::i128Bit, ElementSize, Lhs, Rhs) : _VUCMPGT(OpSize::i128Bit, ElementSize, Lhs, Rhs);
++  };
++
++  // First we walk through the ranges from Src1, and construct
++  // temporary vectors to represent the lower and upper bounds
++  // of the comparison. Then check if both comparisons are true,
++  // zero out invalid lanes, and OR the result into the final result vector.
++  Ref Result {};
++  for (uint32_t i = 0; i < NumElements; i += 2) {
++    Ref LowerBound = _VDupElement(OpSize::i128Bit, ElementSize, Src1, i);
++    Ref UpperBound = _VDupElement(OpSize::i128Bit, ElementSize, Src1, i + 1);
++    Ref BelowLower = GreaterThan(LowerBound, Src2);
++    Ref AboveUpper = GreaterThan(Src2, UpperBound);
++
++    // A range is only valid if its upper bound is a valid Src1 element.
++    Ref RangeValid = _VDupElement(OpSize::i128Bit, ElementSize, Src1ValidElements, i + 1);
++
++    // RangeValid & ~BelowLower & ~AboveUpper
++    Ref InRange = _VAndn(OpSize::i128Bit, RangeValid, BelowLower);
++    InRange = _VAndn(OpSize::i128Bit, InRange, AboveUpper);
++    Result = Result ? _VOr(OpSize::i128Bit, Result, InRange) : InRange;
++  }
++
++  // Invalid (ie. NULL) Src2 characters don't count towards matching.
++  return _VAnd(OpSize::i128Bit, Result, Src2ValidElements);
++}
++
++// This aggregation is the simplest, and is the most similar
++// to strcmp(). It Just compares lanewise which characters are
++// equal in each string.
++Ref OpDispatchBuilder::PCMPXSTRXEqualEach(OpSize ElementSize, Ref Src1, Ref Src2, Ref Src1ValidElements, Ref Src2ValidElements) {
++  // Elements match when both are valid and equal, or when both are invalid.
++  Ref Equal = _VCMPEQ(OpSize::i128Bit, ElementSize, Src1, Src2);
++  Ref BothValid = _VAnd(OpSize::i128Bit, Src1ValidElements, Src2ValidElements);
++  Ref EitherValid = _VOr(OpSize::i128Bit, Src1ValidElements, Src2ValidElements);
++  Ref ValidMatches = _VAnd(OpSize::i128Bit, Equal, BothValid);
++  return _VOrn(OpSize::i128Bit, ValidMatches, EitherValid);
++}
++
++// EqualOrdered implements a strstr()-like semantic finding all instances
++// of the string Src1 in Src2.
++Ref OpDispatchBuilder::PCMPXSTRXEqualOrdered(OpSize ElementSize, Ref Src1, Ref Src2, Ref Src1Length, Ref Src2Length, Ref Src1ValidElements,
++                                             Ref Indices) {
++  const uint32_t NumElements = IR::NumElements(OpSize::i128Bit, ElementSize);
++
++  // Broadcast needle[i] into every lane of a temp vector, then compare it to
++  // the haystack vector. On succesive iterations, we shift the haystack over
++  // by one element, and compare it against the next needle element.
++  // AND together the results of all comparisons, and what is left should
++  // be a vector where the only 'true' elements are lanes where the full
++  // needle was found in the haystack, or those positions after the end of the string.
++  Ref Result {};
++  for (uint32_t i = 0; i < NumElements; i++) {
++    Ref Needle = _VDupElement(OpSize::i128Bit, ElementSize, Src1, i);
++    Ref Haystack = i == 0 ? Src2 : _VExtr(OpSize::i128Bit, ElementSize, Needle, Src2, i);
++    Ref ElementsEqual = _VCMPEQ(OpSize::i128Bit, ElementSize, Haystack, Needle);
++
++    // TODO: I think a more optimal version of this is possible, perhaps using
++    // MATCH from SVE2?
++    Ref ElementsValid = _VDupElement(OpSize::i128Bit, ElementSize, Src1ValidElements, i);
++    Ref ElementsEqualValid = _VOrn(OpSize::i128Bit, ElementsEqual, ElementsValid);
++
++    // Ternary to handle the first row case
++    Result = Result ? _VAnd(OpSize::i128Bit, Result, ElementsEqualValid) : ElementsEqualValid;
++  }
++
++  // Clear positions in the result after the end of the string.
++  Ref FirstClearedPosition = Add(OpSize::i32Bit, _Sub(OpSize::i32Bit, Src2Length, Src1Length), 1);
++  FirstClearedPosition =
++    _Select(OpSize::i32Bit, OpSize::i32Bit, CondClass::ULT, Src2Length, Constant(NumElements), FirstClearedPosition, Constant(NumElements));
++  FirstClearedPosition =
++    _Select(OpSize::i32Bit, OpSize::i32Bit, CondClass::EQ, Src1Length, Constant(0), Constant(NumElements), FirstClearedPosition);
++
++  Ref FirstClearedPositionVector = _VDupFromGPR(OpSize::i128Bit, ElementSize, FirstClearedPosition);
++  Ref KeptPositions = _VCMPGT(OpSize::i128Bit, ElementSize, FirstClearedPositionVector, Indices);
++  return _VAnd(OpSize::i128Bit, Result, KeptPositions);
++}
++
+ void OpDispatchBuilder::PCMPXSTRXOpImpl(OpcodeArgs, bool IsExplicit, bool IsMask, bool IsAVX) {
+   const uint16_t Control = Op->Src[1].Literal();
+ 
+@@ -5372,84 +5499,166 @@ void OpDispatchBuilder::PCMPXSTRXOpImpl(OpcodeArgs, bool IsExplicit, bool IsMask
+   Ref Src1 = LoadSourceFPR_WithOpSize(Op, Op->Dest, OpSize::i128Bit, Op->Flags);
+   Ref Src2 = LoadSourceFPR_WithOpSize(Op, Op->Src[0], OpSize::i128Bit, Op->Flags, {.Align = OpSize::i8Bit});
+ 
+-  Ref IntermediateResult {};
++  // Parse the immediate control bits.
++  // See section 4.1 in Intel SDM for details.
++  const auto Format = static_cast<CPU::SourceData>(Control & 0b11);
++  const auto Aggregation = static_cast<CPU::AggregationOp>((Control >> 2) & 0b11);
++  const auto Polarity = static_cast<CPU::Polarity>((Control >> 4) & 0b11);
++  const bool OutputSelection = (Control & (1 << 6)) != 0;
++
++  // Helper constants
++  const bool IsWords = Format == CPU::SourceData::U16 || Format == CPU::SourceData::S16;
++  const bool IsSigned = Format == CPU::SourceData::S8 || Format == CPU::SourceData::S16;
++  const auto ElementSize = IsWords ? OpSize::i16Bit : OpSize::i8Bit;
++  const bool IsEqualOrdered = Aggregation == CPU::AggregationOp::EqualOrdered;
++  const bool NeedsSrc1ValidElements = true;
++  const bool NeedsSrc2ValidElements = !IsEqualOrdered || Polarity == CPU::Polarity::NegativeMasked;
++  const uint32_t NumElements = IR::NumElements(OpSize::i128Bit, ElementSize);
++
++  // Load a vector where each element contains the value of its own index
++  Ref Indices = LoadAndCacheNamedVectorConstant(OpSize::i128Bit, IsWords ? NAMED_VECTOR_INCREMENTAL_U16_INDEX : NAMED_VECTOR_INCREMENTAL_U8_INDEX);
++
++  // Helper lambda that computes the lowest index element set "all high" in mask.
++  Ref VecNumElements {};
++  const auto LowestIndex = [&](Ref Mask) {
++    if (!VecNumElements) {
++      VecNumElements = _VectorImm(OpSize::i128Bit, ElementSize, NumElements);
++    }
++    Ref Candidates = _VBSL(OpSize::i128Bit, Mask, Indices, VecNumElements);
++    return _VUMinV(OpSize::i128Bit, ElementSize, Candidates);
++  };
++
++  Ref Src1Length {};
++  Ref Src2Length {};
++  Ref Src2LengthVector {};
++  Ref Src1ValidElementsMask {};
++
++  // Compute the valid element masks for the two source strings.
+   if (IsExplicit) {
+-    // Will be 4 in the absence of a REX.W bit and 8 in the presence of a REX.W bit.
+-    //
+-    // While the control bit immediate for the instruction itself is only ever 8 bits
+-    // in size, we use it as a 16-bit value so that we can use the 8th bit to signify
+-    // whether or not RAX and RDX should be interpreted as a 64-bit value.
+-    const auto SrcSize = OpSizeFromSrc(Op);
+-    const auto Is64Bit = SrcSize == OpSize::i64Bit;
+-    const auto NewControl = uint16_t(Control | (uint16_t(Is64Bit) << 8));
++    const auto LengthSize = OpSizeFromSrc(Op);
+ 
+-    Ref SrcRAX = LoadGPRRegister(X86State::REG_RAX);
+-    Ref SrcRDX = LoadGPRRegister(X86State::REG_RDX);
++    Src1Length = PCMPXSTRXSaturateExplicitLength(ElementSize, LengthSize, LoadGPRRegister(X86State::REG_RAX));
++    Src2Length = PCMPXSTRXSaturateExplicitLength(ElementSize, LengthSize, LoadGPRRegister(X86State::REG_RDX));
+ 
+-    IntermediateResult = _VPCMPESTRX(Src1, Src2, SrcRAX, SrcRDX, NewControl);
++    if (NeedsSrc1ValidElements) {
++      Src1ValidElementsMask = _VCMPGT(OpSize::i128Bit, ElementSize, _VDupFromGPR(OpSize::i128Bit, ElementSize, Src1Length), Indices);
++    }
++    if (NeedsSrc2ValidElements) {
++      Src2LengthVector = _VDupFromGPR(OpSize::i128Bit, ElementSize, Src2Length);
++    }
+   } else {
+-    IntermediateResult = _VPCMPISTRX(Src1, Src2, Control);
++    // Get index of the first NUL element, to determine length of input strings.
++    Ref Src1FirstNull = LowestIndex(_VCMPEQZ(OpSize::i128Bit, ElementSize, Src1));
++    Ref Src2FirstNull = LowestIndex(_VCMPEQZ(OpSize::i128Bit, ElementSize, Src2));
++    Src1Length = _VExtractToGPR(OpSize::i128Bit, ElementSize, Src1FirstNull, 0);
++    Src2Length = _VExtractToGPR(OpSize::i128Bit, ElementSize, Src2FirstNull, 0);
++
++    if (NeedsSrc1ValidElements) {
++      // If the index in the lane is less than the index of the first NUL, then it's a valid element.
++      Src1ValidElementsMask = _VCMPGT(OpSize::i128Bit, ElementSize, _VDupElement(OpSize::i128Bit, ElementSize, Src1FirstNull, 0), Indices);
++    }
++    if (NeedsSrc2ValidElements) {
++      Src2LengthVector = _VDupElement(OpSize::i128Bit, ElementSize, Src2FirstNull, 0);
++    }
++  }
++
++  Ref Src1HasInvalidElements = Select01(OpSize::i32Bit, CondClass::ULT, Src1Length, Constant(NumElements));
++  Ref Src2HasInvalidElements = Select01(OpSize::i32Bit, CondClass::ULT, Src2Length, Constant(NumElements));
++  Ref Src2ValidElementsMask = NeedsSrc2ValidElements ? _VCMPGT(OpSize::i128Bit, ElementSize, Src2LengthVector, Indices) : nullptr;
++
++  // Perform the aggregation operations, see section 4.1.3 in the Intel SDM.
++  Ref Matches {};
++  switch (Aggregation) {
++  case CPU::AggregationOp::EqualAny:
++    Matches = PCMPXSTRXEqualAny(ElementSize, Src1, Src2, Src1ValidElementsMask, Src2ValidElementsMask);
++    break;
++  case CPU::AggregationOp::Ranges:
++    Matches = PCMPXSTRXRanges(ElementSize, Src1, Src2, Src1ValidElementsMask, Src2ValidElementsMask, IsSigned);
++    break;
++  case CPU::AggregationOp::EqualEach:
++    Matches = PCMPXSTRXEqualEach(ElementSize, Src1, Src2, Src1ValidElementsMask, Src2ValidElementsMask);
++    break;
++  case CPU::AggregationOp::EqualOrdered:
++    Matches = PCMPXSTRXEqualOrdered(ElementSize, Src1, Src2, Src1Length, Src2Length, Src1ValidElementsMask, Indices);
++    break;
++  }
++
++  // Invert the matches if the polarity is negative or negative masked,
++  // see section 4.1.4 in the Intel SDM.
++  if (Polarity == CPU::Polarity::Negative) {
++    Matches = _VNot(OpSize::i128Bit, Matches);
++  } else if (Polarity == CPU::Polarity::NegativeMasked) {
++    Matches = _VXor(OpSize::i128Bit, Matches, Src2ValidElementsMask);
+   }
+ 
++  // Compute the flags and result
++  Ref CF {};
++  Ref OF {};
++
++  // PCMPESTRM and PCMPISTRM
++  // These instructions return a mask of the matching elements.
+   if (IsMask) {
+-    // For the masked variant of the instructions, if control[6] is set, then we
+-    // need to expand the intermediate result into a byte or word mask (depending
+-    // on data size specified in control[1]) along the entire length of XMM0,
+-    // where set bits in the intermediate result set the corresponding entry
+-    // in XMM0 to all 1s and unset bits set the corresponding entry to all 0s.
+-    //
+-    // If control[6] is not set, then we just store the intermediate result as-is
+-    // into the least significant bits of XMM0 and zero extend it.
+-    const auto IsExpandedMask = (Control & 0b0100'0000) != 0;
+-
+-    if (IsExpandedMask) {
+-      // We need to iterate over the intermediate result and
+-      // expand the mask into XMM0 elements.
+-      const auto ElementSize = 1U << (Control & 1);
+-      const auto NumElements = 16U >> (Control & 1);
+-
+-      Ref Result = LoadZeroVector(OpSize::i128Bit);
+-      for (uint32_t i = 0; i < NumElements; i++) {
+-        Ref SignBit = _Sbfe(OpSize::i64Bit, 1, i, IntermediateResult);
+-        Result = _VInsGPR(OpSize::i128Bit, IR::SizeToOpSize(ElementSize), i, Result, SignBit);
+-      }
++    Ref Result = Matches;
++    // Byte/word mask rather than a bit mask.
++    if (OutputSelection) {
++      // Result is already a byte/word mask, so just compute flags.
++      // CF set when no elements matched
++      // OF is set when the first element matched.
++      Ref AnyMatch = _VExtractToGPR(OpSize::i128Bit, ElementSize, _VUMaxV(OpSize::i128Bit, ElementSize, Matches), 0);
++      CF = Select01(OpSize::i32Bit, CondClass::EQ, AnyMatch, Constant(0));
++      OF = _And(OpSize::i64Bit, _VExtractToGPR(OpSize::i128Bit, ElementSize, Matches, 0), Constant(1));
+ 
+-      if (IsAVX) {
+-        StoreXMMRegister(0, Result);
+-      } else {
+-        StoreXMMRegister_WithAVXInsert(VectorOpType::SSE, 0, Result);
+-      }
+     } else {
+-      // We insert the intermediate result as-is.
+-      Ref Result = _VCastFromGPR(OpSize::i128Bit, OpSize::i16Bit, IntermediateResult);
+-
+-      if (IsAVX) {
+-        StoreXMMRegister(0, Result);
+-      } else {
+-        StoreXMMRegister_WithAVXInsert(VectorOpType::SSE, 0, Result);
+-      }
++      // Convert per element vector to a bit mask with one bit per lane.
++      Ref BitPositions = LoadAndCacheNamedVectorConstant(OpSize::i128Bit, NAMED_VECTOR_MOVMASKB);
++      Ref Zero = LoadZeroVector(OpSize::i128Bit);
++
++      // If the elements are words, truncate to bytes first.
++      Result = IsWords ? _VUnZip(OpSize::i128Bit, OpSize::i8Bit, Matches, Zero) : Matches;
++      // Now repeat this pattern until we collapse each byte into a single bit.
++      Result = _VAnd(OpSize::i128Bit, Result, BitPositions);
++      Result = _VAddP(OpSize::i128Bit, OpSize::i8Bit, Result, Zero);
++      Result = _VAddP(OpSize::i128Bit, OpSize::i8Bit, Result, Zero);
++      Result = _VAddP(OpSize::i128Bit, OpSize::i8Bit, Result, Zero);
++
++      // Compute the flags from the bit mask in Result
++      Ref BitMask = _VExtractToGPR(OpSize::i128Bit, IsWords ? OpSize::i8Bit : OpSize::i16Bit, Result, 0);
++      CF = Select01(OpSize::i32Bit, CondClass::EQ, BitMask, Constant(0));
++      OF = _And(OpSize::i64Bit, BitMask, Constant(1));
+     }
+-  } else {
+-    Ref ZeroConst = Constant(0);
+ 
+-    // For the indexed variant of the instructions, if control[6] is set, then we
+-    // store the index of the most significant bit into ECX. If it's not set,
+-    // then we store the least significant bit.
+-    const auto UseMSBIndex = (Control & 0b0100'0000) != 0;
++    StoreXMMRegister_WithAVXInsert(IsAVX ? VectorOpType::AVX : VectorOpType::SSE, 0, Result);
+ 
+-    Ref ResultNoFlags = _Bfe(OpSize::i32Bit, 16, 0, IntermediateResult);
+-
+-    Ref IfZero = Constant(16 >> (Control & 1));
+-    Ref IfNotZero = UseMSBIndex ? _FindMSB(IR::OpSize::i32Bit, ResultNoFlags) : _FindLSB(IR::OpSize::i32Bit, ResultNoFlags);
+-    Ref Result = _Select(OpSize::i64Bit, OpSize::i64Bit, CondClass::EQ, ResultNoFlags, ZeroConst, IfZero, IfNotZero);
++    // PCMPESTRI and PCMPISTRI
++    // These instructions return either the index of the first match
++    // or the number of elements in the string if no match.
++  } else {
++    Ref LowestMatch = _VExtractToGPR(OpSize::i128Bit, ElementSize, LowestIndex(Matches), 0);
++    CF = Select01(OpSize::i32Bit, CondClass::EQ, LowestMatch, Constant(NumElements));
++    OF = Select01(OpSize::i32Bit, CondClass::EQ, LowestMatch, Constant(0));
++
++    Ref Result = LowestMatch;
++    // Most significant rather than least significant index.
++    if (OutputSelection) {
++      // The max is also 0 when nothing matched, LowestMatch tells those apart.
++      Ref Candidates = _VAnd(OpSize::i128Bit, Indices, Matches);
++      Ref HighestMatchVector = _VUMaxV(OpSize::i128Bit, ElementSize, Candidates);
++      Ref HighestMatch = _VExtractToGPR(OpSize::i128Bit, ElementSize, HighestMatchVector, 0);
++      Result = _Select(OpSize::i32Bit, OpSize::i32Bit, CondClass::EQ, LowestMatch, Constant(NumElements), Constant(NumElements), HighestMatch);
++    }
+ 
+     // Store the result, it is already zero-extended to 64-bit implicitly.
+     StoreGPRRegister(X86State::REG_RCX, Result);
+   }
+ 
+-  // Set all of the necessary flags. NZCV stored in bits 28...31 like the hw op.
+-  SetNZCV(IntermediateResult);
+-  CFInverted = false;
++  // SF/ZF are set when Src1/Src2 respectively have invalid elements.
++  Ref SF = Src1HasInvalidElements;
++  Ref ZF = Src2HasInvalidElements;
++  Ref NZCV = _Orlshl(OpSize::i64Bit, _Lshl(OpSize::i64Bit, OF, Constant(28)), CF, 29);
++  NZCV = _Orlshl(OpSize::i64Bit, NZCV, ZF, 30);
++  NZCV = _Orlshl(OpSize::i64Bit, NZCV, SF, 31);
++  SetNZCV(NZCV);
++  CFInverted = true;
+   ZeroPF_AF();
+ }
+ 
+diff --git a/FEXCore/Source/Interface/IR/IR.json b/FEXCore/Source/Interface/IR/IR.json
+index e969513..d7f737a 100644
+--- a/FEXCore/Source/Interface/IR/IR.json
++++ b/FEXCore/Source/Interface/IR/IR.json
+@@ -2484,6 +2484,14 @@
+         "DestSize": "RegisterSize",
+         "ElementSize": "ElementSize"
+       },
++      "FPR = VUCMPGT OpSize:#RegisterSize, OpSize:#ElementSize, FPR:$Vector1, FPR:$Vector2": {
++        "Desc": ["Vector compare unsigned greater than",
++                 "Each element is compared, if the result is true then the resulting element is ~0, else zero"
++                ],
++
++        "DestSize": "RegisterSize",
++        "ElementSize": "ElementSize"
++      },
+       "FPR = VFCMPEQ OpSize:#RegisterSize, OpSize:#ElementSize, FPR:$Vector1, FPR:$Vector2": {
+         "DestSize": "RegisterSize",
+         "ElementSize": "ElementSize"
+@@ -2551,7 +2559,8 @@
+       },
+ 
+       "GPR = VPCMPESTRX FPR:$LHS, FPR:$RHS, GPR:$RAX, GPR:$RDX, u16:$Control": {
+-        "Desc": ["Performs intermediate behavior analogous to the x86 PCMPESTRI/PCMPESTRM instruction",
++        "Desc": ["NOTE: Currently unused. The OpcodeDispatcher implements the SSE4.2 string instructions inline.",
++                 "Performs intermediate behavior analogous to the x86 PCMPESTRI/PCMPESTRM instruction",
+                  "This will return the intermediate result of a PCMPESTR-type operation, but NOT the final",
+                  "result. This must be derived from the intermediate result",
+ 
+@@ -2563,7 +2572,8 @@
+         "JITDispatch": false
+       },
+       "GPR = VPCMPISTRX FPR:$LHS, FPR:$RHS, u8:$Control": {
+-        "Desc": ["Performs intermediate behavior analogous to the x86 PCMPISTRI/PCMPISTRM instruction",
++        "Desc": ["NOTE: Currently unused. The OpcodeDispatcher implements the SSE4.2 string instructions inline.",
++                 "Performs intermediate behavior analogous to the x86 PCMPISTRI/PCMPISTRM instruction",
+                  "This will return the intermediate result of a PCMPISTR-type operation, but NOT the final",
+                  "result. This must be derived from the intermediate result",
+ 
+diff --git a/FEXCore/Source/Interface/IR/IRDumper.cpp b/FEXCore/Source/Interface/IR/IRDumper.cpp
+index 32f49da..31ecddc 100644
+--- a/FEXCore/Source/Interface/IR/IRDumper.cpp
++++ b/FEXCore/Source/Interface/IR/IRDumper.cpp
+@@ -172,6 +172,8 @@ static void PrintArg(fextl::ostringstream* out, const IRListView*, NamedVectorCo
+         return "u16_incremental_index";
+       case NamedVectorConstant::NAMED_VECTOR_INCREMENTAL_U16_INDEX_UPPER:
+         return "u16_incremental_index_upper";
++      case NamedVectorConstant::NAMED_VECTOR_INCREMENTAL_U8_INDEX:
++        return "u8_incremental_index";
+       case NamedVectorConstant::NAMED_VECTOR_PADDSUBPS_INVERT:
+         return "addsubps_invert";
+       case NamedVectorConstant::NAMED_VECTOR_PADDSUBPS_INVERT_UPPER:
+diff --git a/FEXCore/include/FEXCore/IR/IR.h b/FEXCore/include/FEXCore/IR/IR.h
+index ca43d18..37a581c 100644
+--- a/FEXCore/include/FEXCore/IR/IR.h
++++ b/FEXCore/include/FEXCore/IR/IR.h
+@@ -15,6 +15,7 @@ namespace FEXCore::IR {
+ enum NamedVectorConstant : uint8_t {
+   NAMED_VECTOR_INCREMENTAL_U16_INDEX = 0,
+   NAMED_VECTOR_INCREMENTAL_U16_INDEX_UPPER,
++  NAMED_VECTOR_INCREMENTAL_U8_INDEX,
+   NAMED_VECTOR_PADDSUBPS_INVERT,
+   NAMED_VECTOR_PADDSUBPS_INVERT_UPPER,
+   NAMED_VECTOR_PADDSUBPD_INVERT,
+diff --git a/unittests/ASM/H0F3A/pcmpestri_ranges.asm b/unittests/ASM/H0F3A/pcmpestri_ranges.asm
+index dd79fae..5362576 100644
+--- a/unittests/ASM/H0F3A/pcmpestri_ranges.asm
++++ b/unittests/ASM/H0F3A/pcmpestri_ranges.asm
+@@ -1,12 +1,12 @@
+ %ifdef CONFIG
+ {
+   "RegData": {
+-      "RAX": ["4"],
+-      "RDX": ["16"],
+-      "XMM0": ["0x00060F000F000D01", "0x0000000000070007"],
+-      "XMM1": ["0x3111313131311111", "0x0000000000313131"],
+-      "XMM2": ["0x005A0041007A0061", "0x55AACCBBFF223344"],
+-      "XMM3": ["0x006500200027003F", "0x00210065004F0065"]
++      "RAX": ["2"],
++      "RDX": ["6"],
++      "XMM0": ["0x00060F000F000D01", "0x0000000504070007"],
++      "XMM1": ["0x3111313131311111", "0x0000001919313131"],
++      "XMM2": ["0x000000000010FFF0", "0x0000000000000000"],
++      "XMM3": ["0xFFEF0011FF80007F", "0x000100000010FFF0"]
+   },
+   "HostFeatures": ["SSE4.2"]
+ }
+@@ -113,6 +113,22 @@ CompareAndStore 9, 0b00110101
+ ; Range unsigned word check (msb, negative masked)
+ CompareAndStore 10, 0b01110101
+ 
++; --- 8-bit signed byte tests ---
++movaps xmm2, [rel .data_signed]
++movaps xmm3, [rel .data_signed + 32]
++
++; Range signed byte check (lsb, positive polarity)
++mov rax, 2
++mov rdx, 6
++CompareAndStore 11, 0b00000110
++
++; --- 16-bit signed word tests ---
++movaps xmm2, [rel .data16_signed]
++movaps xmm3, [rel .data16_signed + 32]
++
++; Range signed word check (msb, positive polarity)
++CompareAndStore 12, 0b01000111
++
+ ; Load all our stored indices and flags for result comparing
+ movaps xmm0, [rel .indices]
+ movaps xmm1, [rel .flags]
+@@ -142,6 +158,28 @@ dq 0x00210065004F0065 ; "eOen!"
+ dq 0x8888888888888888
+ dq 0x9999999999999999
+ 
++.data_signed:
++dq 0x00000000000010F0 ; -16, 16 (240, 16 as unsigned, an empty range)
++dq 0x0000000000000000
++dq 0xFFFFFFFFFFFFFFFF
++dq 0xEEEEEEEEEEEEEEEE
++
++dq 0x010010F0EF11807F ; 127, -128, 17, -17, -16, 16 (followed by null and junk)
++dq 0x0101010101010101
++dq 0xFFFFFFFFFFFFFFFF
++dq 0xEEEEEEEEEEEEEEEE
++
++.data16_signed:
++dq 0x000000000010FFF0 ; -16, 16 (65520, 16 as unsigned, an empty range)
++dq 0x0000000000000000
++dq 0xAAAAAAAAAAAAAAAA
++dq 0xBBBBBBBBBBBBBBBB
++
++dq 0xFFEF0011FF80007F ; 127, -128, 17, -17
++dq 0x000100000010FFF0 ; -16, 16 (followed by null and junk)
++dq 0x8888888888888888
++dq 0x9999999999999999
++
+ .indices:
+ dq 0x0000000000000000
+ dq 0x0000000000000000
+diff --git a/unittests/ASM/H0F3A/pcmpistri_ranges.asm b/unittests/ASM/H0F3A/pcmpistri_ranges.asm
+index b673717..9e4eb11 100644
+--- a/unittests/ASM/H0F3A/pcmpistri_ranges.asm
++++ b/unittests/ASM/H0F3A/pcmpistri_ranges.asm
+@@ -1,10 +1,10 @@
+ %ifdef CONFIG
+ {
+   "RegData": {
+-      "XMM0": ["0x00060F000F000D01", "0x0000001010070007"],
+-      "XMM1": ["0x3111313131311111", "0x0000001818313131"],
+-      "XMM2": ["0x005A0041007A0061", "0x55AACCBBFF220000"],
+-      "XMM3": ["0x0065002000270000", "0x00210065004F0065"]
++      "XMM0": ["0x00060F000F000D01", "0x0005041010070007"],
++      "XMM1": ["0x3111313131311111", "0x0019191818313131"],
++      "XMM2": ["0x000000000010FFF0", "0x0000000000000000"],
++      "XMM3": ["0xFFEF0011FF80007F", "0x000100000010FFF0"]
+   },
+   "HostFeatures": ["SSE4.2"]
+ }
+@@ -115,6 +115,20 @@ CompareAndStore 11, 0b01000110
+ ; Range signed byte check (lsb)
+ CompareAndStore 12, 0b01000110
+ 
++; --- 8-bit signed byte tests ---
++movaps xmm2, [rel .data_signed]
++movaps xmm3, [rel .data_signed + 32]
++
++; Range signed byte check (lsb, positive polarity)
++CompareAndStore 13, 0b00000110
++
++; --- 16-bit signed word tests ---
++movaps xmm2, [rel .data16_signed]
++movaps xmm3, [rel .data16_signed + 32]
++
++; Range signed word check (msb, positive polarity)
++CompareAndStore 14, 0b01000111
++
+ ; Load all our stored indices and flags for result comparing
+ movaps xmm0, [rel .indices]
+ movaps xmm1, [rel .flags]
+@@ -155,6 +169,28 @@ dq 0x00210065004F0065 ; "eOen!"
+ dq 0x8888888888888888
+ dq 0x9999999999999999
+ 
++.data_signed:
++dq 0x00000000000010F0 ; -16, 16 (240, 16 as unsigned, an empty range)
++dq 0x0000000000000000
++dq 0xFFFFFFFFFFFFFFFF
++dq 0xEEEEEEEEEEEEEEEE
++
++dq 0x010010F0EF11807F ; 127, -128, 17, -17, -16, 16 (followed by null and junk)
++dq 0x0101010101010101
++dq 0xFFFFFFFFFFFFFFFF
++dq 0xEEEEEEEEEEEEEEEE
++
++.data16_signed:
++dq 0x000000000010FFF0 ; -16, 16 (65520, 16 as unsigned, an empty range)
++dq 0x0000000000000000
++dq 0xAAAAAAAAAAAAAAAA
++dq 0xBBBBBBBBBBBBBBBB
++
++dq 0xFFEF0011FF80007F ; 127, -128, 17, -17
++dq 0x000100000010FFF0 ; -16, 16 (followed by null and junk)
++dq 0x8888888888888888
++dq 0x9999999999999999
++
+ .indices:
+ dq 0x0000000000000000
+ dq 0x0000000000000000

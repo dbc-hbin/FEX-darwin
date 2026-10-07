@@ -3,6 +3,7 @@
 #include "Interface/Core/CPUBackend.h"
 #include "Interface/Context/Context.h"
 #include <FEXCore/Utils/SpinWaitLock.h>
+#include <FEXCore/Utils/JitWriteScope.h>
 
 #include <FEXCore/Debug/InternalThreadState.h>
 #include <FEXCore/Utils/EnumUtils.h>
@@ -1931,6 +1932,7 @@ static uint64_t HandleAtomicLoadstoreExclusive(uintptr_t ProgramCounter, uint64_
 [[nodiscard]]
 std::optional<int32_t> HandleUnalignedAccess(FEXCore::Core::InternalThreadState* Thread, UnalignedHandlerType HandleType,
                                              uintptr_t ProgramCounter, uint64_t* GPRs, bool IsJIT) {
+  const FEXCore::Allocator::JitWriteScope JitWrite;
 #ifdef ARCHITECTURE_arm64
   constexpr bool is_arm64 = true;
 #else

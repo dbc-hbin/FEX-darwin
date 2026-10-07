@@ -393,10 +393,14 @@ void VirtualTHPNOP(const void* Ptr, size_t Size, THPControl Control) {}
 
 VirtualNamePtr VirtualName {VirtualNameNOP};
 VirtualTHPPtr VirtualTHPControl {VirtualTHPNOP};
+VirtualJitWriteProtectPtr VirtualJitWriteProtect {};
+VirtualNativeJitPtr VirtualNativeJit {};
 
 void SetupHooks(size_t PageSize, HookPtrs Ptrs) {
   VirtualName = Ptrs.VirtualName;
   VirtualTHPControl = Ptrs.VirtualTHPControl;
+  VirtualJitWriteProtect = Ptrs.VirtualJitWriteProtect;
+  VirtualNativeJit = Ptrs.VirtualNativeJit;
   SetupAllocatorHooks(VirtualName);
 }
 

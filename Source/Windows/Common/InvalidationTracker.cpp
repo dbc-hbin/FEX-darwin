@@ -11,16 +11,17 @@
 #include <winternl.h>
 
 namespace FEX::Windows {
-InvalidationTracker::InvalidationTracker(FEXCore::Context::Context& CTX, const std::unordered_map<DWORD, FEXCore::Core::InternalThreadState*>& Threads)
+InvalidationTracker::InvalidationTracker(FEXCore::Context::Context& CTX, const std::unordered_map<DWORD, FEXCore::Core::InternalThreadState*>& Threads, uint64_t GuestBase)
   : CTX {CTX}
-  , Threads {Threads} {
+  , Threads {Threads}
+  , GuestBase {GuestBase} {
   FEX_CONFIG_OPT(SMCChecks, SMCCHECKS);
   SMCDetectionDisabled = (SMCChecks == FEXCore::Config::CONFIG_SMC_NONE);
 
   MEMORY_BASIC_INFORMATION Info;
-  uint64_t Address = 0;
+  uint64_t Address = GuestBase;
 
-  while (VirtualQuery(reinterpret_cast<LPCVOID>(Address), &Info, sizeof(Info))) {
+  while ((!GuestBase || Address - GuestBase < (1ULL << 32)) && VirtualQuery(reinterpret_cast<LPCVOID>(Address), &Info, sizeof(Info))) {
     uint64_t BaseAddress = reinterpret_cast<uint64_t>(Info.BaseAddress);
     if (Info.State == MEM_COMMIT) {
       HandleMemoryProtectionNotification(BaseAddress, Info.RegionSize, Info.Protect);
@@ -272,7 +273,8 @@ void InvalidationTracker::DetectMonoBackpatcherBlock(FEXCore::Core::InternalThre
     return;
   }
 
-  uint64_t RIP = CTX.RestoreRIPFromHostPC(Thread, HostPc);
+  uint64_t GuestRIP = CTX.RestoreRIPFromHostPC(Thread, HostPc);
+  uint64_t RIP = GuestBase + GuestRIP;
   if (!RIP || RIP < MonoBase || RIP >= MonoEnd) {
     return;
   }
@@ -289,7 +291,7 @@ void InvalidationTracker::DetectMonoBackpatcherBlock(FEXCore::Core::InternalThre
     std::scoped_lock CodeLock(CTX.GetCodeInvalidationMutex());
     CTX.MarkMonoBackpatcherBlock(BlockEntry);
   }
-  InvalidateAlignedInterval(BlockEntry, FEXCore::Utils::FEX_PAGE_SIZE, false);
+  InvalidateAlignedInterval(GuestBase + BlockEntry, FEXCore::Utils::FEX_PAGE_SIZE, false);
 }
 
 void InvalidationTracker::DisableSMCDetection() {
@@ -331,7 +333,18 @@ void InvalidationTracker::InvalidateIntervalInternal(uint64_t Address, uint64_t 
 }
 
 void InvalidationTracker::InvalidateIntervalInternalLocked(uint64_t Address, uint64_t Size) {
-  // NOTE: This assumes CodeInvalidationMutex is locked by the caller
+  // Host intervals are converted only at the FEX guest-cache boundary.
+  if (GuestBase) {
+    if (Address < GuestBase) {
+      const auto Prefix = GuestBase - Address;
+      if (Size <= Prefix) return;
+      Size -= Prefix;
+      Address = GuestBase;
+    }
+    Address -= GuestBase;
+    if (Address >= (1ULL << 32)) return;
+    Size = std::min<uint64_t>(Size, (1ULL << 32) - Address);
+  }
   CTX.InvalidateCodeBuffersCodeRange(Address, Size);
   for (auto Thread : Threads) {
     CTX.InvalidateThreadCachedCodeRange(Thread.second, Address, Size);

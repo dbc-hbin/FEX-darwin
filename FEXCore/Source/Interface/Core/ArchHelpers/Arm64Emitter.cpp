@@ -274,6 +274,22 @@ namespace x32 {
 
   constexpr unsigned RAPairs = 10;
 
+#ifdef FEX_GUEST_WINDOW
+  // RA without the two guest-window registers. Selected instead of RA only when a non-zero
+  // GUEST32BASE is configured, so identity-mapped 32-bit guests keep the full pool.
+  //
+  // Derived from RA by dropping its last two entries so the two lists cannot drift; the
+  // static_asserts fail the build if that tail stops being exactly the guest-window pair.
+  constexpr auto RA_GuestBase = []<size_t... I>(std::index_sequence<I...>) {
+    return std::array<ARMEmitter::Register, sizeof...(I)> {RA[I]...};
+  }(std::make_index_sequence<RA.size() - 2> {});
+
+  static_assert(RA[RA.size() - 2] == REG_GUEST_ADDR_TMP.R() && RA[RA.size() - 1] == REG_GUEST_BASE.R(),
+                "x32::RA's last two entries must be the guest-window registers");
+  static_assert(RA.size() == RA_GuestBase.size() + 2, "RA_GuestBase must drop exactly two registers");
+  static_assert(RAPairs <= RA_GuestBase.size(), "Reserving the guest-window registers ate into the pair-allocatable prefix");
+#endif
+
   // All are caller saved
   constexpr std::array<ARMEmitter::VRegister, 8> SRAFPR = {
     ARMEmitter::VReg::v16, ARMEmitter::VReg::v17, ARMEmitter::VReg::v18, ARMEmitter::VReg::v19,
@@ -384,6 +400,11 @@ Arm64Emitter::Arm64Emitter(FEXCore::Context::ContextImpl* ctx, void* EmissionPtr
   }
 #endif
 
+#ifdef FEX_GUEST_WINDOW
+  // Resolved once by ContextImpl's constructor, and 0 in 64-bit mode.
+  GuestBase = EmitterCTX->Config.GuestBase;
+#endif
+
   // Number of register available is dependent on what operating mode the proccess is in.
   if (EmitterCTX->Config.Is64BitMode()) {
     StaticRegisters = x64::SRA;
@@ -396,13 +417,32 @@ Arm64Emitter::Arm64Emitter(FEXCore::Context::ContextImpl* ctx, void* EmissionPtr
     PairRegisters = x32::RAPairs;
 
     StaticRegisters = x32::SRA;
+#ifdef FEX_GUEST_WINDOW
+    // Reserve REG_GUEST_BASE and REG_GUEST_ADDR_TMP only when a guest window is configured.
+    GeneralRegisters = GuestBase ? std::span<const ARMEmitter::Register> {x32::RA_GuestBase} : std::span<const ARMEmitter::Register> {x32::RA};
+#else
     GeneralRegisters = x32::RA;
+#endif
     GeneralRegistersNotPreserved = x32::NotPreserved_Dynamic;
 
     StaticFPRegisters = x32::SRAFPR;
     GeneralFPRegisters = x32::RAFPR;
   }
 }
+
+#ifdef FEX_GUEST_WINDOW
+// Materialise REG_GUEST_BASE. Called from FillStaticRegs, which every JIT entry and re-entry path
+// goes through, including the ones that resume from a CONTEXT that may predate the register being
+// set up. x19 is callee-saved, so this is redundant after an ordinary host call; a 4GiB-aligned
+// window encodes as a single movz.
+void Arm64Emitter::LoadGuestBaseReg() {
+  if (!GuestBase) {
+    return;
+  }
+
+  LoadConstant(ARMEmitter::Size::i64Bit, REG_GUEST_BASE.R(), GuestBase);
+}
+#endif
 
 FEXCore::X86State::X86Reg Arm64Emitter::GetX86RegRelationToARMReg(ARMEmitter::Register Reg) {
   for (size_t i = 0; i < StaticRegisters.size(); ++i) {
@@ -812,6 +852,11 @@ void Arm64Emitter::FillStaticRegs(FillStaticRegOptions Options) {
 #endif
 
   ldr(REG_CALLRET_SP, STATE.R(), offsetof(FEXCore::Core::CpuStateFrame, State.callret_sp));
+
+#ifdef FEX_GUEST_WINDOW
+  // No-op unless a guest window is configured.
+  LoadGuestBaseReg();
+#endif
 
   if (Options.NZCV) {
     // Regardless of what GPRs/FPRs we're filling, we need to fill NZCV since it

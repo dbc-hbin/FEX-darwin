@@ -17,9 +17,14 @@ namespace FEX::Windows::Allocator {
 void SetupHooks(HMODULE ntdll) {
   FEXCore::Allocator::HookPtrs Ptrs {};
 
+  const auto JitWriteProtect = reinterpret_cast<FEXCore::Allocator::VirtualJitWriteProtectPtr>(
+    GetProcAddress(ntdll, "__wine_jit_write_protect"));
   Ptrs = {
     .VirtualName = UnixLib::VirtualName,
     .VirtualTHPControl = UnixLib::VirtualTHPControl,
+    .VirtualJitWriteProtect = JitWriteProtect && JitWriteProtect(2) != UINT32_MAX ? JitWriteProtect : nullptr,
+    .VirtualNativeJit = reinterpret_cast<FEXCore::Allocator::VirtualNativeJitPtr>(
+      GetProcAddress(ntdll, "__wine_allocate_native_jit")),
   };
 
   SYSTEM_INFO system_info {};

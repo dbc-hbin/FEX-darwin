@@ -33,6 +33,7 @@ $end_info$
 #include "Windows/Common/FEXUnixLib.h"
 #include "Common/CallRetStack.h"
 #include "Common/JITGuardPage.h"
+#include "UserSharedData.h"
 #include "Common/Config.h"
 #include "Common/Exception.h"
 #include "Common/ImageTracker.h"
@@ -150,6 +151,7 @@ std::optional<FEX::Windows::InvalidationTracker> InvalidationTracker;
 std::optional<FEX::Windows::CPUFeatures> CPUFeatures;
 std::optional<FEX::Windows::OvercommitTracker> OvercommitTracker;
 std::optional<FEX::Windows::ImageTracker> ImageTracker;
+const uint8_t* UserSharedDataBacking {};
 
 std::recursive_mutex ThreadCreationMutex;
 // Map of TIDs to their FEX thread state, `ThreadCreationMutex` must be locked when accessing
@@ -777,6 +779,13 @@ NTSTATUS ProcessInit() {
 
   const auto NtDll = GetModuleHandleW(L"ntdll.dll");
   const bool IsWine = !!GetProcAddress(NtDll, "wine_get_version");
+  if (IsWine) {
+    const auto Getter = reinterpret_cast<uintptr_t>(GetProcAddress(NtDll, "__wine_get_user_shared_data"));
+    if (Getter) {
+      // The compiler-generated ARM64EC call checker redirects the x64 export.
+      UserSharedDataBacking = reinterpret_cast<const uint8_t* (*)()>(Getter)();
+    }
+  }
   OvercommitTracker.emplace(IsWine);
 
   FEX::Windows::SetupEnvironmentVariableValues(NtDll);
@@ -866,6 +875,14 @@ bool ResetToConsistentStateImpl(const ThreadCPUArea CPUArea, EXCEPTION_RECORD* E
 
   if (Exception->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
     const auto FaultAddress = static_cast<uint64_t>(Exception->ExceptionInformation[1]);
+    if (UserSharedDataBacking && Exception->ExceptionInformation[0] == 0 &&
+        FaultAddress - FEX::Windows::UserSharedData::GuestBase < FEX::Windows::UserSharedData::PageSize &&
+        CTX->IsAddressInCodeBuffer(Thread, NativeContext->Pc) &&
+        FEX::Windows::UserSharedData::HandleLoad(UserSharedDataBacking, *reinterpret_cast<const uint32_t*>(NativeContext->Pc),
+                                               FaultAddress, NativeContext->X, NativeContext->Sp, NativeContext->V)) {
+      NativeContext->Pc += 4;
+      return true;
+    }
 
     if (FEX::Windows::CallRetStack::HandleAccessViolation(Thread, FaultAddress, NativeContext->X17)) {
       return true;

@@ -530,8 +530,19 @@
 
       "SSA = LoadMem RegisterClass:$Class, OpSize:#Size, GPR:$Addr, GPR:$Offset, OpSize:$Align, MemOffsetType:$OffsetType, u8:$OffsetScale": {
         "HasSideEffects": true,
+        "Desc": ["Loads a value from memory.",
+                 "With the GuestWindow build feature, $Addr is a GUEST address unless $HostAddr is set: under a",
+                 "32-bit guest window the backend turns it into `GuestBase + zext32(EA + offset)`. $HostAddr marks",
+                 "a context-relative address that is already a host pointer and is dereferenced as-is."
+                ],
         "Inline": ["", "Mem"],
-        "DestSize": "Size"
+        "DestSize": "Size",
+        "Features": {
+          "GuestWindow": {
+            "Args": ", i1:$HostAddr{false}",
+            "EmitValidation": ["$HostAddr || !IsContextRelativeAddress($Addr)"]
+          }
+        }
       },
 
       "SSA:$Value1, SSA:$Value2 = LoadMemPair RegisterClass:$Class, OpSize:#Size, GPR:$Addr, u32:$Offset": {
@@ -543,11 +554,18 @@
       "StoreMem RegisterClass:$Class, OpSize:#Size, SSA:$Value, GPR:$Addr, GPR:$Offset, OpSize:$Align, MemOffsetType:$OffsetType, u8:$OffsetScale": {
         "Desc": [ "Stores a value to memory.",
                   "Zero Extends if value's type is too small",
-                  "Truncates if value's type is too large"
+                  "Truncates if value's type is too large",
+                  "With the GuestWindow build feature, $Addr is a GUEST address unless $HostAddr is set (see LoadMem)."
                 ],
         "Inline": ["Zero", "", "Mem"],
         "HasSideEffects": true,
-        "DestSize": "Size"
+        "DestSize": "Size",
+        "Features": {
+          "GuestWindow": {
+            "Args": ", i1:$HostAddr{false}",
+            "EmitValidation": ["$HostAddr || !IsContextRelativeAddress($Addr)"]
+          }
+        }
       },
 
       "StoreMemPair RegisterClass:$Class, OpSize:#Size, SSA:$Value1, SSA:$Value2, GPR:$Addr, u32:$Offset": {

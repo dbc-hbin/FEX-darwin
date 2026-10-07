@@ -51,6 +51,36 @@ public:
 
   RegClass WalkFindRegClass(Ref Node) const;
 
+#ifdef FEX_GUEST_WINDOW
+  // True when `ssa` is a HOST pointer into FEXCore's own thread context rather than a guest address.
+  // Exactly two IR values can be one: _FormContextAddress (`STATE + Index * Stride`), and a context
+  // load of CPUState::segment_arrays (FEXCore's own GDT/LDT tables on the host heap).
+  //
+  // Feeding either to a memory op that takes a guest address is silent when identity mapped and a
+  // wild access inside a 32-bit guest window, so LoadMem/StoreMem validate at emission time that
+  // such an address carries HostAddr. It has to be checked here: after register allocation the
+  // producing op is no longer recoverable in the backend.
+  bool IsContextRelativeAddress(OrderedNodeWrapper ssa) {
+    constexpr auto SegmentArraysBegin = offsetof(FEXCore::Core::CPUState, segment_arrays);
+    constexpr auto SegmentArraysEnd = SegmentArraysBegin + sizeof(FEXCore::Core::CPUState::segment_arrays);
+    const auto InSegmentArrays = [](uint32_t Offset) {
+      return Offset >= SegmentArraysBegin && Offset < SegmentArraysEnd;
+    };
+
+    const auto* IROp = GetOpHeader(ssa);
+    switch (IROp->Op) {
+    case OP_FORMCONTEXTADDRESS: return true;
+    case OP_LOADCONTEXT: return InSegmentArrays(IROp->C<IR::IROp_LoadContext>()->Offset);
+    case OP_LOADCONTEXTINDEXED: return InSegmentArrays(IROp->C<IR::IROp_LoadContextIndexed>()->BaseOffset);
+    default: return false;
+    }
+  }
+
+  bool IsContextRelativeAddress(Ref Node) {
+    return IsContextRelativeAddress(WrapNode(Node));
+  }
+#endif
+
   // These inlining helpers are used by IRDefines.inc so define first.
   Ref InlineMem(OpSize Size, Ref Offset, MemOffsetType OffsetType, uint8_t& OffsetScale, bool TSO = false) {
     uint64_t Imm {};
@@ -173,6 +203,32 @@ public:
   }
   IRPair<IROp_StoreMem> _StoreMemFPR(OpSize Size, Ref Value, Ref Addr, Ref Offset, OpSize Align, MemOffsetType OffsetType, uint8_t OffsetScale) {
     return _StoreMem(RegClass::FPR, Size, Value, Addr, Offset, Align, OffsetType, OffsetScale);
+  }
+
+  // Host-addressed load/store: `Addr` is already a host pointer into FEXCore's own CPUState (formed by
+  // _FormContextAddress, or a segment_arrays table pointer), never an x86 effective address, so a
+  // 32-bit guest window must not be applied to it. Without the GuestWindow feature these are the
+  // plain forms.
+  IRPair<IROp_LoadMem> _LoadMemHostGPR(OpSize Size, Ref Addr, Ref Offset, OpSize Align, MemOffsetType OffsetType, uint8_t OffsetScale) {
+#ifdef FEX_GUEST_WINDOW
+    return _LoadMem(RegClass::GPR, Size, Addr, Offset, Align, OffsetType, OffsetScale, true);
+#else
+    return _LoadMem(RegClass::GPR, Size, Addr, Offset, Align, OffsetType, OffsetScale);
+#endif
+  }
+  IRPair<IROp_LoadMem> _LoadMemHostFPR(OpSize Size, Ref Addr, Ref Offset, OpSize Align, MemOffsetType OffsetType, uint8_t OffsetScale) {
+#ifdef FEX_GUEST_WINDOW
+    return _LoadMem(RegClass::FPR, Size, Addr, Offset, Align, OffsetType, OffsetScale, true);
+#else
+    return _LoadMem(RegClass::FPR, Size, Addr, Offset, Align, OffsetType, OffsetScale);
+#endif
+  }
+  IRPair<IROp_StoreMem> _StoreMemHostFPR(OpSize Size, Ref Value, Ref Addr, Ref Offset, OpSize Align, MemOffsetType OffsetType, uint8_t OffsetScale) {
+#ifdef FEX_GUEST_WINDOW
+    return _StoreMem(RegClass::FPR, Size, Value, Addr, Offset, Align, OffsetType, OffsetScale, true);
+#else
+    return _StoreMem(RegClass::FPR, Size, Value, Addr, Offset, Align, OffsetType, OffsetScale);
+#endif
   }
 
   IRPair<IROp_StoreMemPair> _StoreMemPairGPR(OpSize Size, Ref Value1, Ref Value2, Ref Addr, uint32_t Offset) {

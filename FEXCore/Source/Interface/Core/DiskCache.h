@@ -14,6 +14,7 @@
 #include <FEXCore/fextl/unordered_set.h>
 #include <FEXCore/fextl/robin_map.h>
 #include <FEXCore/fextl/map.h>
+#include <FEXCore/fextl/list.h>
 #include <FEXCore/fextl/vector.h>
 #include <stdint.h>
 #include <mutex>
@@ -182,7 +183,7 @@ namespace DiskCache {
     std::atomic<uint64_t> CacheFileSize;
     FOZFile IndexFOZ;
     bool ReadOnly = false;
-    bool MaxSizeReached = false;
+    std::atomic<bool> MaxSizeReached {};
 
     FEX_CONFIG_OPT(MaxFileSize, DISKCACHEMAXFILESIZE);
   };

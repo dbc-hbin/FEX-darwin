@@ -3,6 +3,7 @@
 #include <FEXCore/Utils/CompilerDefs.h>
 #include <FEXCore/Utils/EnumOperators.h>
 #include <FEXCore/Utils/LogManager.h>
+#include <FEXCore/Utils/JitWriteScope.h>
 
 #ifndef _WIN32
 #include <stdlib.h>
@@ -37,9 +38,13 @@ FEX_DEFAULT_VISIBILITY void SetupHooks(size_t PageSize);
 #else
 using VirtualNamePtr = void (*)(const char*, const void*, size_t);
 using VirtualTHPPtr = void (*)(const void*, size_t, THPControl);
+using VirtualNativeJitPtr = long (*)(void**, size_t*);
+FEX_DEFAULT_VISIBILITY extern VirtualNativeJitPtr VirtualNativeJit;
 struct HookPtrs {
   VirtualNamePtr VirtualName;
   VirtualTHPPtr VirtualTHPControl;
+  VirtualJitWriteProtectPtr VirtualJitWriteProtect {};
+  VirtualNativeJitPtr VirtualNativeJit {};
 };
 FEX_DEFAULT_VISIBILITY void SetupHooks(size_t PageSize, HookPtrs Ptrs);
 #endif
@@ -49,6 +54,13 @@ FEX_DEFAULT_VISIBILITY void ClearHooks();
 inline void* VirtualAlloc(void* Base, size_t Size, bool Execute = false, bool Commit = true) {
   // Allocate top-down to avoid polluting the lower VA space, as even on 64-bit some programs (i.e. LuaJIT) require allocations below 4GB.
   DWORD Flags = (Commit ? MEM_COMMIT : 0) | MEM_RESERVE | MEM_TOP_DOWN;
+  if (Execute && VirtualJitWriteProtect) Flags &= ~MEM_TOP_DOWN;
+#ifndef ARCHITECTURE_arm64ec
+  if (Execute && VirtualNativeJit) {
+    if (!Commit || VirtualNativeJit(&Base, &Size)) return nullptr;
+    return Base;
+  }
+#endif
 #ifdef ARCHITECTURE_arm64ec
   MEM_EXTENDED_PARAMETER Parameter {};
   if (Execute) {

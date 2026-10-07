@@ -322,7 +322,7 @@ DEF_OP(Thunk) {
 
 DEF_OP(ValidateCode) {
   auto Op = IROp->C<IR::IROp_ValidateCode>();
-  auto Base = GetReg(Op->Address).X();
+  auto Base = GetGuestMemReg(Op->Address).X();
   int len = Op->CodeLength;
 
   const auto Dst = GetReg(Node);

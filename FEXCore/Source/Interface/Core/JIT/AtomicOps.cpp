@@ -10,6 +10,14 @@ $end_info$
 #include "Interface/Core/JIT/JITClass.h"
 
 namespace FEXCore::CPU {
+// Guest window: every address here is a guest address and is converted once, up front, into the reserved
+// REG_GUEST_ADDR_TMP (see Arm64Emitter.h). Using a reserved register rather than one of TMP1-TMP4 is
+// deliberate and load-bearing for exactly this file: CASPair and the LL/SC loops below park values
+// in TMP1-TMP4 and would otherwise overwrite the converted address between computing it and using
+// it - silently turning a CAS on a guest pointer into a CAS on whatever the temporary last held.
+//
+// TelemetrySetValue at the bottom of this file is the one op here that is NOT a guest access; its
+// pointer comes out of CpuStateFrame and is already a host address.
 DEF_OP(CASPair) {
   auto Op = IROp->C<IR::IROp_CASPair>();
   LOGMAN_THROW_A_FMT(IROp->ElementSize == IR::OpSize::i32Bit || IROp->ElementSize == IR::OpSize::i64Bit, "Wrong element size");
@@ -20,7 +28,7 @@ DEF_OP(CASPair) {
   auto Expected1 = GetReg(Op->ExpectedHi);
   auto Desired0 = GetReg(Op->DesiredLo);
   auto Desired1 = GetReg(Op->DesiredHi);
-  auto MemSrc = GetReg(Op->Addr);
+  auto MemSrc = GetGuestMemReg(Op->Addr);
 
   const auto EmitSize = IROp->ElementSize == IR::OpSize::i64Bit ? ARMEmitter::Size::i64Bit : ARMEmitter::Size::i32Bit;
   if (CTX->HostFeatures.SupportsAtomics) {
@@ -99,7 +107,7 @@ DEF_OP(CAS) {
 
   auto Expected = GetReg(Op->Expected);
   auto Desired = GetReg(Op->Desired);
-  auto MemSrc = GetReg(Op->Addr);
+  auto MemSrc = GetGuestMemReg(Op->Addr);
   auto Dst = GetReg(Node);
 
   if (CTX->HostFeatures.SupportsAtomics) {
@@ -146,7 +154,7 @@ DEF_OP(AtomicSwap) {
                                                                                                                                  "d CAS "
                                                                                                                                  "size");
 
-  auto MemSrc = GetReg(Op->Addr);
+  auto MemSrc = GetGuestMemReg(Op->Addr);
   auto Src = GetReg(Op->Value);
 
   const auto EmitSize = ConvertSize(IROp);
@@ -172,7 +180,7 @@ DEF_OP(AtomicFetchAdd) {
   const auto EmitSize = ConvertSize(IROp);
   const auto SubEmitSize = ConvertSubRegSize8(IROp->Size);
 
-  auto MemSrc = GetReg(Op->Addr);
+  auto MemSrc = GetGuestMemReg(Op->Addr);
   auto Src = GetReg(Op->Value);
 
   if (CTX->HostFeatures.SupportsAtomics) {
@@ -193,7 +201,7 @@ DEF_OP(AtomicFetchSub) {
   const auto EmitSize = ConvertSize(IROp);
   const auto SubEmitSize = ConvertSubRegSize8(IROp->Size);
 
-  auto MemSrc = GetReg(Op->Addr);
+  auto MemSrc = GetGuestMemReg(Op->Addr);
   auto Src = GetReg(Op->Value);
 
   if (CTX->HostFeatures.SupportsAtomics) {
@@ -215,7 +223,7 @@ DEF_OP(AtomicFetchAnd) {
   const auto EmitSize = ConvertSize(IROp);
   const auto SubEmitSize = ConvertSubRegSize8(IROp->Size);
 
-  auto MemSrc = GetReg(Op->Addr);
+  auto MemSrc = GetGuestMemReg(Op->Addr);
   auto Src = GetReg(Op->Value);
 
   if (CTX->HostFeatures.SupportsAtomics) {
@@ -237,7 +245,7 @@ DEF_OP(AtomicFetchCLR) {
   const auto EmitSize = ConvertSize(IROp);
   const auto SubEmitSize = ConvertSubRegSize8(IROp->Size);
 
-  auto MemSrc = GetReg(Op->Addr);
+  auto MemSrc = GetGuestMemReg(Op->Addr);
   auto Src = GetReg(Op->Value);
 
   if (CTX->HostFeatures.SupportsAtomics) {
@@ -258,7 +266,7 @@ DEF_OP(AtomicFetchOr) {
   const auto EmitSize = ConvertSize(IROp);
   const auto SubEmitSize = ConvertSubRegSize8(IROp->Size);
 
-  auto MemSrc = GetReg(Op->Addr);
+  auto MemSrc = GetGuestMemReg(Op->Addr);
   auto Src = GetReg(Op->Value);
 
   if (CTX->HostFeatures.SupportsAtomics) {
@@ -279,7 +287,7 @@ DEF_OP(AtomicFetchXor) {
   const auto EmitSize = ConvertSize(IROp);
   const auto SubEmitSize = ConvertSubRegSize8(IROp->Size);
 
-  auto MemSrc = GetReg(Op->Addr);
+  auto MemSrc = GetGuestMemReg(Op->Addr);
   auto Src = GetReg(Op->Value);
 
   if (CTX->HostFeatures.SupportsAtomics) {
@@ -300,7 +308,7 @@ DEF_OP(AtomicFetchNeg) {
   const auto EmitSize = ConvertSize(IROp);
   const auto SubEmitSize = ConvertSubRegSize8(IROp->Size);
 
-  auto MemSrc = GetReg(Op->Addr);
+  auto MemSrc = GetGuestMemReg(Op->Addr);
 
   if (CTX->HostFeatures.SupportsAtomics) {
     // Use a CAS loop to avoid needing to emulate unaligned LLSC atomics

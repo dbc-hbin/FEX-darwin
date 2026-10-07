@@ -533,6 +533,25 @@
           "Useful as a debugging feature."
         ]
       },
+      "Guest32Base": {
+        "Type": "uint64",
+        "Default": "0",
+        "Feature": "GuestWindow",
+        "AffectsCodeGen": "true",
+        "Desc": [
+          "Host address that guest address 0 maps to, for 32-bit guests only ('the guest window').",
+          "0 (the default) means the guest address space is identity mapped, as in every other FEX",
+          "configuration. Only present in builds with ENABLE_GUEST_WINDOW (the iOS WOW64 module).",
+          "When non-zero, the JIT reserves x19 (guest base) and x24 (address scratch) out of the",
+          "32-bit register pool and forms host addresses as `Base + zext32(EA)`. Guest RIP,",
+          "LookupCache keys, VirtualMemSize, segment bases and code-invalidation ranges all stay in",
+          "the guest namespace.",
+          "Ignored (forced to 0) in 64-bit mode. Must be page aligned, and [Base, Base + 4GiB) must be",
+          "reserved before any guest code runs.",
+          "The WOW64 module sets it from the base Wine publishes; it is a normal option so that the",
+          "codegen can also be exercised from the instruction-count harness."
+        ]
+      },
       "DisableTelemetry": {
         "Type": "bool",
         "Default": "false",

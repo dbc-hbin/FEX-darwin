@@ -584,6 +584,114 @@ DEF_OP(ContextClear) {
   }
 }
 
+#ifdef FEX_GUEST_WINDOW
+// Guest window helpers. See JITClass.h for the contract these implement.
+ARMEmitter::Register Arm64JITCore::ApplyGuestBase(ARMEmitter::Register GuestReg, ARMEmitter::Register Tmp) {
+  if (!GuestBase) {
+    return GuestReg;
+  }
+
+  // host = REG_GUEST_BASE + zext32(guest). UXTW makes the zero extension explicit so we never
+  // depend on whatever happened to be in the upper half of the guest register, and the whole
+  // sequence is a single flag-free instruction (guest arithmetic flags live in the host NZCV, so
+  // nothing in an address path may write them).
+  add(ARMEmitter::Size::i64Bit, Tmp, REG_GUEST_BASE.R(), GuestReg, ARMEmitter::ExtendedType::UXTW, 0);
+  return Tmp;
+}
+
+ARMEmitter::Register Arm64JITCore::GetGuestMemReg(IR::OrderedNodeWrapper Addr, ARMEmitter::Register Tmp) {
+  return ApplyGuestBase(GetReg(Addr), Tmp);
+}
+
+Arm64JITCore::GuestMemAddr Arm64JITCore::GetGuestMemAddr(IR::OpSize AccessSize, IR::OrderedNodeWrapper Addr, IR::OrderedNodeWrapper Offset,
+                                                         IR::MemOffsetType OffsetType, uint8_t OffsetScale, ARMEmitter::Register Tmp,
+                                                         bool HostAddr, bool AllowRegOffsetFold) {
+  const auto AddrReg = GetReg(Addr);
+  if (!GuestBase) {
+    // Identity mapped: nothing to do, and nothing is emitted.
+    return {AddrReg, Offset, OffsetType, OffsetScale};
+  }
+
+  if (HostAddr) {
+    // The operand is already a host pointer (IROp_LoadMem/IROp_StoreMem::HostAddr - FEXCore's own
+    // context-relative storage, never anything an x86 instruction can name). Leave the address and
+    // its offset exactly as the identity-mapped path would, so the emitted access is the same
+    // instruction it has always been. IREmitter::IsContextRelativeAddress validates the converse at
+    // IR-emission time: a context-relative address may not reach here without this flag.
+    return {AddrReg, Offset, OffsetType, OffsetScale};
+  }
+
+  const auto NoOffset = IR::OrderedNodeWrapper::WrapOffset(0);
+
+  if (Offset.IsInvalid()) {
+    if (AllowRegOffsetFold) {
+      /* `[REG_GUEST_BASE, wEA, uxtw #0]`. The UXTW in the addressing mode does
+       * exactly the job the `add ..., UXTW` did - zero-extend the guest EA from 32 bits, so nothing
+       * depends on the upper half of the guest register - and the whole conversion becomes free.
+       * The single-conversion and 4GiB-wrap rules in the class comment still hold: there is no
+       * displacement here, so there is nothing that could be added on the far side of the window. */
+      return {REG_GUEST_BASE.R(), NoOffset, IR::MemOffsetType::SXTX, 1, true, AddrReg};
+    }
+    return {ApplyGuestBase(AddrReg, Tmp), NoOffset, IR::MemOffsetType::SXTX, 1};
+  }
+
+  if (OffsetScale != 1 && OffsetScale != IR::OpSizeToSize(AccessSize)) {
+    LOGMAN_MSG_A_FMT("Unhandled GetGuestMemAddr OffsetScale: {}", OffsetScale);
+  }
+
+  // Fold the offset into the guest address first, then apply the base. Two instructions, and the
+  // order is the whole point: `Base + zext32(EA + disp)` is not `Base + zext32(EA) + disp`. The
+  // second form leaves the window whenever the effective address wraps at 4GiB (which x86 does and
+  // a 64-bit host add does not), and for a negative displacement it can land *below* the window
+  // base, in whatever another 32-bit pseudo-process owns.
+  //
+  // The fold itself is done at 64-bit width and the truncation to 32 bits is left to the UXTW on
+  // the final add, which has to be there anyway. That keeps the sign-extended displacements and the
+  // extended-register offset forms encodable without worrying about their 32-bit spellings.
+  uint64_t Const;
+  if (IsInlineConstant(Offset, &Const)) {
+    // Matching GenerateMemOperand, an inline constant offset is a byte displacement and is NOT
+    // scaled by OffsetScale. Offsets reaching here are the sign-extended 64-bit form of a signed
+    // displacement.
+    const int64_t Signed = static_cast<int64_t>(Const);
+    if (Signed >= 0 && Signed <= 4095) {
+      add(ARMEmitter::Size::i64Bit, Tmp, AddrReg, static_cast<uint64_t>(Signed));
+    } else if (Signed < 0 && Signed >= -4095) {
+      sub(ARMEmitter::Size::i64Bit, Tmp, AddrReg, static_cast<uint64_t>(-Signed));
+    } else {
+      LoadConstant(ARMEmitter::Size::i64Bit, Tmp, Const);
+      add(ARMEmitter::Size::i64Bit, Tmp, AddrReg, Tmp);
+    }
+  } else {
+    const auto RegOffset = GetReg(Offset);
+    switch (OffsetType) {
+    case IR::MemOffsetType::SXTX:
+      add(ARMEmitter::Size::i64Bit, Tmp, AddrReg, RegOffset, ARMEmitter::ShiftType::LSL, FEXCore::ilog2(OffsetScale));
+      break;
+    case IR::MemOffsetType::UXTW:
+      add(ARMEmitter::Size::i64Bit, Tmp, AddrReg, RegOffset, ARMEmitter::ExtendedType::UXTW, FEXCore::ilog2(OffsetScale));
+      break;
+    case IR::MemOffsetType::SXTW:
+      add(ARMEmitter::Size::i64Bit, Tmp, AddrReg, RegOffset, ARMEmitter::ExtendedType::SXTW, FEXCore::ilog2(OffsetScale));
+      break;
+    default: LOGMAN_MSG_A_FMT("Unhandled GetGuestMemAddr OffsetType: {}", OffsetType); break;
+    }
+  }
+
+  // UXTW here does double duty: it wraps the effective address at 4GiB the way x86 does, and it
+  // makes the zero extension explicit so nothing depends on the upper half of the fold above.
+  //
+  // when the consumer takes a register-offset operand, that UXTW add is the
+  // addressing mode, so it does not need to be an instruction. Tmp still holds the *completed*
+  // guest effective address, which is what keeps the fold-then-convert ordering intact.
+  if (AllowRegOffsetFold) {
+    return {REG_GUEST_BASE.R(), NoOffset, IR::MemOffsetType::SXTX, 1, true, Tmp};
+  }
+  add(ARMEmitter::Size::i64Bit, Tmp, REG_GUEST_BASE.R(), Tmp, ARMEmitter::ExtendedType::UXTW, 0);
+  return {Tmp, NoOffset, IR::MemOffsetType::SXTX, 1};
+}
+#endif
+
 ARMEmitter::ExtendedMemOperand Arm64JITCore::GenerateMemOperand(
   IR::OpSize AccessSize, ARMEmitter::Register Base, IR::OrderedNodeWrapper Offset, IR::MemOffsetType OffsetType, uint8_t OffsetScale) {
   if (Offset.IsInvalid()) {
@@ -611,6 +719,16 @@ ARMEmitter::ExtendedMemOperand Arm64JITCore::GenerateMemOperand(
 
   FEX_UNREACHABLE;
 }
+
+#ifdef FEX_GUEST_WINDOW
+// See GuestMemAddr::RegOffsetFold.
+ARMEmitter::ExtendedMemOperand Arm64JITCore::GenerateMemOperand(IR::OpSize AccessSize, const GuestMemAddr& Guest) {
+  if (Guest.RegOffsetFold) {
+    return ARMEmitter::ExtendedMemOperand(Guest.Base.X(), Guest.IndexReg.X(), ARMEmitter::ExtendedType::UXTW, 0);
+  }
+  return GenerateMemOperand(AccessSize, Guest.Base, Guest.Offset, Guest.OffsetType, Guest.OffsetScale);
+}
+#endif
 
 ARMEmitter::Register Arm64JITCore::ApplyMemOperand(IR::OpSize AccessSize, ARMEmitter::Register Base, ARMEmitter::Register Tmp,
                                                    IR::OrderedNodeWrapper Offset, IR::MemOffsetType OffsetType, uint8_t OffsetScale) {
@@ -705,8 +823,18 @@ DEF_OP(LoadMem) {
   const auto Op = IROp->C<IR::IROp_LoadMem>();
   const auto OpSize = IROp->Size;
 
+#ifdef FEX_GUEST_WINDOW
+  // Every lowering below is a plain ldr except the 256-bit SVE one, whose operand has no extend
+  // field, so under a guest window the base add folds into the addressing mode for the rest.
+  const auto Guest = GetGuestMemAddr(OpSize, Op->Addr, Op->Offset, Op->OffsetType, Op->OffsetScale, REG_GUEST_ADDR_TMP.R(), Op->HostAddr,
+                                     OpSize != IR::OpSize::i256Bit);
+  const auto MemReg = Guest.Base;
+  const auto MemSrc = GenerateMemOperand(OpSize, Guest);
+#else
+  const auto& Guest = *Op;
   const auto MemReg = GetReg(Op->Addr);
   const auto MemSrc = GenerateMemOperand(OpSize, MemReg, Op->Offset, Op->OffsetType, Op->OffsetScale);
+#endif
 
   if (Op->Class == IR::RegClass::GPR) {
     const auto Dst = GetReg(Node);
@@ -729,7 +857,7 @@ DEF_OP(LoadMem) {
     case IR::OpSize::i128Bit: ldr(Dst.Q(), MemSrc); break;
     case IR::OpSize::i256Bit: {
       LOGMAN_THROW_A_FMT(HostSupportsSVE256, "Need SVE256 support in order to use {} with 256-bit operation", __func__);
-      const auto Operand = GenerateSVEMemOperand(OpSize, MemReg, Op->Offset, Op->OffsetType, Op->OffsetScale);
+      const auto Operand = GenerateSVEMemOperand(OpSize, MemReg, Guest.Offset, Guest.OffsetType, Guest.OffsetScale);
       ld1b<ARMEmitter::SubRegSize::i8Bit>(Dst.Z(), PRED_TMP_32B.Zeroing(), Operand);
       break;
     }
@@ -740,7 +868,11 @@ DEF_OP(LoadMem) {
 
 DEF_OP(LoadMemPair) {
   const auto Op = IROp->C<IR::IROp_LoadMemPair>();
-  const auto Addr = GetReg(Op->Addr);
+  // Guest window: Op->Offset here is a u32 ldp immediate, not an IR operand, so GetGuestMemAddr cannot
+  // fold it. It is non-negative and bounded by the ldp scaled-imm7 range, so the only case where
+  // `Base + zext32(EA) + Offset` differs from `Base + zext32(EA + Offset)` is a guest access that
+  // straddles the 4GiB boundary - which is already a wild access under the identity mapping too.
+  const auto Addr = GetGuestMemReg(Op->Addr);
 
   if (Op->Class == IR::RegClass::GPR) {
     const auto Dst1 = GetReg(Op->OutValue1);
@@ -768,19 +900,37 @@ DEF_OP(LoadMemTSO) {
   const auto Op = IROp->C<IR::IROp_LoadMemTSO>();
   const auto OpSize = IROp->Size;
 
+#ifndef FEX_GUEST_WINDOW
+  const auto& Guest = *Op;
   const auto MemReg = GetReg(Op->Addr);
 
+#endif
   if (Op->Class == IR::RegClass::GPR) {
     LOGMAN_THROW_A_FMT(Op->Offset.IsInvalid() || CTX->HostFeatures.SupportsTSOImm9, "unexpected offset");
     LOGMAN_THROW_A_FMT(Op->OffsetScale == 1, "unexpected offset scale");
     LOGMAN_THROW_A_FMT(Op->OffsetType == IR::MemOffsetType::SXTX, "unexpected offset type");
   }
 
+  // With a guest window this folds the displacement into the address and hands back an
+  // invalid Guest.Offset, so the ldar/ldapr/ldapur forms below all end up as plain `[Xn]` on a host
+  // address. Keeping every atomic and acquire form in the `[Xn]` shape is deliberate: the unaligned
+  // backpatcher in Utils/ArchHelpers/Arm64.cpp decodes these encodings, and it must never have to
+  // learn about an extended-register addressing mode.
+  //
+  // The vector class is the exception - it lowers to a plain ldr (plus a DMB when
+  // vector TSO is on), which the backpatcher never sees and which does have a register-offset form,
+  // so it takes the fold. That is the whole x87/SSE load path on a VectorTSOEnabled=0 build.
+#ifdef FEX_GUEST_WINDOW
+  const auto Guest = GetGuestMemAddr(OpSize, Op->Addr, Op->Offset, Op->OffsetType, Op->OffsetScale, REG_GUEST_ADDR_TMP.R(), false,
+                                     Op->Class != IR::RegClass::GPR && OpSize != IR::OpSize::i256Bit);
+  const auto MemReg = Guest.Base;
+#endif
+
   if (CTX->HostFeatures.SupportsTSOImm9 && Op->Class == IR::RegClass::GPR) {
     const auto Dst = GetReg(Node);
     uint64_t Offset = 0;
-    if (!Op->Offset.IsInvalid()) {
-      bool IsInline = IsInlineConstant(Op->Offset, &Offset);
+    if (!Guest.Offset.IsInvalid()) {
+      bool IsInline = IsInlineConstant(Guest.Offset, &Offset);
       LOGMAN_THROW_A_FMT(IsInline, "expected immediate");
     }
 
@@ -830,7 +980,11 @@ DEF_OP(LoadMemTSO) {
     }
   } else {
     const auto Dst = GetVReg(Node);
+#ifdef FEX_GUEST_WINDOW
+    const auto MemSrc = GenerateMemOperand(OpSize, Guest);
+#else
     const auto MemSrc = GenerateMemOperand(OpSize, MemReg, Op->Offset, Op->OffsetType, Op->OffsetScale);
+#endif
     switch (OpSize) {
     case IR::OpSize::i8Bit: ldrb(Dst, MemSrc); break;
     case IR::OpSize::i16Bit: ldrh(Dst, MemSrc); break;
@@ -839,7 +993,7 @@ DEF_OP(LoadMemTSO) {
     case IR::OpSize::i128Bit: ldr(Dst.Q(), MemSrc); break;
     case IR::OpSize::i256Bit: {
       LOGMAN_THROW_A_FMT(HostSupportsSVE256, "Need SVE256 support in order to use {} with 256-bit operation", __func__);
-      const auto MemSrc = GenerateSVEMemOperand(OpSize, MemReg, Op->Offset, Op->OffsetType, Op->OffsetScale);
+      const auto MemSrc = GenerateSVEMemOperand(OpSize, MemReg, Guest.Offset, Guest.OffsetType, Guest.OffsetScale);
       ld1b<ARMEmitter::SubRegSize::i8Bit>(Dst.Z(), PRED_TMP_32B.Zeroing(), MemSrc);
       break;
     }
@@ -866,10 +1020,18 @@ DEF_OP(VLoadVectorMasked) {
 
   const auto Dst = GetVReg(Node);
   const auto MaskReg = GetVReg(Op->Mask);
+  // Guest window: the non-SVE fallback below rebuilds working pointers out of MemReg with TMP2, so MemReg
+  // must already be a host address by the time that loop starts.
+#ifdef FEX_GUEST_WINDOW
+  const auto Guest = GetGuestMemAddr(OpSize, Op->Addr, Op->Offset, Op->OffsetType, Op->OffsetScale);
+  const auto MemReg = Guest.Base;
+#else
+  const auto& Guest = *Op;
   const auto MemReg = GetReg(Op->Addr);
+#endif
 
   if (HostSupportsSVE128 || HostSupportsSVE256) {
-    const auto MemSrc = GenerateSVEMemOperand(OpSize, MemReg, Op->Offset, Op->OffsetType, Op->OffsetScale);
+    const auto MemSrc = GenerateSVEMemOperand(OpSize, MemReg, Guest.Offset, Guest.OffsetType, Guest.OffsetScale);
 
     // Check if the sign bit is set for the given element size.
     cmplt(SubRegSize, CMPPredicate, GoverningPredicate.Zeroing(), MaskReg.Z(), 0);
@@ -914,9 +1076,9 @@ DEF_OP(VLoadVectorMasked) {
     auto TempMemReg = MemReg;
     movi(ARMEmitter::SubRegSize::i64Bit, TempDst.Q(), 0);
     uint64_t Const {};
-    if (Op->Offset.IsInvalid()) {
+    if (Guest.Offset.IsInvalid()) {
       // Intentional no-op.
-    } else if (IsInlineConstant(Op->Offset, &Const)) {
+    } else if (IsInlineConstant(Guest.Offset, &Const)) {
       TempMemReg = TMP2;
       add(ARMEmitter::Size::i64Bit, TMP2, MemReg, Const);
     } else {
@@ -969,9 +1131,16 @@ DEF_OP(VStoreVectorMasked) {
 
   const auto RegData = GetVReg(Op->Data);
   const auto MaskReg = GetVReg(Op->Mask);
+  // Guest window: as in VLoadVectorMasked, the non-SVE fallback derives working pointers from MemReg.
+#ifdef FEX_GUEST_WINDOW
+  const auto Guest = GetGuestMemAddr(OpSize, Op->Addr, Op->Offset, Op->OffsetType, Op->OffsetScale);
+  const auto MemReg = Guest.Base;
+#else
+  const auto& Guest = *Op;
   const auto MemReg = GetReg(Op->Addr);
+#endif
   if (HostSupportsSVE128 || HostSupportsSVE256) {
-    const auto MemDst = GenerateSVEMemOperand(OpSize, MemReg, Op->Offset, Op->OffsetType, Op->OffsetScale);
+    const auto MemDst = GenerateSVEMemOperand(OpSize, MemReg, Guest.Offset, Guest.OffsetType, Guest.OffsetScale);
 
     // Check if the sign bit is set for the given element size.
     cmplt(SubRegSize, CMPPredicate, GoverningPredicate.Zeroing(), MaskReg.Z(), 0);
@@ -1015,9 +1184,9 @@ DEF_OP(VStoreVectorMasked) {
     auto TempMemReg = MemReg;
 
     uint64_t Const {};
-    if (Op->Offset.IsInvalid()) {
+    if (Guest.Offset.IsInvalid()) {
       // Intentional no-op.
-    } else if (IsInlineConstant(Op->Offset, &Const)) {
+    } else if (IsInlineConstant(Guest.Offset, &Const)) {
       TempMemReg = TMP2;
       add(ARMEmitter::Size::i64Bit, TMP2, MemReg, Const);
     } else {
@@ -1150,13 +1319,20 @@ void Arm64JITCore::Emulate128BitGather(IR::OpSize Size, IR::OpSize ElementSize, 
       }
     }
 
+    // Guest window: the gather address has now been formed *completely* in the guest namespace, at
+    // AddrSize width - so for a 32-bit guest `BaseAddr + Index * Scale` has already wrapped at 4GiB
+    // exactly as x86 does. Converting to a host address is therefore correct only at this point;
+    // converting BaseAddr on its own and adding the index afterwards would let the index carry the
+    // access outside the window.
+    const auto HostMemReg = ApplyGuestBase(TempMemReg);
+
     // Now that the address is calculated. Do the load.
     switch (ElementSize) {
-    case IR::OpSize::i8Bit: ld1<ARMEmitter::SubRegSize::i8Bit>(ResultReg.Q(), i, TempMemReg); break;
-    case IR::OpSize::i16Bit: ld1<ARMEmitter::SubRegSize::i16Bit>(ResultReg.Q(), i, TempMemReg); break;
-    case IR::OpSize::i32Bit: ld1<ARMEmitter::SubRegSize::i32Bit>(ResultReg.Q(), i, TempMemReg); break;
-    case IR::OpSize::i64Bit: ld1<ARMEmitter::SubRegSize::i64Bit>(ResultReg.Q(), i, TempMemReg); break;
-    case IR::OpSize::i128Bit: ldr(ResultReg.Q(), TempMemReg, 0); break;
+    case IR::OpSize::i8Bit: ld1<ARMEmitter::SubRegSize::i8Bit>(ResultReg.Q(), i, HostMemReg); break;
+    case IR::OpSize::i16Bit: ld1<ARMEmitter::SubRegSize::i16Bit>(ResultReg.Q(), i, HostMemReg); break;
+    case IR::OpSize::i32Bit: ld1<ARMEmitter::SubRegSize::i32Bit>(ResultReg.Q(), i, HostMemReg); break;
+    case IR::OpSize::i64Bit: ld1<ARMEmitter::SubRegSize::i64Bit>(ResultReg.Q(), i, HostMemReg); break;
+    case IR::OpSize::i128Bit: ldr(ResultReg.Q(), HostMemReg, 0); break;
     default: LOGMAN_MSG_A_FMT("Unhandled {} size: {}", __func__, ElementSize); FEX_UNREACHABLE;
     }
 
@@ -1203,7 +1379,12 @@ DEF_OP(VLoadVectorGatherMasked) {
     !Op->VectorIndexHigh.IsInvalid() ? std::make_optional(GetVReg(Op->VectorIndexHigh)) : std::nullopt;
 
   ///< If the host supports SVE and the offset scale matches SVE limitations then it can do an SVE style load.
-  const bool SupportsSVELoad = (HostSupportsSVE128 || HostSupportsSVE256) &&
+  // Guest window: !GuestBase is belt-and-braces. The SVE form builds `[Xbase, Zindex]` in hardware, so the
+  // window base cannot be applied after the index contributes - and this path already requires a
+  // 64-bit AddrSize, which a 32-bit guest never produces. Keeping the condition explicit means a
+  // future OpcodeDispatcher change that starts emitting a 64-bit AddrSize in 32-bit mode degrades to
+  // the (correct) emulated gather instead of silently escaping the window.
+  const bool SupportsSVELoad = !GuestBase && (HostSupportsSVE128 || HostSupportsSVE256) &&
                                (OffsetScale == 1 || OffsetScale == IR::OpSizeToSize(VectorIndexSize)) &&
                                VectorIndexSize == IROp->ElementSize && Op->AddrSize == IR::OpSize::i64Bit;
 
@@ -1293,7 +1474,9 @@ DEF_OP(VLoadVectorGatherMaskedQPS) {
     !Op->VectorIndexHigh.IsInvalid() ? std::make_optional(GetVReg(Op->VectorIndexHigh)) : std::nullopt;
 
   ///< If the host supports SVE and the offset scale matches SVE limitations then it can do an SVE style load.
-  const bool SupportsSVELoad = HostSupportsSVE128 && (OffsetScale == 1 || OffsetScale == 4) && Op->AddrSize == IR::OpSize::i64Bit;
+  // Guest window: see the note on VLoadVectorGatherMasked for why !GuestBase is here.
+  const bool SupportsSVELoad = !GuestBase && HostSupportsSVE128 && (OffsetScale == 1 || OffsetScale == 4) &&
+                               Op->AddrSize == IR::OpSize::i64Bit;
 
   if (SupportsSVELoad) {
     ARMEmitter::SVEModType ModType = ARMEmitter::SVEModType::MOD_NONE;
@@ -1368,7 +1551,7 @@ DEF_OP(VLoadVectorElement) {
 
   const auto Dst = GetVReg(Node);
   const auto DstSrc = GetVReg(Op->DstSrc);
-  const auto MemReg = GetReg(Op->Addr);
+  const auto MemReg = GetGuestMemReg(Op->Addr);
 
   LOGMAN_THROW_A_FMT(ElementSize == IR::OpSize::i8Bit || ElementSize == IR::OpSize::i16Bit || ElementSize == IR::OpSize::i32Bit ||
                        ElementSize == IR::OpSize::i64Bit || ElementSize == IR::OpSize::i128Bit,
@@ -1405,7 +1588,7 @@ DEF_OP(VStoreVectorElement) {
   const auto ElementSize = IROp->ElementSize;
 
   const auto Value = GetVReg(Op->Value);
-  const auto MemReg = GetReg(Op->Addr);
+  const auto MemReg = GetGuestMemReg(Op->Addr);
 
   LOGMAN_THROW_A_FMT(ElementSize == IR::OpSize::i8Bit || ElementSize == IR::OpSize::i16Bit || ElementSize == IR::OpSize::i32Bit ||
                        ElementSize == IR::OpSize::i64Bit || ElementSize == IR::OpSize::i128Bit,
@@ -1440,7 +1623,7 @@ DEF_OP(VBroadcastFromMem) {
   const auto ElementSize = IROp->ElementSize;
 
   const auto Dst = GetVReg(Node);
-  const auto MemReg = GetReg(Op->Address);
+  const auto MemReg = GetGuestMemReg(Op->Address);
 
   LOGMAN_THROW_A_FMT(ElementSize == IR::OpSize::i8Bit || ElementSize == IR::OpSize::i16Bit || ElementSize == IR::OpSize::i32Bit ||
                        ElementSize == IR::OpSize::i64Bit || ElementSize == IR::OpSize::i128Bit,
@@ -1484,6 +1667,22 @@ DEF_OP(Push) {
   auto Src = GetReg(Op->Value);
   const auto AddrSrc = GetReg(Op->Addr);
   const auto Dst = GetReg(Node);
+
+  if (GuestBase) {
+    // Keep ESP unchanged until the faultable store succeeds, including when Src aliases ESP.
+    sub(ARMEmitter::Size::i32Bit, TMP3, AddrSrc, ValueSize);
+    const auto HostAddr = ARMEmitter::ExtendedMemOperand(REG_GUEST_BASE, TMP3, ARMEmitter::ExtendedType::UXTW, 0);
+
+    switch (ValueSize) {
+    case 1: strb(Src, HostAddr); break;
+    case 2: strh(Src, HostAddr); break;
+    case 4: str(Src.W(), HostAddr); break;
+    case 8: str(Src.X(), HostAddr); break;
+    default: LOGMAN_MSG_A_FMT("Unhandled {} size: {}", __func__, ValueSize); break;
+    }
+    mov(ARMEmitter::Size::i32Bit, Dst, TMP3);
+    return;
+  }
 
   bool NeedsMoveAfterwards = false;
   if (Dst != AddrSrc) {
@@ -1570,6 +1769,20 @@ DEF_OP(PushTwo) {
   auto Src2 = GetReg(Op->Value2);
   const auto Dst = GetReg(Op->Addr);
 
+  if (GuestBase) {
+    // Commit the architectural stack pointer only after both values have been stored.
+    sub(ARMEmitter::Size::i32Bit, TMP3, Dst, 2 * ValueSize);
+    const auto HostAddr = ApplyGuestBase(TMP3);
+
+    switch (ValueSize) {
+    case 4: stp<ARMEmitter::IndexType::OFFSET>(Src1.W(), Src2.W(), HostAddr, 0); break;
+    case 8: stp<ARMEmitter::IndexType::OFFSET>(Src1.X(), Src2.X(), HostAddr, 0); break;
+    default: LOGMAN_MSG_A_FMT("Unhandled {} size: {}", __func__, ValueSize); break;
+    }
+    mov(ARMEmitter::Size::i32Bit, Dst, TMP3);
+    return;
+  }
+
   switch (ValueSize) {
   case 4: {
     stp<ARMEmitter::IndexType::PRE>(Src1.W(), Src2.W(), Dst, -2 * ValueSize);
@@ -1593,6 +1806,26 @@ DEF_OP(Pop) {
   const auto Dst = GetReg(Op->OutValue);
 
   LOGMAN_THROW_A_FMT(Dst != Addr, "Invalid");
+
+  if (GuestBase) {
+    // Guest window: post-indexed writeback would put a host address in the guest's ESP, so load through
+    // the converted *original* pointer with no writeback and advance the architectural pointer
+    // afterwards, in the guest namespace and at i32Bit width.
+    // as Push -- fold the window add into the load's addressing mode, so a guest
+    // `pop` is `ldr` + `add` rather than `add` + `ldur` + `add`.
+    const auto HostAddr = ARMEmitter::ExtendedMemOperand(REG_GUEST_BASE, Addr.X(), ARMEmitter::ExtendedType::UXTW, 0);
+
+    switch (Size) {
+    case 1: ldrb(Dst, HostAddr); break;
+    case 2: ldrh(Dst, HostAddr); break;
+    case 4: ldr(Dst.W(), HostAddr); break;
+    case 8: ldr(Dst.X(), HostAddr); break;
+    default: LOGMAN_MSG_A_FMT("Unhandled {} size: {}", __func__, Op->Size); return;
+    }
+
+    add(ARMEmitter::Size::i32Bit, Addr, Addr, Size);
+    return;
+  }
 
   switch (Size) {
   case 1: {
@@ -1633,6 +1866,20 @@ DEF_OP(PopTwo) {
   LOGMAN_THROW_A_FMT(Dst1 != Addr && Dst2 != Addr, "Invalid");
   LOGMAN_THROW_A_FMT(Dst1 != Dst2, "Invalid");
 
+  if (GuestBase) {
+    // Guest window: see Pop.
+    const auto HostAddr = ApplyGuestBase(Addr);
+
+    switch (Size) {
+    case 4: ldp<ARMEmitter::IndexType::OFFSET>(Dst1.W(), Dst2.W(), HostAddr, 0); break;
+    case 8: ldp<ARMEmitter::IndexType::OFFSET>(Dst1.X(), Dst2.X(), HostAddr, 0); break;
+    default: LOGMAN_MSG_A_FMT("Unhandled {} size: {}", __func__, Op->Size); return;
+    }
+
+    add(ARMEmitter::Size::i32Bit, Addr, Addr, 2 * Size);
+    return;
+  }
+
   switch (Size) {
   case 4: {
     ldp<ARMEmitter::IndexType::POST>(Dst1.W(), Dst2.W(), Addr, 2 * Size);
@@ -1653,8 +1900,17 @@ DEF_OP(StoreMem) {
   const auto Op = IROp->C<IR::IROp_StoreMem>();
   const auto OpSize = IROp->Size;
 
+#ifdef FEX_GUEST_WINDOW
+  // As LoadMem: plain str everywhere except the 256-bit SVE lowering.
+  const auto Guest = GetGuestMemAddr(OpSize, Op->Addr, Op->Offset, Op->OffsetType, Op->OffsetScale, REG_GUEST_ADDR_TMP.R(), Op->HostAddr,
+                                     OpSize != IR::OpSize::i256Bit);
+  const auto MemReg = Guest.Base;
+  const auto MemSrc = GenerateMemOperand(OpSize, Guest);
+#else
+  const auto& Guest = *Op;
   const auto MemReg = GetReg(Op->Addr);
   const auto MemSrc = GenerateMemOperand(OpSize, MemReg, Op->Offset, Op->OffsetType, Op->OffsetScale);
+#endif
 
   if (Op->Class == IR::RegClass::GPR) {
     const auto Src = GetZeroableReg(Op->Value);
@@ -1691,7 +1947,7 @@ DEF_OP(StoreMem) {
     }
     case IR::OpSize::i256Bit: {
       LOGMAN_THROW_A_FMT(HostSupportsSVE256, "Need SVE256 support in order to use {} with 256-bit operation", __func__);
-      const auto MemSrc = GenerateSVEMemOperand(OpSize, MemReg, Op->Offset, Op->OffsetType, Op->OffsetScale);
+      const auto MemSrc = GenerateSVEMemOperand(OpSize, MemReg, Guest.Offset, Guest.OffsetType, Guest.OffsetScale);
       st1b<ARMEmitter::SubRegSize::i8Bit>(Src.Z(), PRED_TMP_32B, MemSrc);
       break;
     }
@@ -1707,7 +1963,7 @@ DEF_OP(StoreMemX87SVEOptPredicate) {
   LOGMAN_THROW_A_FMT(HostSupportsSVE128 || HostSupportsSVE256, "StoreMemX87SVEOptPredicate needs SVE support");
 
   const auto RegData = GetVReg(Op->Value);
-  const auto MemReg = GetReg(Op->Addr);
+  const auto MemReg = GetGuestMemReg(Op->Addr);
   const auto MemDst = ARMEmitter::SVEMemOperand(MemReg.X(), 0);
 
   switch (IROp->ElementSize) {
@@ -1735,7 +1991,7 @@ DEF_OP(LoadMemX87SVEOptPredicate) {
   const auto Op = IROp->C<IR::IROp_LoadMemX87SVEOptPredicate>();
   const auto Dst = GetVReg(Node);
   const auto Predicate = PRED_X87_SVEOPT;
-  const auto MemReg = GetReg(Op->Addr);
+  const auto MemReg = GetGuestMemReg(Op->Addr);
 
   LOGMAN_THROW_A_FMT(HostSupportsSVE128 || HostSupportsSVE256, "LoadMemX87SVEOptPredicate needs SVE support");
 
@@ -1765,7 +2021,9 @@ DEF_OP(LoadMemX87SVEOptPredicate) {
 DEF_OP(StoreMemPair) {
   const auto Op = IROp->C<IR::IROp_StoreMemPair>();
   const auto OpSize = IROp->Size;
-  const auto Addr = GetReg(Op->Addr);
+  // Guest window: see the note in LoadMemPair about Op->Offset being a bounded non-negative stp
+  // immediate rather than an IR operand.
+  const auto Addr = GetGuestMemReg(Op->Addr);
 
   if (Op->Class == IR::RegClass::GPR) {
     const auto Src1 = GetZeroableReg(Op->Value1);
@@ -1792,19 +2050,31 @@ DEF_OP(StoreMemTSO) {
   const auto Op = IROp->C<IR::IROp_StoreMemTSO>();
   const auto OpSize = IROp->Size;
 
+#ifndef FEX_GUEST_WINDOW
+  const auto& Guest = *Op;
   const auto MemReg = GetReg(Op->Addr);
 
+#endif
   if (Op->Class == IR::RegClass::GPR) {
     LOGMAN_THROW_A_FMT(Op->Offset.IsInvalid() || CTX->HostFeatures.SupportsTSOImm9, "unexpected offset");
     LOGMAN_THROW_A_FMT(Op->OffsetScale == 1, "unexpected offset scale");
     LOGMAN_THROW_A_FMT(Op->OffsetType == IR::MemOffsetType::SXTX, "unexpected offset type");
   }
 
+  // See LoadMemTSO: with a guest window every release/atomic form below reduces to `[Xn]`
+  // on a host address, which is what the unaligned backpatcher expects to decode. And, as
+  // there, the vector class lowers to a plain str and takes the register-offset fold instead.
+#ifdef FEX_GUEST_WINDOW
+  const auto Guest = GetGuestMemAddr(OpSize, Op->Addr, Op->Offset, Op->OffsetType, Op->OffsetScale, REG_GUEST_ADDR_TMP.R(), false,
+                                     Op->Class != IR::RegClass::GPR && OpSize != IR::OpSize::i256Bit);
+  const auto MemReg = Guest.Base;
+#endif
+
   if (CTX->HostFeatures.SupportsTSOImm9 && Op->Class == IR::RegClass::GPR) {
     const auto Src = GetZeroableReg(Op->Value);
     uint64_t Offset = 0;
-    if (!Op->Offset.IsInvalid()) {
-      bool IsInline = IsInlineConstant(Op->Offset, &Offset);
+    if (!Guest.Offset.IsInvalid()) {
+      bool IsInline = IsInlineConstant(Guest.Offset, &Offset);
       LOGMAN_THROW_A_FMT(IsInline, "expected immediate");
     }
 
@@ -1843,7 +2113,11 @@ DEF_OP(StoreMemTSO) {
       dmb(ARMEmitter::BarrierScope::ISH);
     }
     const auto Src = GetVReg(Op->Value);
+#ifdef FEX_GUEST_WINDOW
+    const auto MemSrc = GenerateMemOperand(OpSize, Guest);
+#else
     const auto MemSrc = GenerateMemOperand(OpSize, MemReg, Op->Offset, Op->OffsetType, Op->OffsetScale);
+#endif
     switch (OpSize) {
     case IR::OpSize::i8Bit: strb(Src, MemSrc); break;
     case IR::OpSize::i16Bit: strh(Src, MemSrc); break;
@@ -1852,7 +2126,7 @@ DEF_OP(StoreMemTSO) {
     case IR::OpSize::i128Bit: str(Src.Q(), MemSrc); break;
     case IR::OpSize::i256Bit: {
       LOGMAN_THROW_A_FMT(HostSupportsSVE256, "Need SVE256 support in order to use {} with 256-bit operation", __func__);
-      const auto Operand = GenerateSVEMemOperand(OpSize, MemReg, Op->Offset, Op->OffsetType, Op->OffsetScale);
+      const auto Operand = GenerateSVEMemOperand(OpSize, MemReg, Guest.Offset, Guest.OffsetType, Guest.OffsetScale);
       st1b<ARMEmitter::SubRegSize::i8Bit>(Src.Z(), PRED_TMP_32B, Operand);
       break;
     }
@@ -1894,6 +2168,15 @@ DEF_OP(MemSet) {
   } else {
     const auto Prefix = GetReg(Op->Prefix);
     add(TMP2, Prefix.X(), MemReg.X());
+  }
+
+  if (GuestBase) {
+    // Guest window: TMP2 is the working pointer the whole memset walks, and it is the only thing here
+    // that gets dereferenced - so it is the only thing converted, and only now that the segment
+    // prefix has already been folded in. Everything else stays guest: MakeFinalAddress() below
+    // derives the op's result from MemReg and Length, and that result goes back into a guest
+    // register (EDI/ESI), so it must never carry the base.
+    add(ARMEmitter::Size::i64Bit, TMP2.R(), REG_GUEST_BASE.R(), TMP2.R(), ARMEmitter::ExtendedType::UXTW, 0);
   }
 
   if (!DirectionIsInline) {
@@ -2129,6 +2412,20 @@ DEF_OP(MemCpy) {
   mov(TMP1, Length.X());
   mov(TMP2, MemRegDest.X());
   mov(TMP3, MemRegSrc.X());
+
+  if (GuestBase) {
+    // Guest window: TMP2/TMP3 are the two working pointers that actually get dereferenced, so both are
+    // converted here and the whole copy below then runs in host space. Note this op needs two live
+    // converted addresses, which is why it uses its own temporaries rather than the single reserved
+    // REG_GUEST_ADDR_TMP.
+    //
+    // The op's two results are *not* derived from these: FinalizeAddresses() reloads MemRegDest,
+    // MemRegSrc and Length at the end, so EDI/ESI receive guest addresses.
+    //
+    // The overlap and distance tests further down compute TMP2 - TMP3, in which the base cancels.
+    add(ARMEmitter::Size::i64Bit, TMP2.R(), REG_GUEST_BASE.R(), TMP2.R(), ARMEmitter::ExtendedType::UXTW, 0);
+    add(ARMEmitter::Size::i64Bit, TMP3.R(), REG_GUEST_BASE.R(), TMP3.R(), ARMEmitter::ExtendedType::UXTW, 0);
+  }
 
   // TMP1 = Length
   // TMP2 = Dest
@@ -2409,7 +2706,7 @@ DEF_OP(CacheLineClear) {
 
   auto Op = IROp->C<IR::IROp_CacheLineClear>();
 
-  auto MemReg = GetReg(Op->Addr);
+  auto MemReg = GetGuestMemReg(Op->Addr);
 
   // Clear dcache only
   // icache doesn't matter here since the guest application shouldn't be calling clflush on JIT code.
@@ -2439,7 +2736,7 @@ DEF_OP(CacheLineClean) {
 
   auto Op = IROp->C<IR::IROp_CacheLineClean>();
 
-  auto MemReg = GetReg(Op->Addr);
+  auto MemReg = GetGuestMemReg(Op->Addr);
 
   // Clean dcache only
   // check host cacheline size again x86_64 size to ensure at least 64 bytes are cleaned
@@ -2458,7 +2755,7 @@ DEF_OP(CacheLineClean) {
 DEF_OP(CacheLineZero) {
   auto Op = IROp->C<IR::IROp_CacheLineZero>();
 
-  auto MemReg = GetReg(Op->Addr);
+  auto MemReg = GetGuestMemReg(Op->Addr);
 
   if (CTX->HostFeatures.SupportsCLZERO) {
     // We can use this instruction directly
@@ -2478,10 +2775,10 @@ DEF_OP(CacheLineZero) {
 
 DEF_OP(Prefetch) {
   auto Op = IROp->C<IR::IROp_Prefetch>();
-  const auto MemReg = GetReg(Op->Addr);
+  const auto Guest = GetGuestMemAddr(IR::OpSize::i64Bit, Op->Addr, Op->Offset, Op->OffsetType, Op->OffsetScale);
 
   // Access size is only ever handled as 8-byte. Even though it is accesssed as a cacheline.
-  const auto MemSrc = GenerateMemOperand(IR::OpSize::i64Bit, MemReg, Op->Offset, Op->OffsetType, Op->OffsetScale);
+  const auto MemSrc = GenerateMemOperand(IR::OpSize::i64Bit, Guest.Base, Guest.Offset, Guest.OffsetType, Guest.OffsetScale);
 
   size_t LUT = (Op->Stream ? 1 : 0) | ((Op->CacheLevel - 1) << 1) | (Op->ForStore ? 1U << 3 : 0);
 
@@ -2523,7 +2820,8 @@ DEF_OP(VStoreNonTemporal) {
   const auto Is128Bit = OpSize == IR::OpSize::i128Bit;
 
   const auto Value = GetVReg(Op->Value);
-  const auto MemReg = GetReg(Op->Addr);
+  // Guest window: Op->Offset is an i8 structure immediate, not an IR operand; see LoadMemPair.
+  const auto MemReg = GetGuestMemReg(Op->Addr);
   const auto Offset = Op->Offset;
 
   if (Is256Bit) {
@@ -2550,7 +2848,7 @@ DEF_OP(VStoreNonTemporalPair) {
   const auto ValueLow = GetVReg(Op->ValueLow);
   const auto ValueHigh = GetVReg(Op->ValueHigh);
 
-  const auto MemReg = GetReg(Op->Addr);
+  const auto MemReg = GetGuestMemReg(Op->Addr);
   const auto Offset = Op->Offset;
 
   stnp(ValueLow.Q(), ValueHigh.Q(), MemReg, Offset);
@@ -2565,7 +2863,8 @@ DEF_OP(VLoadNonTemporal) {
   const auto Is128Bit = OpSize == IR::OpSize::i128Bit;
 
   const auto Dst = GetVReg(Node);
-  const auto MemReg = GetReg(Op->Addr);
+  // Guest window: Op->Offset is an i8 structure immediate, not an IR operand; see LoadMemPair.
+  const auto MemReg = GetGuestMemReg(Op->Addr);
   const auto Offset = Op->Offset;
 
   if (Is256Bit) {

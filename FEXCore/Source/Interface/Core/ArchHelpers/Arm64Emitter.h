@@ -89,6 +89,24 @@ constexpr size_t CPU_AREA_EMULATOR_DATA_OFFSET = 0x30;
 constexpr uint64_t EC_CODE_BITMAP_MAX_ADDRESS = 1ULL << 47;
 #endif
 
+// Guest window registers. Reserved only in 32-bit mode and only when a non-zero GUEST32BASE is
+// configured (ContextImpl::Config.GuestBase, FEX_GUEST_WINDOW builds). Otherwise they stay in the
+// 32-bit dynamic register pool (x32::RA) and nothing changes.
+//
+// REG_GUEST_BASE holds the host address of guest address 0 for the lifetime of a JIT entry.
+// REG_GUEST_ADDR_TMP receives `REG_GUEST_BASE + zext32(EA)` just before a guest memory access (see
+// Arm64JITCore::GetGuestMemReg). It is never register allocated, so no emitter site has to reason
+// about collisions with TMP1-TMP4 or a live IR value.
+//
+// Both come from the tail of x32::RA:
+//  - x19 and x24 are AAPCS64 callee-saved, so they survive every host call the JIT makes (including
+//    `preserve_all` calls) and need no spill/fill around calls.
+//  - Neither is in x32::RA's pair-allocatable prefix (x32::RAPairs == 10), so pairing is undisturbed.
+//  - Neither is in x32::NotPreserved_Dynamic.
+// x18 is the platform register on both Windows and iOS and cannot be used.
+constexpr auto REG_GUEST_BASE = ARMEmitter::XReg::x19;
+constexpr auto REG_GUEST_ADDR_TMP = ARMEmitter::XReg::x24;
+
 // Will force one single instruction block to be generated first if set when entering the JIT filling SRA.
 // FillStaticRegs must preserve this
 constexpr auto ENTRY_FILL_SRA_SINGLE_INST_REG = TMP2;
@@ -121,6 +139,18 @@ public:
 
 protected:
   FEXCore::Context::ContextImpl* EmitterCTX;
+
+  // Host address of guest address 0, or 0 for the usual identity mapping. Mirrors
+  // ContextImpl::Config.GuestBase and is only ever non-zero in 32-bit mode. A constant 0 in builds
+  // without FEX_GUEST_WINDOW, where every `if (GuestBase)` path compiles away.
+#ifdef FEX_GUEST_WINDOW
+  uint64_t GuestBase {};
+
+  // Emits the load of REG_GUEST_BASE. No-op unless a guest window is configured.
+  void LoadGuestBaseReg();
+#else
+  static constexpr uint64_t GuestBase = 0;
+#endif
 
   std::span<const ARMEmitter::Register> StaticRegisters {};
   std::span<const ARMEmitter::Register> GeneralRegisters {};

@@ -63,7 +63,8 @@ void OpDispatchBuilder::SyscallOp(OpcodeArgs, bool IsSyscallInst) {
 
 void OpDispatchBuilder::ThunkOp(OpcodeArgs) {
   const auto GPRSize = GetGPROpSize();
-  uint8_t* sha256 = (uint8_t*)(Op->PC + 2);
+  // The SHA256 literal follows the thunk opcode in guest code, so reading it is a guest read.
+  uint8_t* sha256 = (uint8_t*)(CTX->GetGuestBase() + Op->PC + 2);
 
   if (Is64BitMode) {
     // x86-64 ABI puts the function argument in RDI
@@ -4310,7 +4311,9 @@ void OpDispatchBuilder::UpdatePrefixFromSegment(Ref Segment, uint32_t SegmentReg
   // Fun quirk, if we mask the selector then it is premultiplied by 8 which we need to do for accessing anyway.
   auto SegmentOffset = _And(OpSize::i32Bit, Segment, _Constant(0xfff8));
   Ref SegmentBase = _LoadContextGPRIndexed(GDT, OpSize::i64Bit, offsetof(FEXCore::Core::CPUState, segment_arrays[0]), 8);
-  Ref NewSegment = _LoadMemGPR(OpSize::i64Bit, SegmentBase, SegmentOffset, OpSize::i8Bit, MemOffsetType::UXTW, 1);
+  // segment_arrays holds host pointers to FEXCore's own descriptor tables, so the descriptor read is
+  // host-addressed; only the segment base extracted below is a guest value.
+  Ref NewSegment = _LoadMemHostGPR(OpSize::i64Bit, SegmentBase, SegmentOffset, OpSize::i8Bit, MemOffsetType::UXTW, 1);
   CheckLegacySegmentWrite(NewSegment, SegmentReg);
 
   // Extract the 32-bit base from the GDT segment.

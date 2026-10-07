@@ -10,6 +10,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #else
+#include <climits>
 #include <windows.h>
 #include <winnt.h>
 #include <winternl.h>
@@ -21,6 +22,7 @@ extern "C" NTSTATUS WINAPI NtQueryDirectoryFile(HANDLE, HANDLE, PIO_APC_ROUTINE,
 
 extern "C" NTSTATUS RtlUnicodeToUTF8N(OUT PCHAR UTF8StringDestination, IN ULONG UTF8StringMaxByteCount,
                                       OUT PULONG UTF8StringActualByteCount, IN PCWCH UnicodeStringSource, IN ULONG UnicodeStringByteCount);
+extern "C" NTSTATUS RtlUTF8ToUnicodeN(PWSTR, ULONG, PULONG, PCCH, ULONG);
 #endif
 
 namespace FEXCore::FileUtils {
@@ -202,14 +204,27 @@ end:
 }
 
 #else
+static std::optional<fextl::basic_string<wchar_t>> PathToWidePath(std::string_view Path) {
+  // WalkDirectory returns UTF-8 names, independent of the process ANSI code page.
+  ULONG Bytes {};
+  if (Path.empty() || Path.find('\0') != std::string_view::npos || Path.size() > ULONG_MAX ||
+      RtlUTF8ToUnicodeN(nullptr, 0, &Bytes, Path.data(), Path.size()) != STATUS_SUCCESS) {
+    return std::nullopt;
+  }
+  fextl::basic_string<wchar_t> PathW(Bytes / sizeof(wchar_t), L'\0');
+  if (RtlUTF8ToUnicodeN(PathW.data(), Bytes, &Bytes, Path.data(), Path.size()) != STATUS_SUCCESS) {
+    return std::nullopt;
+  }
+  return PathW;
+}
+
 static inline std::optional<UNICODE_STRING> PathToNTPath(std::string_view Path) {
-  UNICODE_STRING PathW;
-  if (!RtlCreateUnicodeStringFromAsciiz(&PathW, fextl::string(Path).c_str())) {
+  auto PathW = PathToWidePath(Path);
+  if (!PathW) {
     return std::nullopt;
   }
   UNICODE_STRING NTPath;
-  bool Success = RtlDosPathNameToNtPathName_U(PathW.Buffer, &NTPath, nullptr, nullptr);
-  RtlFreeUnicodeString(&PathW);
+  bool Success = RtlDosPathNameToNtPathName_U(PathW->c_str(), &NTPath, nullptr, nullptr);
   if (!Success) {
     return std::nullopt;
   }
@@ -237,7 +252,7 @@ FEX_DEFAULT_VISIBILITY void WalkDirectory(std::string_view Directory,
 
   InitializeObjectAttributes(&attr, &*NTPath, OBJ_CASE_INSENSITIVE, nullptr, nullptr);
   Status = NtOpenFile(&dir_fd, FILE_LIST_DIRECTORY | SYNCHRONIZE, &attr, &io, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                      FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT);
+                      FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT);
 
   FreeNTPath(*NTPath);
 
@@ -275,7 +290,7 @@ FEX_DEFAULT_VISIBILITY void WalkDirectory(std::string_view Directory,
         // Buffer too small? Scale and try again.
         dirent_size *= 2;
         FEXCore::Allocator::free(dirent_buffer);
-        uint8_t* dirent_buffer = reinterpret_cast<uint8_t*>(FEXCore::Allocator::malloc(dirent_size));
+        dirent_buffer = reinterpret_cast<uint8_t*>(FEXCore::Allocator::malloc(dirent_size));
 
         if (!dirent_buffer) {
           // Ran out of memory?
@@ -298,10 +313,17 @@ FEX_DEFAULT_VISIBILITY void WalkDirectory(std::string_view Directory,
       if (EntryName != L"." && EntryName != L"..") {
         ULONG utf8_bytes_needed = 0;
         ULONG actual_utf8_bytes = 0;
-        RtlUnicodeToUTF8N(nullptr, 0, &utf8_bytes_needed, Info->FileName, Info->FileNameLength);
+        Status = RtlUnicodeToUTF8N(nullptr, 0, &utf8_bytes_needed, Info->FileName, Info->FileNameLength);
+        if (Status != STATUS_SUCCESS) {
+          goto end;
+        }
         char* dynamic_buf = reinterpret_cast<char*>(FEXCore::Allocator::malloc(utf8_bytes_needed + 1));
         if (dynamic_buf) {
-          RtlUnicodeToUTF8N(dynamic_buf, utf8_bytes_needed + 1, &actual_utf8_bytes, Info->FileName, Info->FileNameLength);
+          Status = RtlUnicodeToUTF8N(dynamic_buf, utf8_bytes_needed + 1, &actual_utf8_bytes, Info->FileName, Info->FileNameLength);
+          if (Status != STATUS_SUCCESS) {
+            FEXCore::Allocator::free(dynamic_buf);
+            goto end;
+          }
           std::string_view name_view(dynamic_buf, actual_utf8_bytes);
           bool is_dir = (Info->FileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
           Callback(name_view, is_dir, user_data);
@@ -345,10 +367,12 @@ FEX_DEFAULT_VISIBILITY bool RecursiveRemoveDirectory(const fextl::string& Direct
       WalkDirectory(full_path, Data->RemoveFile, &NewData);
     }
 
-    if (is_dir) {
-      RemoveDirectoryA(full_path.c_str());
-    } else {
-      DeleteFileA(full_path.c_str());
+    if (auto PathW = PathToWidePath(full_path)) {
+      if (is_dir) {
+        RemoveDirectoryW(PathW->c_str());
+      } else {
+        DeleteFileW(PathW->c_str());
+      }
     }
   };
 
@@ -359,8 +383,10 @@ FEX_DEFAULT_VISIBILITY bool RecursiveRemoveDirectory(const fextl::string& Direct
 
   WalkDirectory(Directory, RemoveFile, &Data);
 
-  return RemoveDirectoryA(Directory.c_str()) != 0;
+  auto PathW = PathToWidePath(Directory);
+  return PathW && RemoveDirectoryW(PathW->c_str()) != 0;
 }
 
 #endif
 } // namespace FEXCore::FileUtils
+

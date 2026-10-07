@@ -324,6 +324,78 @@ private:
   ARMEmitter::ExtendedMemOperand GenerateMemOperand(IR::OpSize AccessSize, ARMEmitter::Register Base, IR::OrderedNodeWrapper Offset,
                                                     IR::MemOffsetType OffsetType, uint8_t OffsetScale);
 
+  // Guest window support. See Arm64Emitter.h (REG_GUEST_BASE) and Context.h (Config.GuestBase).
+  //
+  // Every IR op that dereferences a guest address converts it to a host address exactly once, and
+  // the conversion applies to the *completed* effective address, never to one component of it. An
+  // x86 effective address wraps modulo 2^32, so `Base + zext32(EA) + disp` can leave the window at
+  // the top, and a negative displacement can land below the window base. GetGuestMemAddr therefore
+  // folds any offset into the guest address first, then adds the base.
+  //
+  // Without FEX_GUEST_WINDOW (and with GuestBase == 0) all of these are the identity and emit nothing.
+  struct GuestMemAddr {
+    // Host address base register for the access.
+    ARMEmitter::Register Base;
+    // Offset still to be encoded into the memory operand. Invalid once a guest window has folded it
+    // into Base.
+    IR::OrderedNodeWrapper Offset;
+    IR::MemOffsetType OffsetType;
+    uint8_t OffsetScale;
+
+    // Set when the window add is folded into the addressing mode itself: the access is
+    // `[REG_GUEST_BASE, IndexReg, UXTW #0]` with IndexReg holding the completed guest effective
+    // address. Only for callers that asked for it (AllowRegOffsetFold) and lower to a plain ldr/str:
+    // the acquire/release and atomic encodings have no register-offset form, and the unaligned
+    // back-patcher must keep seeing them in the `[Xn]` shape.
+    bool RegOffsetFold {false};
+    ARMEmitter::Register IndexReg {ARMEmitter::Reg::zr};
+  };
+
+#ifdef FEX_GUEST_WINDOW
+  // Converts a guest address operand plus its offset into a host addressing description. `Tmp`
+  // defaults to the reserved REG_GUEST_ADDR_TMP; pass another scratch only when an op needs two
+  // converted addresses live at once. `HostAddr` says the operand is already a host pointer
+  // (IROp_LoadMem/IROp_StoreMem::HostAddr) and is used as-is. `AllowRegOffsetFold` lets the
+  // `add Tmp, REG_GUEST_BASE, wEA, uxtw` become the addressing mode; only pass it from sites that
+  // consume the result through the GuestMemAddr overload of GenerateMemOperand and lower to a plain
+  // ldr/str (never ldar/stlr/ldapr/ldapur/stlur, SVE, or code that re-derives pointers from Base).
+  [[nodiscard]]
+  GuestMemAddr GetGuestMemAddr(IR::OpSize AccessSize, IR::OrderedNodeWrapper Addr, IR::OrderedNodeWrapper Offset,
+                               IR::MemOffsetType OffsetType, uint8_t OffsetScale, ARMEmitter::Register Tmp = REG_GUEST_ADDR_TMP.R(),
+                               bool HostAddr = false, bool AllowRegOffsetFold = false);
+
+  // Shorthand for an address with no separate offset operand.
+  [[nodiscard]]
+  ARMEmitter::Register GetGuestMemReg(IR::OrderedNodeWrapper Addr, ARMEmitter::Register Tmp = REG_GUEST_ADDR_TMP.R());
+
+  // Converts an already-materialised guest address in `GuestReg` into a host address in `Tmp`, for
+  // ops that compute a guest pointer themselves (MemSet/MemCpy working pointers, gather bases).
+  [[nodiscard]]
+  ARMEmitter::Register ApplyGuestBase(ARMEmitter::Register GuestReg, ARMEmitter::Register Tmp = REG_GUEST_ADDR_TMP.R());
+
+  // The GuestMemAddr form, the only one that can honour RegOffsetFold.
+  [[nodiscard]]
+  ARMEmitter::ExtendedMemOperand GenerateMemOperand(IR::OpSize AccessSize, const GuestMemAddr& Guest);
+#else
+  [[nodiscard]]
+  GuestMemAddr GetGuestMemAddr(IR::OpSize, IR::OrderedNodeWrapper Addr, IR::OrderedNodeWrapper Offset, IR::MemOffsetType OffsetType,
+                               uint8_t OffsetScale, ARMEmitter::Register = REG_GUEST_ADDR_TMP.R(), bool = false, bool = false) {
+    return {GetReg(Addr), Offset, OffsetType, OffsetScale};
+  }
+  [[nodiscard]]
+  ARMEmitter::Register GetGuestMemReg(IR::OrderedNodeWrapper Addr, ARMEmitter::Register = REG_GUEST_ADDR_TMP.R()) {
+    return GetReg(Addr);
+  }
+  [[nodiscard]]
+  ARMEmitter::Register ApplyGuestBase(ARMEmitter::Register GuestReg, ARMEmitter::Register = REG_GUEST_ADDR_TMP.R()) {
+    return GuestReg;
+  }
+  [[nodiscard]]
+  ARMEmitter::ExtendedMemOperand GenerateMemOperand(IR::OpSize AccessSize, const GuestMemAddr& Guest) {
+    return GenerateMemOperand(AccessSize, Guest.Base, Guest.Offset, Guest.OffsetType, Guest.OffsetScale);
+  }
+#endif
+
   [[nodiscard]]
   ARMEmitter::Register ApplyMemOperand(IR::OpSize AccessSize, ARMEmitter::Register Base, ARMEmitter::Register Tmp,
                                        IR::OrderedNodeWrapper Offset, IR::MemOffsetType OffsetType, uint8_t OffsetScale);

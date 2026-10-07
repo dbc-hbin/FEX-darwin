@@ -113,6 +113,19 @@ def parse_ops(ops):
                 # Skip these
                 continue
 
+            # Build features (--feature=<Name>) can extend an op: "Features" maps a feature name to
+            # extra trailing "Args" and "EmitValidation" entries that only exist in builds enabling
+            # that feature. Without the feature the op is generated exactly as written.
+            if "Features" in op_val:
+                op_val = dict(op_val)
+                for FeatureName, FeatureVal in op_val["Features"].items():
+                    if FeatureName not in EnabledFeatures:
+                        continue
+                    if "Args" in FeatureVal:
+                        op = op + FeatureVal["Args"]
+                    if "EmitValidation" in FeatureVal:
+                        op_val["EmitValidation"] = op_val.get("EmitValidation", []) + FeatureVal["EmitValidation"]
+
             OpDef = OpDefinition()
 
             # Check if we have a destination
@@ -850,6 +863,9 @@ def print_ir_dispatcher_dispatch():
     output_dispatch_file.write("#undef IROP_DISPATCH_DISPATCH\n")
     output_dispatch_file.write("#endif\n")
 
+
+EnabledFeatures: set[str] = set(Arg.split("=", 1)[1] for Arg in sys.argv[1:] if Arg.startswith("--feature="))
+sys.argv = [Arg for Arg in sys.argv if not Arg.startswith("--feature=")]
 
 if len(sys.argv) < 4:
     ExitError("Insufficient parameters passed to script")

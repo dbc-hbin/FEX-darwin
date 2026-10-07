@@ -41,7 +41,7 @@ FEXCore::CodeMapFileId ComputeCodeMapId(std::string_view FileName, uint32_t Time
 }
 
 static void LoadImageVolatileMetadata(fextl::set<uint64_t>& VolatileInstructions, FEXCore::IntervalList<uint64_t>& VolatileValidRanges,
-                                      HMODULE Module, ArchImageNtHeaders* Nt, uint64_t Address, uint64_t EndAddress) {
+                                      HMODULE Module, ArchImageNtHeaders* Nt, uint64_t Address, uint64_t EndAddress, uint64_t GuestBase) {
   ULONG Size;
 
   const auto* LoadConfig =
@@ -50,11 +50,11 @@ static void LoadImageVolatileMetadata(fextl::set<uint64_t>& VolatileInstructions
     return;
   }
 
-  if (LoadConfig->VolatileMetadataPointer < Address || LoadConfig->VolatileMetadataPointer + sizeof(IMAGE_VOLATILE_METADATA) >= EndAddress) {
+  if (GuestBase + LoadConfig->VolatileMetadataPointer < Address || GuestBase + LoadConfig->VolatileMetadataPointer + sizeof(IMAGE_VOLATILE_METADATA) >= EndAddress) {
     return;
   }
 
-  const auto* VolatileMetadata = reinterpret_cast<IMAGE_VOLATILE_METADATA*>(LoadConfig->VolatileMetadataPointer);
+  const auto* VolatileMetadata = reinterpret_cast<IMAGE_VOLATILE_METADATA*>(GuestBase + LoadConfig->VolatileMetadataPointer);
   if (!VolatileMetadata || Address + VolatileMetadata->VolatileAccessTable + VolatileMetadata->VolatileAccessTableSize >= EndAddress ||
       Address + VolatileMetadata->VolatileInfoRangeTable + VolatileMetadata->VolatileInfoRangeTableSize >= EndAddress) {
     return;
@@ -64,14 +64,14 @@ static void LoadImageVolatileMetadata(fextl::set<uint64_t>& VolatileInstructions
   const auto* VolatileAccessTableEnd =
     VolatileAccessTableBegin + (VolatileMetadata->VolatileAccessTableSize / sizeof(IMAGE_VOLATILE_RVA_METADATA));
   for (auto It = VolatileAccessTableBegin; It != VolatileAccessTableEnd; It++) {
-    VolatileInstructions.emplace(Address + It->Rva);
+    VolatileInstructions.emplace(Address - GuestBase + It->Rva);
   }
 
   const auto* VolatileInfoRangeTableBegin = reinterpret_cast<IMAGE_VOLATILE_RANGE_METADATA*>(Address + VolatileMetadata->VolatileInfoRangeTable);
   const auto* VolatileInfoRangeTableEnd =
     VolatileInfoRangeTableBegin + (VolatileMetadata->VolatileInfoRangeTableSize / sizeof(IMAGE_VOLATILE_RANGE_METADATA));
   for (auto It = VolatileInfoRangeTableBegin; It != VolatileInfoRangeTableEnd; It++) {
-    VolatileValidRanges.Insert({Address + It->Rva, Address + It->Rva + It->Size});
+    VolatileValidRanges.Insert({Address - GuestBase + It->Rva, Address - GuestBase + It->Rva + It->Size});
   }
 }
 
@@ -112,10 +112,11 @@ static fextl::robin_map<uint32_t, FEXCore::GuestRelocationType> LoadImageRelocat
   return Result;
 }
 
-ImageTracker::ImageTracker(FEXCore::Context::Context& CTX, bool IsGeneratingCache)
+ImageTracker::ImageTracker(FEXCore::Context::Context& CTX, bool IsGeneratingCache, uint64_t GuestBase)
   : CTX {CTX}
   , ExtendedMetaData {FEX::VolatileMetadata::ParseExtendedVolatileMetadata(ExtendedVolatileMetadataConfig())}
-  , IsGeneratingCache {IsGeneratingCache} {}
+  , IsGeneratingCache {IsGeneratingCache}
+  , GuestBase {GuestBase} {}
 
 ImageTracker::MappedImageInfo::MappedImageInfo(std::string_view Path, uint64_t Address, ArchImageNtHeaders* Nt,
                                                fextl::robin_map<uint32_t, FEXCore::GuestRelocationType> Relocations)
@@ -139,7 +140,7 @@ FEXCore::ExecutableFileSectionInfo ImageTracker::HandleImageMap(std::string_view
     }();
     std::unique_lock Lk {ImagesLock};
     auto [It, Inserted] = MappedImages.emplace(std::piecewise_construct, std::forward_as_tuple(Address),
-                                               std::forward_as_tuple(Path, Address, Nt, std::move(Relocations)));
+                                               std::forward_as_tuple(Path, Address - GuestBase, Nt, std::move(Relocations)));
 
     if (!Inserted) {
       return It->second.SectionInfo;
@@ -185,12 +186,12 @@ FEXCore::ExecutableFileSectionInfo ImageTracker::HandleImageMap(std::string_view
   uint64_t EndAddress = Address + Nt->OptionalHeader.SizeOfImage;
   fextl::set<uint64_t> VolatileInstructions {};
   FEXCore::IntervalList<uint64_t> VolatileValidRanges {};
-  LoadImageVolatileMetadata(VolatileInstructions, VolatileValidRanges, Module, Nt, Address, EndAddress);
+  LoadImageVolatileMetadata(VolatileInstructions, VolatileValidRanges, Module, Nt, Address, EndAddress, GuestBase);
   if (auto It = ExtendedMetaData.find(ID); It != ExtendedMetaData.end()) {
-    FEX::VolatileMetadata::ApplyFEXExtendedVolatileMetadata(It->second, VolatileInstructions, VolatileValidRanges, Address, EndAddress);
+    FEX::VolatileMetadata::ApplyFEXExtendedVolatileMetadata(It->second, VolatileInstructions, VolatileValidRanges, Address - GuestBase, EndAddress - GuestBase);
   }
   if (auto It = ExtendedMetaData.find(fextl::string {ModuleName}); It != ExtendedMetaData.end()) {
-    FEX::VolatileMetadata::ApplyFEXExtendedVolatileMetadata(It->second, VolatileInstructions, VolatileValidRanges, Address, EndAddress);
+    FEX::VolatileMetadata::ApplyFEXExtendedVolatileMetadata(It->second, VolatileInstructions, VolatileValidRanges, Address - GuestBase, EndAddress - GuestBase);
   }
 
   if (!VolatileInstructions.empty() || !VolatileValidRanges.Empty()) {
@@ -203,7 +204,7 @@ FEXCore::ExecutableFileSectionInfo ImageTracker::HandleImageMap(std::string_view
 
 void ImageTracker::HandleImageUnmap(uint64_t Address, uint64_t Size) {
   std::scoped_lock Lock(CTX.GetCodeInvalidationMutex());
-  CTX.RemoveForceTSOInformation(Address, Size);
+  CTX.RemoveForceTSOInformation(Address - GuestBase, Size);
 
   std::unique_lock Lk {ImagesLock};
   MappedImages.erase(Address);
@@ -212,7 +213,7 @@ void ImageTracker::HandleImageUnmap(uint64_t Address, uint64_t Size) {
 std::optional<FEXCore::ExecutableFileSectionInfo> ImageTracker::LookupExecutableFileSection(uint64_t Address) {
   std::shared_lock Lk {ImagesLock};
   auto It = MappedImages.upper_bound(Address);
-  if (It == MappedImages.begin() || std::prev(It)->second.SectionInfo.EndVA <= Address) {
+  if (It == MappedImages.begin() || std::prev(It)->second.SectionInfo.EndVA + GuestBase <= Address) {
     return {};
   }
   return std::prev(It)->second.SectionInfo;

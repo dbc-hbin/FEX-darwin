@@ -133,6 +133,12 @@ namespace BridgeInstrs {
   void* UnixCall {};
 } // namespace BridgeInstrs
 
+uint64_t GuestBase {};
+
+void* GuestPtr(uint64_t Address) {
+  return Address ? reinterpret_cast<void*>(GuestBase + static_cast<uint32_t>(Address)) : nullptr;
+}
+
 fextl::unique_ptr<FEXCore::Context::Context> CTX;
 fextl::unique_ptr<FEX::DummyHandlers::DummySignalDelegator> SignalDelegator;
 fextl::unique_ptr<WowSyscallHandler> SyscallHandler;
@@ -223,7 +229,7 @@ void LoadStateFromWowContext(FEXCore::Core::InternalThreadState* Thread) {
 
   // The TEB is the only populated GDT entry by default
   auto GDT = State.GetSegmentFromIndex(State, (Context->SegFs & 0xffff));
-  uint64_t WowTEB = GetWowTEB(NtCurrentTeb());
+  uint64_t WowTEB = static_cast<uint32_t>(GetWowTEB(NtCurrentTeb()) - GuestBase);
   State.SetGDTBase(GDT, WowTEB);
   State.SetGDTLimit(GDT, 0xF'FFFFU);
   State.fs_cached = WowTEB;
@@ -259,38 +265,38 @@ void LoadStateFromWowContext(FEXCore::Core::InternalThreadState* Thread) {
     // Only if the BP type was instruction class.
     if (Dr0Changed) {
       if (Context->Dr0 && ((Context->Dr7 >> 16) & 0b11) == 0) {
-        InvalidationTracker->InvalidateAlignedInterval(Context->Dr0, 8, false);
+        InvalidationTracker->InvalidateAlignedInterval(GuestBase + Context->Dr0, 8, false);
       }
 
       if (State.Dr[0] && ((State.Dr7 >> 16) & 0b11) == 0) {
-        InvalidationTracker->InvalidateAlignedInterval(State.Dr[0], 8, false);
+        InvalidationTracker->InvalidateAlignedInterval(GuestBase + State.Dr[0], 8, false);
       }
     }
     if (Dr1Changed) {
       if (Context->Dr1 && ((Context->Dr7 >> 20) & 0b11) == 0) {
-        InvalidationTracker->InvalidateAlignedInterval(Context->Dr1, 8, false);
+        InvalidationTracker->InvalidateAlignedInterval(GuestBase + Context->Dr1, 8, false);
       }
 
       if (State.Dr[1] && ((State.Dr7 >> 20) & 0b11) == 0) {
-        InvalidationTracker->InvalidateAlignedInterval(State.Dr[1], 8, false);
+        InvalidationTracker->InvalidateAlignedInterval(GuestBase + State.Dr[1], 8, false);
       }
     }
     if (Dr2Changed) {
       if (Context->Dr2 && ((Context->Dr7 >> 24) & 0b11) == 0) {
-        InvalidationTracker->InvalidateAlignedInterval(Context->Dr2, 8, false);
+        InvalidationTracker->InvalidateAlignedInterval(GuestBase + Context->Dr2, 8, false);
       }
 
       if (State.Dr[2] && ((State.Dr7 >> 24) & 0b11) == 0) {
-        InvalidationTracker->InvalidateAlignedInterval(State.Dr[2], 8, false);
+        InvalidationTracker->InvalidateAlignedInterval(GuestBase + State.Dr[2], 8, false);
       }
     }
     if (Dr3Changed) {
       if (Context->Dr3 && ((Context->Dr7 >> 28) & 0b11) == 0) {
-        InvalidationTracker->InvalidateAlignedInterval(Context->Dr3, 8, false);
+        InvalidationTracker->InvalidateAlignedInterval(GuestBase + Context->Dr3, 8, false);
       }
 
       if (State.Dr[3] && ((State.Dr7 >> 28) & 0b11) == 0) {
-        InvalidationTracker->InvalidateAlignedInterval(State.Dr[3], 8, false);
+        InvalidationTracker->InvalidateAlignedInterval(GuestBase + State.Dr[3], 8, false);
       }
     }
   }
@@ -487,7 +493,7 @@ public:
   WowSyscallHandler() = default;
 
   static void HandleSyscallImpl(FEXCore::Core::CpuStateFrame* Frame) {
-    const uint64_t ReturnRIP = *(uint32_t*)(Frame->State.gregs[FEXCore::X86State::REG_RSP]); // Return address from the stack
+    const uint64_t ReturnRIP = *static_cast<uint32_t*>(GuestPtr(Frame->State.gregs[FEXCore::X86State::REG_RSP])); // Return address from the stack
     uint64_t ReturnRSP = Frame->State.gregs[FEXCore::X86State::REG_RSP] + 4;                 // Stack pointer after popping return address
     uint64_t ReturnRAX = 0;
 
@@ -496,14 +502,14 @@ public:
         unixlib_handle_t Handle;
         UINT32 ID;
         ULONG32 Args;
-      }* StackArgs = reinterpret_cast<StackLayout*>(ReturnRSP);
+      }* StackArgs = static_cast<StackLayout*>(GuestPtr(ReturnRSP));
 
       Frame->State.gregs[FEXCore::X86State::REG_RSP] = ReturnRSP + sizeof(StackLayout);
       Frame->State.rip = ReturnRIP;
 
       Context::FlushThreadStateContext();
       Context::UnlockJITContext();
-      ReturnRAX = static_cast<uint64_t>(WineUnixCall(StackArgs->Handle, StackArgs->ID, ULongToPtr(StackArgs->Args)));
+      ReturnRAX = static_cast<uint64_t>(WineUnixCall(StackArgs->Handle, StackArgs->ID, GuestPtr(StackArgs->Args)));
       Context::LockJITContext();
       Frame->State.gregs[FEXCore::X86State::REG_RAX] = ReturnRAX;
     } else if (Frame->State.rip == (uint64_t)BridgeInstrs::Syscall) {
@@ -515,7 +521,7 @@ public:
       Context::FlushThreadStateContext();
       Context::UnlockJITContext();
       Wow64ProcessPendingCrossProcessItems();
-      ReturnRAX = static_cast<uint64_t>(Wow64SystemServiceEx(static_cast<UINT>(EntryRAX), reinterpret_cast<UINT*>(ReturnRSP + 4)));
+      ReturnRAX = static_cast<uint64_t>(Wow64SystemServiceEx(static_cast<UINT>(EntryRAX), static_cast<UINT*>(GuestPtr(ReturnRSP + 4))));
       Context::LockJITContext();
       Frame->State.gregs[FEXCore::X86State::REG_RAX] = ReturnRAX;
     }
@@ -531,15 +537,15 @@ public:
   }
 
   std::optional<FEXCore::ExecutableFileSectionInfo> LookupExecutableFileSection(FEXCore::Core::InternalThreadState*, uint64_t Address) override {
-    return ImageTracker->LookupExecutableFileSection(Address);
+    return ImageTracker->LookupExecutableFileSection(GuestBase + Address);
   }
 
   void MarkGuestExecutableRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) override {
-    InvalidationTracker->ReprotectRWXIntervals(Start, Length);
+    InvalidationTracker->ReprotectRWXIntervals(GuestBase + Start, Length);
   }
 
   void InvalidateGuestCodeRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) override {
-    InvalidationTracker->InvalidateAlignedInterval(Start, Length, false);
+    InvalidationTracker->InvalidateAlignedInterval(GuestBase + Start, Length, false);
   }
 
   void MarkOvercommitRange(uint64_t Start, uint64_t Length) override {
@@ -551,7 +557,9 @@ public:
   }
 
   FEXCore::HLE::ExecutableRangeInfo QueryGuestExecutableRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Address) override {
-    return InvalidationTracker->QueryExecutableRange(Address);
+    auto Info = InvalidationTracker->QueryExecutableRange(GuestBase + Address);
+    if (Info.Size) Info.Base -= GuestBase;
+    return Info;
   }
 
   void PreCompile() override {
@@ -570,6 +578,11 @@ void BTCpuProcessInit() {
 
   FEXCore::Config::Set(FEXCore::Config::CONFIG_INTERPRETER_INSTALLED, "0");
   FEXCore::Config::Set(FEXCore::Config::CONFIG_IS64BIT_MODE, "0");
+#ifdef FEX_GUEST_WINDOW
+  LOGMAN_THROW_A_FMT(NtQueryInformationProcess(NtCurrentProcess(), static_cast<PROCESSINFOCLASS>(1010), &GuestBase, sizeof(GuestBase), nullptr) == 0 &&
+                      GuestBase && !(GuestBase & 0xffffffffULL), "Wine guest window is unavailable or misaligned");
+  FEXCore::Config::Set(FEXCore::Config::CONFIG_GUEST32BASE, std::to_string(GuestBase));
+#endif
   FEXCore::Config::Set(FEXCore::Config::CONFIG_APP_FILENAME, ExecutablePath);
   FEXCore::Config::Set(FEXCore::Config::CONFIG_APP_CONFIG_NAME, ExecutableName);
 
@@ -597,8 +610,8 @@ void BTCpuProcessInit() {
   CTX->SetSyscallHandler(SyscallHandler.get());
   CTX->InitCore();
   Context::HandlerConfig.emplace(*CTX);
-  InvalidationTracker.emplace(*CTX, Threads);
-  ImageTracker.emplace(*CTX, false);
+  InvalidationTracker.emplace(*CTX, Threads, GuestBase);
+  ImageTracker.emplace(*CTX, false, GuestBase);
 
   auto MainModule = reinterpret_cast<__TEB*>(NtCurrentTeb())->Peb->ImageBaseAddress;
   HandleImageMap(reinterpret_cast<uint64_t>(MainModule), true);
@@ -614,8 +627,8 @@ void BTCpuProcessInit() {
   NtAllocateVirtualMemory(NtCurrentProcess(), &Addr, (1U << 31) - 1, &Size, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
   InvalidationTracker->HandleMemoryProtectionNotification(reinterpret_cast<uint64_t>(Addr), Size, PAGE_EXECUTE);
   *reinterpret_cast<uint32_t*>(Addr) = 0x2ecd2ecd;
-  BridgeInstrs::Syscall = Addr;
-  BridgeInstrs::UnixCall = reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(Addr) + 2);
+  BridgeInstrs::Syscall = reinterpret_cast<void*>(static_cast<uint32_t>(reinterpret_cast<uint64_t>(Addr) - GuestBase));
+  BridgeInstrs::UnixCall = reinterpret_cast<void*>(static_cast<uint32_t>(reinterpret_cast<uint64_t>(Addr) - GuestBase + 2));
 
   const auto Sym = GetProcAddress(NtDll, "__wine_unix_call_dispatcher");
   if (Sym) {
@@ -816,7 +829,7 @@ bool BTCpuResetToConsistentStateImpl(EXCEPTION_POINTERS* Ptrs) {
       FEXCORE_PROFILE_INSTANT_INCREMENT(Thread, AccumulatedSMCCount, 1);
       if (InvalidationTracker->HandleRWXAccessViolation(Thread, Context->Pc, FaultAddress)) {
         if (CTX->IsAddressInCodeBuffer(Thread, Context->Pc) && !CTX->IsCurrentBlockSingleInst(Thread) &&
-            CTX->IsAddressInCurrentBlock(Thread, FaultAddress & FEXCore::Utils::FEX_PAGE_MASK, FEXCore::Utils::FEX_PAGE_SIZE)) {
+            CTX->IsAddressInCurrentBlock(Thread, static_cast<uint32_t>(FaultAddress - GuestBase) & FEXCore::Utils::FEX_PAGE_MASK, FEXCore::Utils::FEX_PAGE_SIZE)) {
           Context::ReconstructThreadState(Context);
           LogMan::Msg::DFmt("Handled inline self-modifying code: pc: {:X} rip: {:X} fault: {:X}", Context->Pc,
                             Thread->CurrentFrame->State.rip, FaultAddress);
@@ -857,6 +870,7 @@ bool BTCpuResetToConsistentStateImpl(EXCEPTION_POINTERS* Ptrs) {
   BOOL FirstChance = TRUE;
   EXCEPTION_RECORD GuestException =
     FEX::Windows::HandleGuestException(Fault, *Exception, WowContext->Eip, WowContext->Eax, WowContext->Ecx, FirstChance);
+  GuestException.ExceptionAddress = GuestPtr(reinterpret_cast<uint64_t>(GuestException.ExceptionAddress));
   if (GuestException.ExceptionCode == EXCEPTION_SINGLE_STEP) {
     WowContext->EFlags &= ~(1 << FEXCore::X86State::RFLAG_TF_RAW_LOC);
   }

@@ -529,9 +529,9 @@ ApplyRIPMoveRelocation(ContextImpl& CTX, uint64_t GuestRIP, uint8_t RegisterInde
   Emitter.LoadConstant(ARMEmitter::Size::i64Bit, ARMEmitter::Register(RegisterIndex), Pointer, CPU::Arm64Emitter::PadType::DOPAD);
 }
 
-static inline int64_t ReadLiveGuestData(uint64_t SiteAddress, uint8_t ValueSize) {
+static inline int64_t ReadLiveGuestData(ContextImpl& CTX, uint64_t SiteAddress, uint8_t ValueSize) {
   uint64_t Raw = 0;
-  memcpy(&Raw, reinterpret_cast<const void*>(SiteAddress), ValueSize);
+  memcpy(&Raw, reinterpret_cast<const void*>(CTX.GetGuestBase() + SiteAddress), ValueSize);
   // manual sign-extension from guest live bytes
   if (ValueSize == 1) {
     return (int8_t)Raw;
@@ -544,22 +544,22 @@ static inline int64_t ReadLiveGuestData(uint64_t SiteAddress, uint8_t ValueSize)
   }
 }
 
-static inline void ApplyPatchableDataRelocation(uint64_t SiteAddress, uint8_t ValueSize, uint8_t RegisterIndex, CPU::Arm64Emitter& Emitter) {
-  Emitter.LoadConstant(ARMEmitter::Size::i64Bit, ARMEmitter::Register(RegisterIndex), ReadLiveGuestData(SiteAddress, ValueSize),
+static inline void ApplyPatchableDataRelocation(ContextImpl& CTX, uint64_t SiteAddress, uint8_t ValueSize, uint8_t RegisterIndex, CPU::Arm64Emitter& Emitter) {
+  Emitter.LoadConstant(ARMEmitter::Size::i64Bit, ARMEmitter::Register(RegisterIndex), ReadLiveGuestData(CTX, SiteAddress, ValueSize),
                        CPU::Arm64Emitter::PadType::DOPAD);
 }
 
-static inline void ApplyPatchableRIPLiteralRelocation(uint64_t SiteAddress, uint8_t ValueSize, CPU::Arm64Emitter& Emitter) {
-  Emitter.dc64(SiteAddress + ValueSize + ReadLiveGuestData(SiteAddress, ValueSize));
+static inline void ApplyPatchableRIPLiteralRelocation(ContextImpl& CTX, uint64_t SiteAddress, uint8_t ValueSize, CPU::Arm64Emitter& Emitter) {
+  Emitter.dc64(SiteAddress + ValueSize + ReadLiveGuestData(CTX, SiteAddress, ValueSize));
 }
 
-static inline void ApplyPatchableRIPMoveRelocation(uint64_t SiteAddress, uint8_t ValueSize, uint8_t RegisterIndex, CPU::Arm64Emitter& Emitter) {
-  const uint64_t Target = SiteAddress + ValueSize + ReadLiveGuestData(SiteAddress, ValueSize);
+static inline void ApplyPatchableRIPMoveRelocation(ContextImpl& CTX, uint64_t SiteAddress, uint8_t ValueSize, uint8_t RegisterIndex, CPU::Arm64Emitter& Emitter) {
+  const uint64_t Target = SiteAddress + ValueSize + ReadLiveGuestData(CTX, SiteAddress, ValueSize);
   Emitter.LoadConstant(ARMEmitter::Size::i64Bit, ARMEmitter::Register(RegisterIndex), Target, CPU::Arm64Emitter::PadType::DOPAD);
 }
 
-static inline void ApplyPatchableCRCMoveRelocation(uint64_t SiteAddress, uint8_t ValueSize, uint8_t RegisterIndex, CPU::Arm64Emitter& Emitter) {
-  const uint64_t Target = FEXCore::Utils::crc32(reinterpret_cast<const uint8_t*>(SiteAddress), ValueSize);
+static inline void ApplyPatchableCRCMoveRelocation(ContextImpl& CTX, uint64_t SiteAddress, uint8_t ValueSize, uint8_t RegisterIndex, CPU::Arm64Emitter& Emitter) {
+  const uint64_t Target = FEXCore::Utils::crc32(reinterpret_cast<const uint8_t*>(CTX.GetGuestBase() + SiteAddress), ValueSize);
   Emitter.LoadConstant(ARMEmitter::Size::i64Bit, ARMEmitter::Register(RegisterIndex), Target, CPU::Arm64Emitter::PadType::DOPAD);
 }
 
@@ -584,21 +584,21 @@ bool CodeCache::ApplyPackedCodeRelocations(uint64_t GuestEntry, std::span<std::b
       break;
     }
     case FEXCore::CPU::RelocationTypes::RELOC_GUEST_PATCHABLE_DATA_MOVE: {
-      ApplyPatchableDataRelocation(GuestEntry + Reloc.PatchableData.SiteOffset, Reloc.PatchableData.ValueSize,
+      ApplyPatchableDataRelocation(CTX, GuestEntry + Reloc.PatchableData.SiteOffset, Reloc.PatchableData.ValueSize,
                                    Reloc.PatchableData.RegisterIndex, Emitter);
       break;
     }
     case FEXCore::CPU::RelocationTypes::RELOC_GUEST_PATCHABLE_RIP_LITERAL: {
-      ApplyPatchableRIPLiteralRelocation(GuestEntry + Reloc.PatchableData.SiteOffset, Reloc.PatchableData.ValueSize, Emitter);
+      ApplyPatchableRIPLiteralRelocation(CTX, GuestEntry + Reloc.PatchableData.SiteOffset, Reloc.PatchableData.ValueSize, Emitter);
       break;
     }
     case FEXCore::CPU::RelocationTypes::RELOC_GUEST_PATCHABLE_RIP_MOVE: {
-      ApplyPatchableRIPMoveRelocation(GuestEntry + Reloc.PatchableData.SiteOffset, Reloc.PatchableData.ValueSize,
+      ApplyPatchableRIPMoveRelocation(CTX, GuestEntry + Reloc.PatchableData.SiteOffset, Reloc.PatchableData.ValueSize,
                                       Reloc.PatchableData.RegisterIndex, Emitter);
       break;
     }
     case FEXCore::CPU::RelocationTypes::RELOC_GUEST_PATCHABLE_CRC_MOVE: {
-      ApplyPatchableCRCMoveRelocation(GuestEntry + Reloc.PatchableData.SiteOffset, Reloc.PatchableData.ValueSize,
+      ApplyPatchableCRCMoveRelocation(CTX, GuestEntry + Reloc.PatchableData.SiteOffset, Reloc.PatchableData.ValueSize,
                                       Reloc.PatchableData.RegisterIndex, Emitter);
       break;
     }
@@ -932,6 +932,7 @@ std::span<std::byte> AbstractCodeCache::SelectCodeRangeToFinalize(MappedCodeCach
 namespace FEXCore::Context {
 
 void CodeCache::FinalizeCodePages(MappedCodeCacheFile& Code, std::span<std::byte> CodeRange) {
+  FEXCore::Allocator::JitWriteScope Writable;
   const size_t StartOffset = CodeRange.data() - Code.CodeBuffer.data();
   const auto StartPage = StartOffset / Utils::FEX_PAGE_SIZE;
   const auto EndPage = StartPage + CodeRange.size_bytes() / Utils::FEX_PAGE_SIZE;
