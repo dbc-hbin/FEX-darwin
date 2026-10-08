@@ -603,92 +603,20 @@ ARMEmitter::Register Arm64JITCore::GetGuestMemReg(IR::OrderedNodeWrapper Addr, A
   return ApplyGuestBase(GetReg(Addr), Tmp);
 }
 
-Arm64JITCore::GuestMemAddr Arm64JITCore::GetGuestMemAddr(IR::OpSize AccessSize, IR::OrderedNodeWrapper Addr, IR::OrderedNodeWrapper Offset,
+Arm64JITCore::GuestMemAddr Arm64JITCore::GetGuestMemAddr(IR::OpSize, IR::OrderedNodeWrapper Addr, IR::OrderedNodeWrapper Offset,
                                                          IR::MemOffsetType OffsetType, uint8_t OffsetScale, ARMEmitter::Register Tmp,
                                                          bool HostAddr, bool AllowRegOffsetFold) {
   const auto AddrReg = GetReg(Addr);
-  if (!GuestBase) {
-    // Identity mapped: nothing to do, and nothing is emitted.
+  if (!GuestBase || HostAddr) {
     return {AddrReg, Offset, OffsetType, OffsetScale};
   }
 
-  if (HostAddr) {
-    // The operand is already a host pointer (IROp_LoadMem/IROp_StoreMem::HostAddr - FEXCore's own
-    // context-relative storage, never anything an x86 instruction can name). Leave the address and
-    // its offset exactly as the identity-mapped path would, so the emitted access is the same
-    // instruction it has always been. IREmitter::IsContextRelativeAddress validates the converse at
-    // IR-emission time: a context-relative address may not reach here without this flag.
-    return {AddrReg, Offset, OffsetType, OffsetScale};
+  if (Offset.IsInvalid() && AllowRegOffsetFold) {
+    return {REG_GUEST_BASE.R(), Offset, IR::MemOffsetType::SXTX, 1, true, AddrReg};
   }
 
-  const auto NoOffset = IR::OrderedNodeWrapper::WrapOffset(0);
-
-  if (Offset.IsInvalid()) {
-    if (AllowRegOffsetFold) {
-      /* `[REG_GUEST_BASE, wEA, uxtw #0]`. The UXTW in the addressing mode does
-       * exactly the job the `add ..., UXTW` did - zero-extend the guest EA from 32 bits, so nothing
-       * depends on the upper half of the guest register - and the whole conversion becomes free.
-       * The single-conversion and 4GiB-wrap rules in the class comment still hold: there is no
-       * displacement here, so there is nothing that could be added on the far side of the window. */
-      return {REG_GUEST_BASE.R(), NoOffset, IR::MemOffsetType::SXTX, 1, true, AddrReg};
-    }
-    return {ApplyGuestBase(AddrReg, Tmp), NoOffset, IR::MemOffsetType::SXTX, 1};
-  }
-
-  if (OffsetScale != 1 && OffsetScale != IR::OpSizeToSize(AccessSize)) {
-    LOGMAN_MSG_A_FMT("Unhandled GetGuestMemAddr OffsetScale: {}", OffsetScale);
-  }
-
-  // Fold the offset into the guest address first, then apply the base. Two instructions, and the
-  // order is the whole point: `Base + zext32(EA + disp)` is not `Base + zext32(EA) + disp`. The
-  // second form leaves the window whenever the effective address wraps at 4GiB (which x86 does and
-  // a 64-bit host add does not), and for a negative displacement it can land *below* the window
-  // base, in whatever another 32-bit pseudo-process owns.
-  //
-  // The fold itself is done at 64-bit width and the truncation to 32 bits is left to the UXTW on
-  // the final add, which has to be there anyway. That keeps the sign-extended displacements and the
-  // extended-register offset forms encodable without worrying about their 32-bit spellings.
-  uint64_t Const;
-  if (IsInlineConstant(Offset, &Const)) {
-    // Matching GenerateMemOperand, an inline constant offset is a byte displacement and is NOT
-    // scaled by OffsetScale. Offsets reaching here are the sign-extended 64-bit form of a signed
-    // displacement.
-    const int64_t Signed = static_cast<int64_t>(Const);
-    if (Signed >= 0 && Signed <= 4095) {
-      add(ARMEmitter::Size::i64Bit, Tmp, AddrReg, static_cast<uint64_t>(Signed));
-    } else if (Signed < 0 && Signed >= -4095) {
-      sub(ARMEmitter::Size::i64Bit, Tmp, AddrReg, static_cast<uint64_t>(-Signed));
-    } else {
-      LoadConstant(ARMEmitter::Size::i64Bit, Tmp, Const);
-      add(ARMEmitter::Size::i64Bit, Tmp, AddrReg, Tmp);
-    }
-  } else {
-    const auto RegOffset = GetReg(Offset);
-    switch (OffsetType) {
-    case IR::MemOffsetType::SXTX:
-      add(ARMEmitter::Size::i64Bit, Tmp, AddrReg, RegOffset, ARMEmitter::ShiftType::LSL, FEXCore::ilog2(OffsetScale));
-      break;
-    case IR::MemOffsetType::UXTW:
-      add(ARMEmitter::Size::i64Bit, Tmp, AddrReg, RegOffset, ARMEmitter::ExtendedType::UXTW, FEXCore::ilog2(OffsetScale));
-      break;
-    case IR::MemOffsetType::SXTW:
-      add(ARMEmitter::Size::i64Bit, Tmp, AddrReg, RegOffset, ARMEmitter::ExtendedType::SXTW, FEXCore::ilog2(OffsetScale));
-      break;
-    default: LOGMAN_MSG_A_FMT("Unhandled GetGuestMemAddr OffsetType: {}", OffsetType); break;
-    }
-  }
-
-  // UXTW here does double duty: it wraps the effective address at 4GiB the way x86 does, and it
-  // makes the zero extension explicit so nothing depends on the upper half of the fold above.
-  //
-  // when the consumer takes a register-offset operand, that UXTW add is the
-  // addressing mode, so it does not need to be an instruction. Tmp still holds the *completed*
-  // guest effective address, which is what keeps the fold-then-convert ordering intact.
-  if (AllowRegOffsetFold) {
-    return {REG_GUEST_BASE.R(), NoOffset, IR::MemOffsetType::SXTX, 1, true, Tmp};
-  }
-  add(ARMEmitter::Size::i64Bit, Tmp, REG_GUEST_BASE.R(), Tmp, ARMEmitter::ExtendedType::UXTW, 0);
-  return {Tmp, NoOffset, IR::MemOffsetType::SXTX, 1};
+  // Addr is the completed, wrapping EA. Offset is a linear subaccess within that operand.
+  return {ApplyGuestBase(AddrReg, Tmp), Offset, OffsetType, OffsetScale};
 }
 #endif
 
@@ -868,10 +796,8 @@ DEF_OP(LoadMem) {
 
 DEF_OP(LoadMemPair) {
   const auto Op = IROp->C<IR::IROp_LoadMemPair>();
-  // Guest window: Op->Offset here is a u32 ldp immediate, not an IR operand, so GetGuestMemAddr cannot
-  // fold it. It is non-negative and bounded by the ldp scaled-imm7 range, so the only case where
-  // `Base + zext32(EA) + Offset` differs from `Base + zext32(EA + Offset)` is a guest access that
-  // straddles the 4GiB boundary - which is already a wild access under the identity mapping too.
+  // Architectural displacement is already in Addr. The pair immediate is a linear
+  // offset within the checked operand (its u32 field also carries signed imm7 values).
   const auto Addr = GetGuestMemReg(Op->Addr);
 
   if (Op->Class == IR::RegClass::GPR) {
@@ -2008,8 +1934,7 @@ DEF_OP(LoadMemX87SVEOptPredicate) {
 DEF_OP(StoreMemPair) {
   const auto Op = IROp->C<IR::IROp_StoreMemPair>();
   const auto OpSize = IROp->Size;
-  // Guest window: see the note in LoadMemPair about Op->Offset being a bounded non-negative stp
-  // immediate rather than an IR operand.
+  // Like LoadMemPair, the pair immediate is linear, not an architectural displacement.
   const auto Addr = GetGuestMemReg(Op->Addr);
 
   if (Op->Class == IR::RegClass::GPR) {

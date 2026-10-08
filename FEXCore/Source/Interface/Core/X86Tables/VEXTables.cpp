@@ -322,10 +322,10 @@ namespace AVX128 {
     {OPD(2, 0b01, 0x8C), 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::AVX128_VPMASKMOV, false>},
     {OPD(2, 0b01, 0x8E), 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::AVX128_VPMASKMOV, true>},
 
-    {OPD(2, 0b01, 0x90), 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::AVX128_VPGATHER, OpSize::i32Bit>},
-    {OPD(2, 0b01, 0x91), 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::AVX128_VPGATHER, OpSize::i64Bit>},
-    {OPD(2, 0b01, 0x92), 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::AVX128_VPGATHER, OpSize::i32Bit>},
-    {OPD(2, 0b01, 0x93), 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::AVX128_VPGATHER, OpSize::i64Bit>},
+    {OPD(2, 0b01, 0x90), 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::VPGATHER, OpSize::i32Bit>},
+    {OPD(2, 0b01, 0x91), 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::VPGATHER, OpSize::i64Bit>},
+    {OPD(2, 0b01, 0x92), 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::VPGATHER, OpSize::i32Bit>},
+    {OPD(2, 0b01, 0x93), 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::VPGATHER, OpSize::i64Bit>},
 
     {OPD(2, 0b01, 0x96), 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::AVX128_VFMAddSubImpl, true, 1, 3, 2>},  // VFMADDSUB
     {OPD(2, 0b01, 0x97), 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::AVX128_VFMAddSubImpl, false, 1, 3, 2>}, // VFMSUBADD

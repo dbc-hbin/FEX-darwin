@@ -46,11 +46,11 @@ constexpr inline DispatchTableEntry OpDispatch_BaseOpTable[] = {
   {0x9D, 1, &OpDispatchBuilder::POPFOp},
   {0x9E, 1, &OpDispatchBuilder::SAHFOp},
   {0x9F, 1, &OpDispatchBuilder::LAHFOp},
-  {0xA4, 2, &OpDispatchBuilder::MOVSOp},
+  {0xA4, 2, &OpDispatchBuilder::Bind<&OpDispatchBuilder::StringMemOp, true>},
 
   {0xA6, 2, &OpDispatchBuilder::CMPSOp},
   {0xA8, 2, &OpDispatchBuilder::Bind<&OpDispatchBuilder::TESTOp, 0>},
-  {0xAA, 2, &OpDispatchBuilder::STOSOp},
+  {0xAA, 2, &OpDispatchBuilder::Bind<&OpDispatchBuilder::StringMemOp, false>},
   {0xAC, 2, &OpDispatchBuilder::LODSOp},
   {0xAE, 2, &OpDispatchBuilder::SCASOp},
   {0xB0, 16, &OpDispatchBuilder::Bind<&OpDispatchBuilder::MOVGPROp, 0>},

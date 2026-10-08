@@ -323,6 +323,10 @@
       "Break BreakDefinition:$Reason": {
         "HasSideEffects": true
       },
+      "CheckGuestMemSpan GPR:$Addr, GPR:$Bytes, GPR:$RIP, BreakDefinition:$Reason": {
+        "HasSideEffects": true,
+        "Desc": ["Checks the full flat 32-bit operand span before any access or architectural update."]
+      },
       "CallbackReturn": {
         "HasSideEffects": true
       },
@@ -531,7 +535,7 @@
       "SSA = LoadMem RegisterClass:$Class, OpSize:#Size, GPR:$Addr, GPR:$Offset, OpSize:$Align, MemOffsetType:$OffsetType, u8:$OffsetScale": {
         "Desc": ["Loads a value from memory.",
                  "With the GuestWindow build feature, $Addr is a GUEST address unless $HostAddr is set: under a",
-                 "32-bit guest window the backend turns it into `GuestBase + zext32(EA + offset)`. $HostAddr marks",
+                 "32-bit guest window the backend uses `GuestBase + zext32(completedEA) + linearOffset`. $HostAddr marks",
                  "a context-relative address that is already a host pointer and is dereferenced as-is."
                 ],
         "Inline": ["", "Mem"],

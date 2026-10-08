@@ -40,6 +40,13 @@ static inline EXCEPTION_RECORD HandleGuestException(FEXCore::Core::CpuStateFrame
   case FEXCore::Core::FAULT_SIGSEGV:
     switch (Fault.TrapNo) {
     case FEXCore::X86State::X86_TRAPNO_GP:
+      if (!Fault.err_code && Fault.si_code == 2) { // Generated memory-limit GP (SEGV_ACCERR).
+        Dst.ExceptionCode = EXCEPTION_ACCESS_VIOLATION;
+        Dst.NumberParameters = 2;
+        Dst.ExceptionInformation[0] = 0;
+        Dst.ExceptionInformation[1] = 0xffffffff;
+        return Dst;
+      }
       if ((Fault.err_code & 0b111) == 0b010) {
         switch (Fault.err_code >> 3) {
         case 3:
@@ -73,6 +80,7 @@ static inline EXCEPTION_RECORD HandleGuestException(FEXCore::Core::CpuStateFrame
         return Dst;
       }
       break;
+    case FEXCore::X86State::X86_TRAPNO_SS: Dst.ExceptionCode = EXCEPTION_STACK_OVERFLOW; return Dst;
     case FEXCore::X86State::X86_TRAPNO_OF: Dst.ExceptionCode = EXCEPTION_INT_OVERFLOW; return Dst;
     case FEXCore::X86State::X86_TRAPNO_PF:
       // A page-fault raised by an explicit break in JIT code is always an execute fault

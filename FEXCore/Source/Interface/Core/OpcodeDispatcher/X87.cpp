@@ -129,8 +129,9 @@ void OpDispatchBuilder::FST(OpcodeArgs, IR::OpSize Width) {
   const auto SourceSize = ReducedPrecisionMode ? OpSize::i64Bit : OpSize::f80Bit;
   AddressMode A = DecodeAddress(Op, Op->Dest, MemoryAccessType::DEFAULT, false);
 
-  A = SelectAddressMode(this, A, GetGPROpSize(), CTX->HostFeatures.SupportsTSOImm9, false, false, Width);
-  _StoreStackMem(SourceSize, Width, A.Base, A.Index, OpSize::iInvalid, A.IndexType, A.IndexScale);
+  Ref Mem = LoadEffectiveAddress(this, A, GetGPROpSize(), true);
+  CheckGuestMemSpan(Op, Mem, Constant(IR::OpSizeToSize(Width)));
+  _StoreStackMem(SourceSize, Width, Mem, Invalid(), OpSize::iInvalid, MemOffsetType::SXTX, 1);
 
   if (Op->TableInfo->Flags & X86Tables::InstFlags::FLAGS_POP) {
     _PopStackDestroy();
@@ -375,12 +376,13 @@ void OpDispatchBuilder::X87FNSTENV(OpcodeArgs) {
   // 4 bytes : data pointer offset
   // 4 bytes : data pointer selector
 
-  // Before we store anything we need to sync our stack to the registers.
-  _SyncStackToSlow();
-
   const auto Size = OpSizeFromSrc(Op);
   Ref Mem = LoadSourceGPR(Op, Op->Dest, Op->Flags, {.LoadData = false});
   Mem = AppendSegmentOffset(Mem, Op->Flags);
+  CheckGuestMemSpan(Op, Mem, Constant(IR::OpSizeToSize(Size) * 7));
+
+  // Before we store anything we need to sync our stack to the registers.
+  _SyncStackToSlow();
 
   {
     auto FCW = _LoadContextGPR(OpSize::i16Bit, offsetof(FEXCore::Core::CPUState, FCW));
@@ -436,29 +438,25 @@ Ref OpDispatchBuilder::ReconstructX87StateFromFSW_Helper(Ref FSW) {
 }
 
 void OpDispatchBuilder::X87LDENV(OpcodeArgs) {
-  _StackForceSlow();
-
   const auto Size = OpSizeFromSrc(Op);
   Ref Mem = LoadSourceGPR(Op, Op->Src[0], Op->Flags, {.LoadData = false});
   Mem = AppendSegmentOffset(Mem, Op->Flags);
+  CheckGuestMemSpan(Op, Mem, Constant(IR::OpSizeToSize(Size) * 7));
+  _StackForceSlow();
 
   auto NewFCW = _LoadMemGPR(OpSize::i16Bit, Mem, OpSize::i16Bit);
   _StoreContextGPR(OpSize::i16Bit, NewFCW, offsetof(FEXCore::Core::CPUState, FCW));
 
-  Ref MemLocation = Add(OpSize::i64Bit, Mem, IR::OpSizeToSize(Size) * 1);
-  auto NewFSW = _LoadMemGPR(Size, MemLocation, Size);
+  auto NewFSW = _LoadMemGPR(Size, Mem, Constant(IR::OpSizeToSize(Size) * 1), Size, MemOffsetType::SXTX, 1);
   ReconstructX87StateFromFSW_Helper(NewFSW);
 
   {
     // FTW
-    Ref MemLocation = Add(OpSize::i64Bit, Mem, IR::OpSizeToSize(Size) * 2);
-    SetX87FTW(_LoadMemGPR(Size, MemLocation, Size));
+    SetX87FTW(_LoadMemGPR(Size, Mem, Constant(IR::OpSizeToSize(Size) * 2), Size, MemOffsetType::SXTX, 1));
   }
 }
 
 void OpDispatchBuilder::X87FNSAVE(OpcodeArgs) {
-  _SyncStackToSlow();
-
   // 14 bytes for 16bit
   // 2 Bytes : FCW
   // 2 Bytes : FSW
@@ -479,6 +477,8 @@ void OpDispatchBuilder::X87FNSAVE(OpcodeArgs) {
   // 4 bytes : data pointer selector
   const auto Size = OpSizeFromDst(Op);
   Ref Mem = MakeSegmentAddress(Op, Op->Dest);
+  CheckGuestMemSpan(Op, Mem, Constant(IR::OpSizeToSize(Size) * 7 + 80));
+  _SyncStackToSlow();
   Ref Top = GetX87Top();
   {
     auto FCW = _LoadContextGPR(OpSize::i16Bit, offsetof(FEXCore::Core::CPUState, FCW));
@@ -542,9 +542,10 @@ void OpDispatchBuilder::X87FNSAVE(OpcodeArgs) {
 }
 
 void OpDispatchBuilder::X87FRSTOR(OpcodeArgs) {
-  _StackForceSlow();
   const auto Size = OpSizeFromSrc(Op);
   Ref Mem = MakeSegmentAddress(Op, Op->Src[0]);
+  CheckGuestMemSpan(Op, Mem, Constant(IR::OpSizeToSize(Size) * 7 + 80));
+  _StackForceSlow();
 
   auto NewFCW = _LoadMemGPR(OpSize::i16Bit, Mem, OpSize::i16Bit);
   _StoreContextGPR(OpSize::i16Bit, NewFCW, offsetof(FEXCore::Core::CPUState, FCW));
@@ -856,22 +857,103 @@ void OpDispatchBuilder::X87FCMOV(OpcodeArgs) {
 
 void OpDispatchBuilder::X87FXAM(OpcodeArgs) {
   auto a = _ReadStackValue(0);
-  Ref Result =
-    ReducedPrecisionMode ? _VExtractToGPR(OpSize::i64Bit, OpSize::i64Bit, a, 0) : _VExtractToGPR(OpSize::i128Bit, OpSize::i64Bit, a, 1);
+  Ref Value = ReducedPrecisionMode ? _VExtractToGPR(OpSize::i64Bit, OpSize::i64Bit, a, 0) : _VExtractToGPR(OpSize::i128Bit, OpSize::i64Bit, a, 1);
 
-  // Extract the sign bit
-  Result = ReducedPrecisionMode ? _Bfe(OpSize::i64Bit, 1, 63, Result) : _Bfe(OpSize::i64Bit, 1, 15, Result);
+  // Extract the sign bit, which goes in C1
+  Ref Result = ReducedPrecisionMode ? _Bfe(OpSize::i64Bit, 1, 63, Value) : _Bfe(OpSize::i64Bit, 1, 15, Value);
   SetRFLAG<FEXCore::X86State::X87FLAG_C1_LOC>(Result);
 
-  // Claim this is a normal number
-  // We don't support anything else
-  auto TopValid = _StackValidTag(0);
+  auto NotEmpty = _StackValidTag(0);
+  Ref IsEmpty = _Xor(OpSize::i64Bit, NotEmpty, Constant(1));
+  Ref IsNaN {};
+  Ref IsDenormal {};
+  Ref IsInf {};
+  Ref IsZero {};
+  Ref IsUnsupported {};
+  Ref NoSignBit {};
 
-  // In the case of top being invalid then C3:C2:C0 is 0b101
-  auto C3 = Select01(OpSize::i32Bit, CondClass::NEQ, TopValid, Constant(1));
+  // TODO: The codegen for this is not optimal, and can probably be improved
+  // if FXAM ends up on the hot path for some workload.
 
-  auto C2 = TopValid;
-  auto C0 = C3; // Mirror C3 until something other than zero is supported
+  if (ReducedPrecisionMode) {
+    constexpr uint64_t ExponentMask = 0x7FF0'0000'0000'0000ULL;
+    NoSignBit = _Bfe(OpSize::i64Bit, 63, 0, Value);
+    IsInf = Select01(OpSize::i64Bit, CondClass::EQ, NoSignBit, Constant(ExponentMask));
+    IsNaN = Select01(OpSize::i64Bit, CondClass::UGT, NoSignBit, Constant(ExponentMask));
+
+    IsZero = Select01(OpSize::i64Bit, CondClass::EQ, NoSignBit, Constant(0));
+    // 64 bit floats can't represent an x87 denormal, nor any of the
+    // unsupported encodings.
+    IsDenormal = Constant(0);
+    IsUnsupported = Constant(0);
+  } else {
+    Ref Mantissa = _VExtractToGPR(OpSize::i128Bit, OpSize::i64Bit, a, 0);
+
+    // "J" is the name given to the msb of the mantissa in the SDM.
+    Ref JBit = _Bfe(OpSize::i64Bit, 1, 63, Mantissa);
+    Ref Exponent = _Bfe(OpSize::i64Bit, 15, 0, Value);
+    Ref IsExponentZero = Select01(OpSize::i64Bit, CondClass::EQ, Exponent, Constant(0));
+    Ref IsExponentMax = Select01(OpSize::i64Bit, CondClass::EQ, Exponent, Constant(0x7FFF));
+
+    // Inf is when mantissa only has the J bit set, exponent is all 1's.
+    Ref IsOnlyJBit = Select01(OpSize::i64Bit, CondClass::EQ, Mantissa, Constant(1ULL << 63));
+    IsInf = _And(OpSize::i64Bit, IsExponentMax, IsOnlyJBit);
+
+    // NaN is when the low 63 bits of the mantissa are non-zero
+    // and exponent is max, and the J bit is set.
+    Ref Fraction = _Bfe(OpSize::i64Bit, 63, 0, Mantissa);
+    Ref FractionNonZero = Select01(OpSize::i64Bit, CondClass::NEQ, Fraction, Constant(0));
+    Ref IsExponentMaxWithJBit = _And(OpSize::i64Bit, IsExponentMax, JBit);
+    IsNaN = _And(OpSize::i64Bit, IsExponentMaxWithJBit, FractionNonZero);
+
+    // Zero and Denormal are basically the same as the 64-bit case.
+    Ref MantissaNonZero = Select01(OpSize::i64Bit, CondClass::NEQ, Mantissa, Constant(0));
+    Ref MantissaZero = _Xor(OpSize::i64Bit, MantissaNonZero, Constant(1));
+    IsZero = _And(OpSize::i64Bit, IsExponentZero, MantissaZero);
+    IsDenormal = _And(OpSize::i64Bit, IsExponentZero, MantissaNonZero);
+
+    // This is where things are weird. If the J bit is not set
+    // and the exponent is non-zero, then this is an "unsupported"
+    // encoding, which I believe is left in for legacy reasons.
+    Ref IsSupported = _Or(OpSize::i64Bit, IsExponentZero, JBit);
+    IsUnsupported = _Xor(OpSize::i64Bit, IsSupported, Constant(1));
+  }
+
+  // NormalFiniteNumber = !Zero && !Denormal && !Inf && !NaN && !Empty && !Unsupported
+  Ref temp1 = _Or(OpSize::i64Bit, IsZero, IsDenormal);
+  Ref temp2 = _Or(OpSize::i64Bit, IsInf, IsNaN);
+  Ref temp3 = _Or(OpSize::i64Bit, IsUnsupported, IsEmpty);
+  temp1 = _Or(OpSize::i64Bit, temp1, temp2);
+  temp2 = _Or(OpSize::i64Bit, temp1, temp3);
+  Ref NormalFiniteNumber = _Xor(OpSize::i64Bit, temp2, Constant(1));
+
+  // Set C3, C2, C0 based on the class of the FP value in ST(0)
+  // Table is from "FXAM" page in the SDM.
+  // +----------------------+----+----+----+
+  // | Class                | C3 | C2 | C0 |
+  // +----------------------+----+----+----+
+  // | Unsupported          | 0  | 0  | 0  |
+  // | NaN                  | 0  | 0  | 1  |
+  // | Normal finite number | 0  | 1  | 0  |
+  // | Infinity             | 0  | 1  | 1  |
+  // | Zero                 | 1  | 0  | 0  |
+  // | Empty                | 1  | 0  | 1  |
+  // | Denormal number      | 1  | 1  | 0  |
+  // +----------------------+----+----+----+
+
+  // c0 = IsNaN || IsInf || IsEmpty
+  // c2 = (IsInf || Denormal || NormalFiniteNumber) && !IsEmpty
+  // c3 = Zero || IsEmpty || Denormal
+  Ref C0 = _Or(OpSize::i64Bit, IsNaN, IsInf);
+  C0 = _Or(OpSize::i64Bit, C0, IsEmpty);
+
+  Ref C2 = _Or(OpSize::i64Bit, IsInf, IsDenormal);
+  C2 = _Or(OpSize::i64Bit, C2, NormalFiniteNumber);
+  C2 = _And(OpSize::i64Bit, C2, NotEmpty);
+
+  Ref C3 = _Or(OpSize::i64Bit, IsZero, IsEmpty);
+  C3 = _Or(OpSize::i64Bit, C3, IsDenormal);
+
   SetRFLAG<FEXCore::X86State::X87FLAG_C0_LOC>(C0);
   SetRFLAG<FEXCore::X86State::X87FLAG_C2_LOC>(C2);
   SetRFLAG<FEXCore::X86State::X87FLAG_C3_LOC>(C3);

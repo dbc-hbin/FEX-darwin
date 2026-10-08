@@ -250,8 +250,8 @@ namespace DiskCache {
 
   // TODO: This header is in global installed header path, but uses internal headers.
   // Migrate this once that is fixed.
-  // Owned Darwin + selected backports; PUSH commits ESP only after a successful store.
-  static constexpr uint16_t FormatVersion = 0xA60A;
+  // Owned Darwin codegen, including operand spans and restartable string/gather operations.
+  static constexpr uint16_t FormatVersion = 0xA60F;
   FEX_DEFAULT_VISIBILITY uint16_t GetFormatVersion();
 
   static constexpr uint32_t LOOKUP_KEY_MAX_BUCKET_DEPTH = 500;

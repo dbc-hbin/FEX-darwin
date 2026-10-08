@@ -58,16 +58,34 @@ DEF_OP(Fence) {
 
 DEF_OP(Break) {
   auto Op = IROp->C<IR::IROp_Break>();
+  EmitSynchronousFault(Op->Reason);
+}
+
+DEF_OP(CheckGuestMemSpan) {
+  const auto Op = IROp->C<IR::IROp_CheckGuestMemSpan>();
+  ARMEmitter::ForwardLabel Valid;
+  // Flag-neutral: guest arithmetic flags may still reside in NZCV.
+  mov(ARMEmitter::Size::i32Bit, TMP1, GetReg(Op->Addr));
+  add(ARMEmitter::Size::i64Bit, TMP1, TMP1, GetReg(Op->Bytes));
+  sub(ARMEmitter::Size::i64Bit, TMP1, TMP1, 1);
+  lsr(ARMEmitter::Size::i64Bit, TMP1, TMP1, 32);
+  cbz(ARMEmitter::Size::i64Bit, TMP1, &Valid);
+  str(GetReg(Op->RIP).X(), STATE, offsetof(FEXCore::Core::CPUState, rip));
+  EmitSynchronousFault(Op->Reason);
+  Bind(&Valid);
+}
+
+void Arm64JITCore::EmitSynchronousFault(const IR::BreakDefinition& Reason) {
 
   // First we must reset the stack
   ResetStack();
 
   Core::CpuStateFrame::SynchronousFaultDataStruct State = {
     .FaultToTopAndGeneratedException = 1,
-    .Signal = Op->Reason.Signal,
-    .TrapNo = Op->Reason.TrapNumber,
-    .si_code = Op->Reason.si_code,
-    .err_code = Op->Reason.ErrorRegister,
+    .Signal = Reason.Signal,
+    .TrapNo = Reason.TrapNumber,
+    .si_code = Reason.si_code,
+    .err_code = Reason.ErrorRegister,
   };
 
   uint64_t Constant {};
@@ -76,7 +94,7 @@ DEF_OP(Break) {
   LoadConstant(ARMEmitter::Size::i64Bit, TMP1, Constant);
   str(TMP1, STATE, offsetof(FEXCore::Core::CpuStateFrame, SynchronousFaultData));
 
-  switch (Op->Reason.Signal) {
+  switch (Reason.Signal) {
   case Core::FAULT_SIGILL:
     ldr(TMP1, STATE, offsetof(FEXCore::Core::CpuStateFrame, Pointers.GuestSignal_SIGILL));
     br(TMP1);

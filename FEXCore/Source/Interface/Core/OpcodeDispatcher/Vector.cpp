@@ -2979,6 +2979,7 @@ void OpDispatchBuilder::AVXVFCMPOp(OpcodeArgs, IR::OpSize ElementSize) {
 
 void OpDispatchBuilder::FXSaveOp(OpcodeArgs) {
   Ref Mem = MakeSegmentAddress(Op, Op->Dest);
+  CheckGuestMemSpan(Op, Mem, Constant(512));
 
   SaveX87State(Op, Mem);
   SaveSSEState(Mem);
@@ -2997,6 +2998,18 @@ void OpDispatchBuilder::XSaveOpImpl(OpcodeArgs) {
   // NOTE: Mask should be EAX and EDX concatenated, but we only need to test
   //       for features that are in the lower 32 bits, so EAX only is sufficient.
   const auto OpSize = GetGPROpSize();
+
+#ifdef FEX_GUEST_WINDOW
+  if (!Is64BitMode) {
+    Ref Base = XSaveBase(Op);
+    Ref Bytes = Constant(576);
+    if (CTX->HostFeatures.SupportsAVX) {
+      Ref AVXRequested = _Bfe(OpSize, 1, 2, LoadGPRRegister(X86State::REG_RAX));
+      Bytes = _Select(OpSize::i64Bit, OpSize, CondClass::NEQ, AVXRequested, Constant(0), Constant(704), Bytes);
+    }
+    CheckGuestMemSpan(Op, Base, Bytes);
+  }
+#endif
 
   const auto StoreIfFlagSet = [this, OpSize](uint32_t BitIndex, auto fn, uint32_t FieldSize = 1) {
     Ref Mask = LoadGPRRegister(X86State::REG_RAX);
@@ -3172,6 +3185,7 @@ Ref OpDispatchBuilder::GetMXCSR() {
 
 void OpDispatchBuilder::FXRStoreOp(OpcodeArgs) {
   Ref Mem = MakeSegmentAddress(Op, Op->Src[0]);
+  CheckGuestMemSpan(Op, Mem, Constant(512));
 
   RestoreX87State(Mem);
   RestoreSSEState(Mem);
@@ -3182,6 +3196,19 @@ void OpDispatchBuilder::FXRStoreOp(OpcodeArgs) {
 
 void OpDispatchBuilder::XRstorOpImpl(OpcodeArgs) {
   const auto OpSize = GetGPROpSize();
+
+#ifdef FEX_GUEST_WINDOW
+  if (!Is64BitMode) {
+    Ref Base = XSaveBase(Op);
+    CheckGuestMemSpan(Op, Base, Constant(576));
+    if (CTX->HostFeatures.SupportsAVX) {
+      Ref Mask = _LoadMemGPR(OpSize::i64Bit, Base, Constant(512), OpSize::i64Bit, MemOffsetType::SXTX, 1);
+      Ref AVXActive = _Bfe(OpSize, 1, 2, Mask);
+      Ref Bytes = _Select(OpSize::i64Bit, OpSize, CondClass::NEQ, AVXActive, Constant(0), Constant(704), Constant(576));
+      CheckGuestMemSpan(Op, Base, Bytes);
+    }
+  }
+#endif
 
   // If a bit in our XSTATE_BV is set, then we restore from that region of the XSAVE area,
   // otherwise, if not set, then we need to set the relevant data the bit corresponds to
@@ -3250,9 +3277,10 @@ void OpDispatchBuilder::RestoreX87State(Ref MemBase) {
   auto NewFCW = _LoadMemGPR(OpSize::i16Bit, MemBase, OpSize::i16Bit);
   _StoreContextGPR(OpSize::i16Bit, NewFCW, offsetof(FEXCore::Core::CPUState, FCW));
 
+  Ref Top {};
   {
     auto NewFSW = _LoadMemGPR(OpSize::i16Bit, MemBase, Constant(2), OpSize::i16Bit, MemOffsetType::SXTX, 1);
-    ReconstructX87StateFromFSW_Helper(NewFSW);
+    Top = ReconstructX87StateFromFSW_Helper(NewFSW);
   }
 
   {
@@ -3261,10 +3289,21 @@ void OpDispatchBuilder::RestoreX87State(Ref MemBase) {
     _StoreContextGPR(OpSize::i8Bit, NewFTW, offsetof(FEXCore::Core::CPUState, AbridgedFTW));
   }
 
-  for (uint32_t i = 0; i < Core::CPUState::NUM_MMS; i += 2) {
-    auto MMRegs = LoadMemPairFPR(OpSize::i128Bit, MemBase, i * 16 + 32);
-    _StoreContextFPR(OpSize::i128Bit, MMRegs.Low, MMBaseOffset() + i * 16);
-    _StoreContextFPR(OpSize::i128Bit, MMRegs.High, MMBaseOffset() + (i + 1) * 16);
+  auto SevenConst = Constant(7);
+  auto low = Constant(~0ULL);
+  auto high = Constant(0xFFFF);
+  Ref Mask = _VLoadTwoGPRs(low, high);
+  const auto StoreSize = ReducedPrecisionMode ? OpSize::i64Bit : OpSize::i128Bit;
+  for (uint32_t i = 0; i < Core::CPUState::NUM_MMS; ++i) {
+    Ref Reg = _LoadMemFPR(OpSize::i128Bit, MemBase, Constant(16 * i + 32), OpSize::i8Bit, MemOffsetType::SXTX, 1);
+    // Mask off the top bits
+    Reg = _VAnd(OpSize::i128Bit, Reg, Mask);
+    if (ReducedPrecisionMode) {
+      // Convert to double precision
+      Reg = _F80CVT(OpSize::i64Bit, Reg);
+    }
+    _StoreContextFPRIndexed(Reg, Top, StoreSize, MMBaseOffset(), IR::OpSizeToSize(OpSize::i128Bit));
+    Top = _And(OpSize::i32Bit, Add(OpSize::i32Bit, Top, 1), SevenConst);
   }
 }
 
@@ -5743,130 +5782,87 @@ void OpDispatchBuilder::VFMAddSubImpl(OpcodeArgs, bool AddSub, uint8_t Src1Idx, 
   StoreResultFPR(Op, Result);
 }
 
-OpDispatchBuilder::RefVSIB OpDispatchBuilder::LoadVSIB(const X86Tables::DecodedOp& Op, const X86Tables::DecodedOperand& Operand, uint32_t Flags) {
-  const bool IsVSIB = (Op->Flags & X86Tables::DecodeFlags::FLAG_VSIB_BYTE) != 0;
-  LOGMAN_THROW_A_FMT((Operand.IsSIB() || Operand.IsSIBRelocation()) && IsVSIB, "Trying to load VSIB for something that isn't the correct "
-                                                                               "type!");
-
-  // VSIB is a very special case which has a ton of encoded data.
-  // Get it in a format we can reason about.
-
-  const auto Index_gpr = Operand.Data.SIB.Index;
-  const auto Base_gpr = Operand.Data.SIB.Base;
-  LOGMAN_THROW_A_FMT(Index_gpr >= FEXCore::X86State::REG_XMM_0 && Index_gpr <= FEXCore::X86State::REG_XMM_15, "must be AVX reg");
-  LOGMAN_THROW_A_FMT(Base_gpr == FEXCore::X86State::REG_INVALID || (Base_gpr >= FEXCore::X86State::REG_RAX && Base_gpr <= FEXCore::X86State::REG_R15),
-                     "Base must be a GPR.");
-  const auto Index_XMM_gpr = Index_gpr - X86State::REG_XMM_0;
-
-  OpDispatchBuilder::RefVSIB A {
-    .Low = LoadXMMRegister(Index_XMM_gpr),
-    .BaseAddr = Base_gpr != FEXCore::X86State::REG_INVALID ? LoadGPRRegister(Base_gpr, OpSize::i64Bit, 0, false) : nullptr,
-    .Scale = Operand.Data.SIB.Scale,
+void OpDispatchBuilder::VPGATHER(OpcodeArgs, OpSize AddrElementSize) {
+  const auto& Operand = Op->Src[0];
+  LOGMAN_THROW_A_FMT((Operand.IsSIB() || Operand.IsSIBRelocation()) && (Op->Flags & X86Tables::DecodeFlags::FLAG_VSIB_BYTE), "Expected VSIB operand");
+  const auto Size = OpSizeFromDst(Op);
+  const auto ElementSize = Op->Flags & X86Tables::DecodeFlags::FLAG_OPTION_AVX_W ? OpSize::i64Bit : OpSize::i32Bit;
+  const auto AddrSize = Op->Flags & X86Tables::DecodeFlags::FLAG_ADDRESS_SIZE ? GetGPROpSize() >> 1 : GetGPROpSize();
+  const auto DestReg = Op->Dest.Data.GPR.GPR - X86State::REG_XMM_0;
+  const auto MaskReg = Op->Src[1].Data.GPR.GPR - X86State::REG_XMM_0;
+  const auto IndexReg = Operand.Data.SIB.Index - X86State::REG_XMM_0;
+  const auto BaseReg = Operand.Data.SIB.Base;
+  if (AddrSize == OpSize::i16Bit || DestReg == MaskReg || DestReg == IndexReg || MaskReg == IndexReg) {
+    DecodeFailure = true;
+    return;
+  }
+  const unsigned ElementBytes = IR::OpSizeToSize(ElementSize);
+  const unsigned IndexBytes = IR::OpSizeToSize(AddrElementSize);
+  const unsigned Lanes = IR::OpSizeToSize(Size) / std::max(ElementBytes, IndexBytes);
+  const bool Split = !CTX->HostFeatures.SupportsSVE256;
+  auto LoadHalf = [&](uint32_t Reg, unsigned Half) -> Ref {
+    if (Split) return AVX128_LoadXMMRegister(Reg, Half);
+    Ref Full = LoadXMMRegister(Reg);
+    return Half ? _VDupElement(OpSize::i256Bit, OpSize::i128Bit, Full, 1) : Full;
+  };
+  auto StoreHalf = [&](uint32_t Reg, unsigned Half, Ref Value) {
+    if (Split) {
+      AVX128_StoreXMMRegister(Reg, Value, Half);
+    } else {
+      StoreXMMRegister(Reg, _VInsElement(OpSize::i256Bit, OpSize::i128Bit, Half, 0, LoadXMMRegister(Reg), Value));
+    }
   };
 
-  if (Operand.IsSIBRelocation()) {
-    auto EPOffset = _EntrypointOffset(OpSize::i64Bit, Operand.Data.SIB.Offset);
-    if (A.BaseAddr) {
-      A.BaseAddr = Add(OpSize::i64Bit, EPOffset, A.BaseAddr);
-    } else {
-      A.BaseAddr = EPOffset;
+  // VEX gathers normalize masks and zero unused lanes before the first faulting access.
+  for (unsigned Half = 0; Half < 2; ++Half) {
+    Ref Dest = LoadHalf(DestReg, Half);
+    Ref Mask = _VSShrI(OpSize::i128Bit, ElementSize, LoadHalf(MaskReg, Half), ElementBytes * 8 - 1);
+    if (Lanes * ElementBytes <= Half * 16) {
+      Dest = Mask = LoadZeroVector(OpSize::i128Bit);
+    } else if (Lanes * ElementBytes - Half * 16 == 8) {
+      Dest = _VMov(OpSize::i64Bit, Dest);
+      Mask = _VMov(OpSize::i64Bit, Mask);
     }
-  } else {
-    A.Displacement = static_cast<int32_t>(Operand.Data.SIB.Offset);
+    StoreHalf(DestReg, Half, Dest);
+    StoreHalf(MaskReg, Half, Mask);
   }
 
-  return A;
-}
+  const auto DefaultSegment = BaseReg == X86State::REG_RBP || BaseReg == X86State::REG_RSP
+    ? X86Tables::DecodeFlags::FLAG_SS_PREFIX : X86Tables::DecodeFlags::FLAG_DS_PREFIX;
+  const uint32_t SegmentFlags = (Op->Flags & X86Tables::DecodeFlags::FLAG_SEGMENTS) ?: DefaultSegment;
+  // ponytail: scalar lanes commit fault progress; a vector path needs equivalent architectural recovery.
+  for (unsigned Lane = 0; Lane < Lanes; ++Lane) {
+    const unsigned DataHalf = Lane * ElementBytes / 16;
+    const unsigned DataLane = Lane % (16 / ElementBytes);
+    Ref Mask = _VExtractToGPR(OpSize::i128Bit, ElementSize, LoadHalf(MaskReg, DataHalf), DataLane);
+    auto Active = CondJumpBit(Mask, ElementBytes * 8 - 1, true);
+    auto Body = CreateNewCodeBlockAfter(GetCurrentBlock());
+    auto Next = CreateNewCodeBlockAfter(Body);
+    SetTrueJumpTarget(Active, Body);
+    SetFalseJumpTarget(Active, Next);
+    SetCurrentCodeBlock(Body);
+    StartNewBlock();
+    _GuestOpcode(Op->PC - Entry);
 
-void OpDispatchBuilder::VPGATHER(OpcodeArgs, OpSize AddrElementSize) {
-  LOGMAN_THROW_A_FMT(AddrElementSize == OpSize::i32Bit || AddrElementSize == OpSize::i64Bit, "Unknown address element size");
-
-  const auto Size = OpSizeFromDst(Op);
-  const auto Is128Bit = Size == OpSize::i128Bit;
-  const auto GPRSize = GetGPROpSize();
-  auto AddrSize = (Op->Flags & X86Tables::DecodeFlags::FLAG_ADDRESS_SIZE) != 0 ? (GPRSize >> 1) : GPRSize;
-
-  ///< Element size is determined by W flag.
-  const OpSize ElementLoadSize = Op->Flags & X86Tables::DecodeFlags::FLAG_OPTION_AVX_W ? OpSize::i64Bit : OpSize::i32Bit;
-
-  // We only need the high address register if the number of data elements is more than what the low half can consume.
-  // But also the number of address elements is clamped by the destination size as well.
-  const size_t NumDataElements = IR::NumElements(Size, ElementLoadSize);
-  const size_t NumAddrElementBytes = std::min<size_t>(IR::OpSizeToSize(Size), (NumDataElements * IR::OpSizeToSize(AddrElementSize)));
-  const bool Needs128BitHighAddrBytes = NumAddrElementBytes > IR::OpSizeToSize(OpSize::i128Bit);
-
-  auto VSIB = LoadVSIB(Op, Op->Src[0], Op->Flags);
-
-  const bool SupportsSVELoad = (VSIB.Scale == 1 || VSIB.Scale == IR::OpSizeToSize(AddrElementSize)) && (AddrElementSize == ElementLoadSize);
-
-  Ref Dest = LoadSourceFPR(Op, Op->Dest, Op->Flags);
-  Ref Mask = LoadSourceFPR(Op, Op->Src[1], Op->Flags);
-
-  Ref Result {};
-  if (!SupportsSVELoad) {
-    // We need to go down the fallback path in the case that we don't hit the backend's SVE mode.
-    RefPair Dest128 {
-      .Low = Dest,
-      .High = _VDupElement(OpSize::i256Bit, OpSize::i128Bit, Dest, 1),
-    };
-
-    RefPair Mask128 {
-      .Low = Mask,
-      .High = _VDupElement(OpSize::i256Bit, OpSize::i128Bit, Mask, 1),
-    };
-
-    RefVSIB VSIB128 = VSIB;
-    VSIB128.High = Invalid();
-
-    if (Needs128BitHighAddrBytes) {
-      if (Is128Bit) {
-        ///< A bit careful for the VSIB index register duplicating.
-        VSIB128.High = VSIB128.Low;
-      } else {
-        VSIB128.High = _VDupElement(OpSize::i256Bit, OpSize::i128Bit, VSIB128.Low, 1);
-      }
+    Ref Offset = _VExtractToGPR(OpSize::i128Bit, AddrElementSize, LoadHalf(IndexReg, Lane * IndexBytes / 16), Lane % (16 / IndexBytes));
+    if (AddrElementSize == OpSize::i32Bit) Offset = _Sbfe(OpSize::i64Bit, 32, 0, Offset);
+    if (Operand.Data.SIB.Scale != 1) Offset = _Lshl(OpSize::i64Bit, Offset, Constant(FEXCore::ilog2(Operand.Data.SIB.Scale)));
+    if (BaseReg != X86State::REG_INVALID) Offset = Add(OpSize::i64Bit, Offset, LoadGPRRegister(BaseReg));
+    if (Operand.IsSIBRelocation()) {
+      Offset = Add(OpSize::i64Bit, Offset, _EntrypointOffset(OpSize::i64Bit, Operand.Data.SIB.Offset));
+    } else if (Operand.Data.SIB.Offset) {
+      Offset = Add(OpSize::i64Bit, Offset, static_cast<int32_t>(Operand.Data.SIB.Offset));
     }
-
-    auto Result128 = AVX128_VPGatherImpl(Op, Size, ElementLoadSize, AddrElementSize, Dest128, Mask128, VSIB128);
-    // The registers are current split, need to merge them.
-    Result = _VInsElement(OpSize::i256Bit, OpSize::i128Bit, 1, 0, Result128.Low, Result128.High);
-  } else {
-    ///< Calculate the full operation.
-    ///< BaseAddr doesn't need to exist, calculate that here.
-    Ref BaseAddr = VSIB.BaseAddr;
-    if (BaseAddr && VSIB.Displacement) {
-      BaseAddr = Add(OpSize::i64Bit, BaseAddr, VSIB.Displacement);
-    } else if (VSIB.Displacement) {
-      BaseAddr = Constant(VSIB.Displacement);
-    } else if (!BaseAddr) {
-      BaseAddr = Invalid();
-    }
-
-    Result =
-      _VLoadVectorGatherMasked(Size, ElementLoadSize, Dest, Mask, BaseAddr, VSIB.Low, Invalid(), AddrElementSize, VSIB.Scale, 0, 0, AddrSize);
+    if (AddrSize != OpSize::i64Bit) Offset = _Bfe(OpSize::i64Bit, IR::OpSizeAsBits(AddrSize), 0, Offset);
+    Ref Address = AppendSegmentOffset(Offset, Op->Flags, DefaultSegment);
+    CheckGuestMemSpan(Op, Address, Constant(ElementBytes), SegmentFlags);
+    Ref Value = _LoadMemGPRAutoTSO(ElementSize, Address);
+    StoreHalf(DestReg, DataHalf, _VInsGPR(OpSize::i128Bit, ElementSize, DataLane, LoadHalf(DestReg, DataHalf), Value));
+    StoreHalf(MaskReg, DataHalf, _VInsGPR(OpSize::i128Bit, ElementSize, DataLane, LoadHalf(MaskReg, DataHalf), Constant(0)));
+    Jump(Next);
+    SetCurrentCodeBlock(Next);
+    StartNewBlock();
   }
-
-  if (Is128Bit) {
-    if (AddrElementSize == OpSize::i64Bit && ElementLoadSize == OpSize::i32Bit) {
-      // Special case for the 128-bit gather load using 64-bit address indexes with 32-bit results.
-      // Only loads two 32-bit elements in to the lower 64-bits of the first destination.
-      // Bits [255:65] all become zero.
-      Result = _VMov(OpSize::i64Bit, Result);
-    } else {
-      Result = _VMov(OpSize::i128Bit, Result);
-    }
-  } else {
-    if (AddrElementSize == OpSize::i64Bit && ElementLoadSize == OpSize::i32Bit) {
-      // If we only fetched 128-bits worth of data then the upper-result is all zero.
-      Result = _VMov(OpSize::i128Bit, Result);
-    }
-  }
-
-  StoreResultFPR(Op, Result);
-
-  ///< Assume non-faulting behaviour and clear the mask register.
-  auto Zero = LoadZeroVector(Size);
-  StoreResultFPR_WithOpSize(Op, Op->Src[1], Zero, Size);
 }
 
 void OpDispatchBuilder::Extrq_imm(OpcodeArgs) {

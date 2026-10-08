@@ -413,8 +413,8 @@ DEF_OP(ValidateCode) {
 DEF_OP(ThreadRemoveCodeEntry) {
   auto Op = IROp->C<IR::IROp_ThreadRemoveCodeEntry>();
 
-  // Move the entry to ABI before saving state.
-  mov(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::r1, GetReg(Op->Entry));
+  // Preserve the argument without overwriting guest RDX (x1 on ARM64EC).
+  mov(ARMEmitter::Size::i64Bit, TMP2, GetReg(Op->Entry));
 
   PushDynamicRegs(TMP4);
   SpillStaticRegs(TMP4);
@@ -422,6 +422,9 @@ DEF_OP(ThreadRemoveCodeEntry) {
   // Arguments are passed as follows:
   // X0: Thread
   // X1: RIP
+  if (!TMP_ABIARGS) {
+    mov(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::r1, TMP2);
+  }
   mov(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::r0, STATE.R());
 
   ldr(ARMEmitter::XReg::x2, STATE, offsetof(FEXCore::Core::CpuStateFrame, Pointers.ThreadRemoveCodeEntryFromJIT));

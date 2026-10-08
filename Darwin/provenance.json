@@ -91,7 +91,15 @@
       ]
     }
   ],
+  "additional_upstream_backports": [
+    "93def420615289035dcf0b767ef6da4be1692789",
+    "6788bcf264bc99c5686bb6eece3017eb2b5b1301"
+  ],
   "sources": [
+    {
+      "path": "FEXCore/Source/Interface/Core/OpcodeDispatcher/X87.cpp",
+      "sha256": "31ce7dadfe17efae360621a13c767ce58ae570c0f5e04bf91d336dc2e59d3228"
+    },
     {
       "path": "Source/Windows/ARM64EC/Module.cpp",
       "sha256": "f9adebf4bc2336fac104f6adb0f58dc3a11f1e84ef7d3bfe50f3d0af3533d24d"
@@ -306,7 +314,7 @@
     }
   ],
   "cache": {
-    "format_version": "0xA609",
+    "format_version": "0xA60F",
     "enabled_by_default": false,
     "memory_budget_default": 0,
     "main_file_cap_default": 1073741824,

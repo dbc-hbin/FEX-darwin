@@ -437,8 +437,7 @@ public:
   void IMUL1SrcOp(OpcodeArgs);
   void IMUL2SrcOp(OpcodeArgs);
   void IMULOp(OpcodeArgs);
-  void STOSOp(OpcodeArgs);
-  void MOVSOp(OpcodeArgs);
+  void StringMemOp(OpcodeArgs, bool Copy);
   void CMPSOp(OpcodeArgs);
   void LODSOp(OpcodeArgs);
   void SCASOp(OpcodeArgs);
@@ -852,14 +851,6 @@ public:
   void VFMAImpl(OpcodeArgs, IROps IROp, bool Scalar, uint8_t Src1Idx, uint8_t Src2Idx, uint8_t AddendIdx);
   void VFMAddSubImpl(OpcodeArgs, bool AddSub, uint8_t Src1Idx, uint8_t Src2Idx, uint8_t AddendIdx);
 
-  struct RefVSIB {
-    Ref Low, High;
-    Ref BaseAddr;
-    int32_t Displacement;
-    uint8_t Scale;
-  };
-
-  RefVSIB LoadVSIB(const X86Tables::DecodedOp& Op, const X86Tables::DecodedOperand& Operand, uint32_t Flags);
   void VPGATHER(OpcodeArgs, OpSize AddrElementSize);
 
   void AVXExtendVectorElements(OpcodeArgs, IR::OpSize ElementSize, IR::OpSize DstElementSize, bool Signed);
@@ -922,7 +913,6 @@ public:
   RefPair AVX128_LoadSource_WithOpSize(const X86Tables::DecodedOp& Op, const X86Tables::DecodedOperand& Operand, uint32_t Flags,
                                        bool NeedsHigh, MemoryAccessType AccessType = MemoryAccessType::DEFAULT);
 
-  RefVSIB AVX128_LoadVSIB(const X86Tables::DecodedOp& Op, const X86Tables::DecodedOperand& Operand, uint32_t Flags, bool NeedsHigh);
   void AVX128_StoreResult_WithOpSize(FEXCore::X86Tables::DecodedOp Op, const FEXCore::X86Tables::DecodedOperand& Operand, const RefPair Src,
                                      MemoryAccessType AccessType = MemoryAccessType::DEFAULT);
   void AVX128_VMOVScalarImpl(OpcodeArgs, IR::OpSize ElementSize);
@@ -1075,11 +1065,6 @@ public:
   void AVX128_VFMAImpl(OpcodeArgs, IROps IROp, uint8_t Src1Idx, uint8_t Src2Idx, uint8_t AddendIdx);
   void AVX128_VFMAScalarImpl(OpcodeArgs, IROps IROp, uint8_t Src1Idx, uint8_t Src2Idx, uint8_t AddendIdx);
   void AVX128_VFMAddSubImpl(OpcodeArgs, bool AddSub, uint8_t Src1Idx, uint8_t Src2Idx, uint8_t AddendIdx);
-
-  RefPair AVX128_VPGatherQPSImpl(OpcodeArgs, Ref Dest, Ref Mask, RefVSIB VSIB);
-  RefPair AVX128_VPGatherImpl(OpcodeArgs, OpSize Size, OpSize ElementLoadSize, OpSize AddrElementSize, RefPair Dest, RefPair Mask, RefVSIB VSIB);
-
-  void AVX128_VPGATHER(OpcodeArgs, OpSize AddrElementSize);
 
   void AVX128_VCVTPH2PS(OpcodeArgs);
   void AVX128_VCVTPS2PH(OpcodeArgs);
@@ -2425,6 +2410,8 @@ private:
     return DestIsMem(Op) && (Op->Flags & FEXCore::X86Tables::DecodeFlags::FLAG_LOCK) != 0;
   }
 
+  void CheckGuestMemSpan(const X86Tables::DecodedOp& Op, Ref Base, Ref Bytes, uint32_t SegmentFlags = 0);
+
   bool DestIsMem(FEXCore::X86Tables::DecodedOp Op) const {
     return !Op->Dest.IsGPR();
   }
@@ -2506,12 +2493,12 @@ private:
     AddressMode Out {};
 
     signed OffsetEl = A.Offset / SizeInt;
-    if ((A.Offset % SizeInt) == 0 && OffsetEl >= -64 && OffsetEl < 64) {
+    if (A.AddrSize == OpSize::i64Bit && (A.Offset % SizeInt) == 0 && OffsetEl >= -64 && OffsetEl < 64) {
       Out.Offset = A.Offset;
       A.Offset = 0;
     }
 
-    Out.Base = LoadEffectiveAddress(this, A, GetGPROpSize(), true, false);
+    Out.Base = LoadEffectiveAddress(this, A, A.AddrSize == OpSize::i64Bit ? OpSize::i64Bit : GetGPROpSize(), true, false);
     return Out;
   }
 
@@ -2534,13 +2521,15 @@ private:
       return LoadMemPair(Class, Size, B.Base, B.Offset);
     }
 
-    AddressMode HighA = A;
-    HighA.Offset += 16;
-
-    return {
-      .Low = _LoadMemAutoTSO(Class, Size, A, Align),
-      .High = _LoadMemAutoTSO(Class, Size, HighA, Align),
-    };
+    const auto B = SelectPairAddressMode(A, Size);
+    const auto LowOffset = Constant(B.Offset);
+    const auto HighOffset = Constant(B.Offset + IR::OpSizeToSize(Size));
+    if (AtomicTSO) {
+      return {_LoadMemTSO(Class, Size, B.Base, LowOffset, Align, MemOffsetType::SXTX, 1),
+              _LoadMemTSO(Class, Size, B.Base, HighOffset, Align, MemOffsetType::SXTX, 1)};
+    }
+    return {_LoadMem(Class, Size, B.Base, LowOffset, Align, MemOffsetType::SXTX, 1),
+            _LoadMem(Class, Size, B.Base, HighOffset, Align, MemOffsetType::SXTX, 1)};
   }
   RefPair _LoadMemPairFPRAutoTSO(OpSize Size, const AddressMode& A, OpSize Align = OpSize::i8Bit) {
     return _LoadMemPairAutoTSO(RegClass::FPR, Size, A, Align);
@@ -2572,11 +2561,16 @@ private:
       const auto B = SelectPairAddressMode(A, Size);
       _StoreMemPair(Class, Size, Value1, Value2, B.Base, B.Offset);
     } else {
-      auto B = A;
-
-      _StoreMemAutoTSO(Class, Size, B, Value1, OpSize::i8Bit);
-      B.Offset += SizeInt;
-      _StoreMemAutoTSO(Class, Size, B, Value2, OpSize::i8Bit);
+      const auto B = SelectPairAddressMode(A, Size);
+      const auto LowOffset = Constant(B.Offset);
+      const auto HighOffset = Constant(B.Offset + SizeInt);
+      if (AtomicTSO) {
+        _StoreMemTSO(Class, Size, Value1, B.Base, LowOffset, Align, MemOffsetType::SXTX, 1);
+        _StoreMemTSO(Class, Size, Value2, B.Base, HighOffset, Align, MemOffsetType::SXTX, 1);
+      } else {
+        _StoreMem(Class, Size, Value1, B.Base, LowOffset, Align, MemOffsetType::SXTX, 1);
+        _StoreMem(Class, Size, Value2, B.Base, HighOffset, Align, MemOffsetType::SXTX, 1);
+      }
     }
   }
   void _StoreMemPairFPRAutoTSO(OpSize Size, const AddressMode& A, Ref Value1, Ref Value2, OpSize Align = OpSize::i8Bit) {

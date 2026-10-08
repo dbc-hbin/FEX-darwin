@@ -323,21 +323,20 @@ private:
   [[nodiscard]]
   ARMEmitter::ExtendedMemOperand GenerateMemOperand(IR::OpSize AccessSize, ARMEmitter::Register Base, IR::OrderedNodeWrapper Offset,
                                                     IR::MemOffsetType OffsetType, uint8_t OffsetScale);
+  void EmitSynchronousFault(const IR::BreakDefinition& Reason);
 
   // Guest window support. See Arm64Emitter.h (REG_GUEST_BASE) and Context.h (Config.GuestBase).
   //
   // Every IR op that dereferences a guest address converts it to a host address exactly once, and
   // the conversion applies to the *completed* effective address, never to one component of it. An
-  // x86 effective address wraps modulo 2^32, so `Base + zext32(EA) + disp` can leave the window at
-  // the top, and a negative displacement can land below the window base. GetGuestMemAddr therefore
-  // folds any offset into the guest address first, then adds the base.
+  // x86 effective address wraps modulo 2^32 in the frontend, including architectural displacement.
+  // Separate memory-IR offsets are linear bytes within that completed operand and must not wrap.
   //
   // Without FEX_GUEST_WINDOW (and with GuestBase == 0) all of these are the identity and emit nothing.
   struct GuestMemAddr {
     // Host address base register for the access.
     ARMEmitter::Register Base;
-    // Offset still to be encoded into the memory operand. Invalid once a guest window has folded it
-    // into Base.
+    // Linear offset within the operand, retained after guest base conversion.
     IR::OrderedNodeWrapper Offset;
     IR::MemOffsetType OffsetType;
     uint8_t OffsetScale;

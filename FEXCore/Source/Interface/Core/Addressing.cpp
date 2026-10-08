@@ -54,6 +54,19 @@ Ref LoadEffectiveAddress(IREmitter* IREmit, const AddressMode& A, IR::OpSize GPR
 AddressMode SelectAddressMode(IREmitter* IREmit, const AddressMode& A, IR::OpSize GPRSize, bool HostSupportsTSOImm9, bool AtomicTSO,
                               bool Vector, IR::OpSize AccessSize) {
   const auto Is32Bit = GPRSize == OpSize::i32Bit;
+  if (Is32Bit && A.AddrSize <= OpSize::i32Bit) {
+    // Architectural displacement belongs inside the wrapping effective address.
+    // Memory-IR offsets are reserved for linear subaccesses of that operand.
+    auto Base = LoadEffectiveAddress(IREmit, A, GPRSize, true);
+    return {.Base = IREmit->_Bfe(OpSize::i64Bit, 32, 0, Base), .Index = IREmit->Invalid()};
+  }
+  if (Is32Bit && A.AddrSize == OpSize::i64Bit) {
+    // Synthetic structure offsets must never pass through another 32-bit wrap.
+    auto Offset = A;
+    Offset.Base = IREmit->Invalid();
+    return {.Base = A.Base, .Index = LoadEffectiveAddress(IREmit, Offset, OpSize::i64Bit, true),
+            .IndexType = MemOffsetType::SXTX, .IndexScale = 1};
+  }
   const auto GPRSizeMatchesAddrSize = A.AddrSize == GPRSize;
   const auto OffsetIndexToLargeFor32Bit = Is32Bit && (A.Offset <= -16384 || A.Offset >= 16384);
   if (!GPRSizeMatchesAddrSize || OffsetIndexToLargeFor32Bit) {
