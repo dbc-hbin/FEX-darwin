@@ -13,6 +13,7 @@ upstream FEX notices are retained in [LICENSE.upstream](LICENSE.upstream).
 - WoW64 guest window: translate 32-bit guest addresses; core adapted from [willfaust/FEX PR #2](https://github.com/willfaust/FEX/pull/2) (MIT).
 - WoW64 integration: preserve guest pointer identity, fault-safe PUSH state and whole-process code invalidation.
 - Call/return guards: use 16KB guard pages on Darwin.
+- Fault/context correctness: retain REP/gather progress, honor XRSTOR requests and preserve extended state through paired Wine APC/thread-context paths.
 
 Selected upstream backports add thread-termination fixes, PCMPXSTRX lowering and disk-cache optimizations.
 Local cache fixes cover address translation, locking, size limits, retry after failure/eviction and Unicode cleanup.
@@ -27,13 +28,10 @@ Requires native macOS ARM64, Xcode command-line tools, Python 3, CMake, Make and
 ```sh
 git submodule update --init --depth 1 External/fmt External/range-v3 External/rpmalloc External/unordered_dense External/xxhash Source/Common/cpp-optparse
 python3 Darwin/build.py --output build/local/darwin01 --jobs 8
-python3 Darwin/test_build.py --build-output build/local/darwin01
-python3 Darwin/test_guest_window.py
-python3 Darwin/tests/fex_disk_cache_cpu.py
 ```
 
-Use a fresh build directory. The builder runs CPU checks and audits both DLLs; outputs and evidence are under
-`build/local/darwin01/`. Windows probes in `Darwin/tests/` require a compatible ARM64-native Wine runtime.
+Use a fresh build directory. The builder audits both DLLs; outputs and provenance are under
+`build/local/darwin01/`.
 
 Wine must provide the shared-data, JIT write-protection, native JIT allocation and WoW64 guest-window hooks.
 Wine changes and graphics backends are separate from this repository. This is not a standalone macOS or Linux loader.
