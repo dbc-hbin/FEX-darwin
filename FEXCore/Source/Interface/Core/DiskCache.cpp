@@ -25,6 +25,7 @@
 #ifdef _WIN32
 #include <winternl.h>
 extern "C" NTSTATUS RtlUnicodeToUTF8N(PCHAR, ULONG, PULONG, PCWCH, ULONG);
+extern "C" NTSTATUS WINAPI NtQueryAttributesFile(const OBJECT_ATTRIBUTES*, FILE_BASIC_INFORMATION*);
 #endif
 
 namespace FEXCore {
@@ -383,6 +384,7 @@ namespace DiskCache {
     if (!DiskCachePruneStaleEntries) {
       return;
     }
+    const fextl::string NativeCacheBase(CacheBase);
 
 #ifdef _WIN32
     // Config/getenv and file-open APIs use ANSI; FileUtils traversal uses UTF-8.
@@ -401,26 +403,73 @@ namespace DiskCache {
 #endif
 
     struct SimpleCapture {
-      std::string_view CacheBase, MachineBucketHash;
+      std::string_view CacheBase, NativeCacheBase, MachineBucketHash;
     } const SimpleCapture {
       .CacheBase = CacheBase,
+      .NativeCacheBase = NativeCacheBase,
       .MachineBucketHash = MachineBucketHash,
     };
 
     FEXCore::FileUtils::WalkDirectory(
       CacheBase,
       [](std::string_view name, bool is_dir, const void* user_data) {
-        if (!is_dir) {
+        if (!is_dir || name.size() != 16 || name.find_first_not_of("0123456789abcdef") != std::string_view::npos) {
           return;
         }
 
         auto capture = reinterpret_cast<const struct SimpleCapture*>(user_data);
 
-        // Current behaviour is to remove entries that no longer match the MachineBucketHash.
-        // This means that if the Disk Cache version no longer matches, or the FEXCore::HostFeatures differ, then they get removed.
-        if (name != capture->MachineBucketHash) {
-          FEXCore::FileUtils::RecursiveRemoveDirectory(fextl::fmt::format("{}/{}", capture->CacheBase, name));
-        }
+        if (name == capture->MachineBucketHash) return;
+        const auto Directory = fextl::fmt::format("{}/{}", capture->CacheBase, name);
+        const auto NativeDirectory = fextl::fmt::format("{}/{}", capture->NativeCacheBase, name);
+        bool RemovedCacheFile = false;
+        struct BucketCapture {
+          const fextl::string& NativeDirectory;
+          bool& RemovedCacheFile;
+        } Bucket {NativeDirectory, RemovedCacheFile};
+        // Remove only recognizable FEX database files, never an arbitrary directory tree.
+        // Keep the native (ANSI on Windows) path for file APIs; traversal uses UTF-8.
+        FEXCore::FileUtils::WalkDirectory(Directory, [](std::string_view FileName, bool IsDirectory, const void* UserData) {
+          if (IsDirectory || !FileName.starts_with("RWCacheDB_") || FileName.size() < 26 ||
+              FileName.substr(10, 16).find_first_not_of("0123456789abcdef") != std::string_view::npos ||
+              (FileName.substr(26) != ".foz" && FileName.substr(26) != "_idx.foz")) return;
+          const auto& Bucket = *static_cast<const BucketCapture*>(UserData);
+          const auto Path = fextl::fmt::format("{}/{}", Bucket.NativeDirectory, FileName);
+          // A cache-shaped name can still be a FIFO/device or a link to one.
+          // Inspect it without opening it, so validation cannot block startup.
+#ifdef _WIN32
+          UNICODE_STRING PathW, NTPath;
+          if (!RtlCreateUnicodeStringFromAsciiz(&PathW, Path.c_str())) return;
+          const bool HasNTPath = RtlDosPathNameToNtPathName_U(PathW.Buffer, &NTPath, nullptr, nullptr);
+          RtlFreeUnicodeString(&PathW);
+          if (!HasNTPath) return;
+          OBJECT_ATTRIBUTES Attributes;
+          InitializeObjectAttributes(&Attributes, &NTPath, OBJ_CASE_INSENSITIVE, nullptr, nullptr);
+          FILE_BASIC_INFORMATION Info {};
+          const auto Status = NtQueryAttributesFile(&Attributes, &Info);
+          RtlFreeUnicodeString(&NTPath);
+          if (Status != 0 || (Info.FileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DEVICE))) return;
+#else
+          struct stat Info {};
+          if (lstat(Path.c_str(), &Info) != 0 || !S_ISREG(Info.st_mode)) return;
+#endif
+          {
+            FOZFile File;
+            if (!File.Open(Path, true)) return;
+          }
+#ifdef _WIN32
+          if (DeleteFileA(Path.c_str())) Bucket.RemovedCacheFile = true;
+#else
+          if (unlink(Path.c_str()) == 0) Bucket.RemovedCacheFile = true;
+#endif
+        }, &Bucket);
+        // Unknown files, nested directories and failed reads/deletes keep the bucket alive.
+        if (!RemovedCacheFile) return;
+#ifdef _WIN32
+        RemoveDirectoryA(NativeDirectory.c_str());
+#else
+        rmdir(NativeDirectory.c_str());
+#endif
       },
       &SimpleCapture);
   }
@@ -562,6 +611,7 @@ namespace DiskCache {
         if (IndexEntry) {
           IndexEntry->MemoryBlob.reset();
           IndexEntry->LRUEntry.reset();
+          if (!IndexEntry->DB) Self->EraseEntryLocked(LastKey.LookupKey, IndexEntry);
         }
         Self->MemoryLRUCurrentSize -= LastKey.Size;
         auto Deleted = Last;
@@ -633,8 +683,9 @@ namespace DiskCache {
     IndexEntry MainEntry;
     IndexEntry CandidateEntry;
     uint64_t MainEntryFootprint;
-    fextl::multimap<uint64_t, IndexEntry>::iterator MoreEntriesIt;
-    fextl::multimap<uint64_t, IndexEntry>* MapPointer = nullptr;
+    // Eviction can erase or promote entries after IndexLock is released.
+    fextl::vector<std::pair<uint64_t, IndexEntry>> MoreEntriesSnapshot;
+    decltype(MoreEntriesSnapshot)::iterator MoreEntriesIt;
     IndexEntry* EntryUnderReview;
     fextl::shared_ptr<fextl::vector<uint8_t>> BlobRef;
     std::optional<fextl::list<MemoryLRUKey>::iterator> LRUIter;
@@ -649,11 +700,11 @@ namespace DiskCache {
 
       MainEntry = It->second.MainEntry;
       MainEntryFootprint = It->second.MainEntryFootprint;
-      MapPointer = It->second.MoreEntries.get();
-      if (MapPointer) {
-        MoreEntriesIt = It->second.MoreEntries->begin();
+      if (It->second.MoreEntries) {
+        MoreEntriesSnapshot.assign(It->second.MoreEntries->begin(), It->second.MoreEntries->end());
       }
-      if (MapPointer && MoreEntriesIt != It->second.MoreEntries->end()) {
+      MoreEntriesIt = MoreEntriesSnapshot.begin();
+      if (MoreEntriesIt != MoreEntriesSnapshot.end()) {
         CandidateEntry = MoreEntriesIt->second;
         EntryUnderReview = &CandidateEntry;
         BlobRef = EntryUnderReview->MemoryBlob;
@@ -672,10 +723,8 @@ namespace DiskCache {
     bool Advance = false;
     while (!FoundMatchingHash) {
       if (Advance) {
-        std::lock_guard Guard(IndexLock);
-
         EntryUnderReview = nullptr;
-        if (MapPointer && MoreEntriesIt != MapPointer->end()) {
+        if (MoreEntriesIt != MoreEntriesSnapshot.end()) {
           // if the current footprint is also the main entry's footprint, give main entry a shot next
           if (!TriedMainEntry && MoreEntriesIt->first == MainEntryFootprint) {
             EntryUnderReview = &MainEntry;
@@ -687,7 +736,7 @@ namespace DiskCache {
             MoreEntriesIt++;
           }
         }
-        if (!MapPointer || MoreEntriesIt == MapPointer->end()) {
+        if (MoreEntriesIt == MoreEntriesSnapshot.end()) {
           if (TriedMainEntry) {
             // ran out
             break;
@@ -699,7 +748,7 @@ namespace DiskCache {
             TriedMainEntry = true;
           }
         }
-        if (!EntryUnderReview && MapPointer && MoreEntriesIt != MapPointer->end()) {
+        if (!EntryUnderReview && MoreEntriesIt != MoreEntriesSnapshot.end()) {
           CandidateEntry = MoreEntriesIt->second;
           EntryUnderReview = &CandidateEntry;
           BlobRef = EntryUnderReview->MemoryBlob;
@@ -710,7 +759,7 @@ namespace DiskCache {
 
       Advance = true;
 
-      // entry not backed by anything right now - todo prune..
+      // Ignore an unbacked entry in the snapshot.
       if (!EntryUnderReview->DB && !BlobRef) {
         continue;
       }
@@ -946,6 +995,28 @@ namespace DiskCache {
     return nullptr;
   }
 
+  void DiskCache::EraseEntryLocked(uint64_t LookupKey, IndexEntry* Entry) {
+    auto It = Index.find(LookupKey);
+    auto& Head = It->second;
+    if (Entry == &Head.MainEntry) {
+      if (!Head.MoreEntries || Head.MoreEntries->empty()) {
+        Index.erase(It);
+      } else {
+        auto First = Head.MoreEntries->begin();
+        Head.MainEntryFootprint = First->first;
+        Head.MainEntry = std::move(First->second);
+        Head.MoreEntries->erase(First);
+      }
+    } else {
+      for (auto More = Head.MoreEntries->begin(); More != Head.MoreEntries->end(); ++More) {
+        if (&More->second == Entry) {
+          Head.MoreEntries->erase(More);
+          break;
+        }
+      }
+    }
+  }
+
   struct DiskCache::CacheStoreWorkItem final : WorkQueueThread::WorkItem {
     DiskCache* Self;
     IndexedDB* DB;
@@ -986,6 +1057,7 @@ namespace DiskCache {
           }
           if (!KeepEntryInMemory) {
             IndexEntry->MemoryBlob.reset();
+            if (!IndexEntry->DB) Self->EraseEntryLocked(LookupKey, IndexEntry);
           } else {
             std::lock_guard LRUGuard(Self->MemoryLRULock);
             Self->MemoryLRU.push_front({LookupKey, IndexAfterHeader->GuestHash, IndexAfterHeader->GuestFootprint, (uint32_t)Blob->size()});
@@ -1008,6 +1080,9 @@ namespace DiskCache {
       return false;
     }
     if (!DecodedBlockInfo) {
+      return false;
+    }
+    if (RWCacheDB->Full() && !MemoryLRUMaxSize) {
       return false;
     }
     // check for any reloc targets outside of our jurisdiction

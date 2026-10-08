@@ -99,7 +99,7 @@ DLLEXPORT_FUNC(BOOL, DeleteFileW, (LPCWSTR lpFileName)) {
 
   NTSTATUS Status =
     NtCreateFile(&Handle, SYNCHRONIZE | DELETE, &ObjAttributes, &IOSB, nullptr, 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                 FILE_OPEN, FILE_DELETE_ON_CLOSE | FILE_NON_DIRECTORY_FILE, nullptr, 0);
+                 FILE_OPEN, FILE_DELETE_ON_CLOSE | FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT, nullptr, 0);
   if (WinAPIReturn(Status)) {
     Status = NtClose(Handle);
   }

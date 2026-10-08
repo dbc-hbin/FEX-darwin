@@ -213,6 +213,7 @@ namespace DiskCache {
     bool OpenCacheDB(const fextl::string& CacheDBName, bool ReadOnly);
     uint64_t MakeLookupKey(Core::InternalThreadState* Thread, const uint64_t ModuleOffset, bool Writable, bool MonoBackpatcher);
     IndexEntry* LookupLocked(const uint64_t LookupKey, const XXH128_hash_t& GuestHash, const uint64_t GuestFootprint);
+    void EraseEntryLocked(uint64_t LookupKey, IndexEntry* Entry);
 
     bool ReadingDiskCache {};
     bool WritingDiskCache {};
