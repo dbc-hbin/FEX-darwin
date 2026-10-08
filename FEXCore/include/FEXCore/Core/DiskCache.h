@@ -8,4 +8,3 @@
 namespace FEXCore::DiskCache {
 FEX_DEFAULT_VISIBILITY uint16_t GetFormatVersion();
 } // namespace FEXCore::DiskCache
-

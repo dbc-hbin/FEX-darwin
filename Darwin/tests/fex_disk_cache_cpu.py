@@ -28,11 +28,17 @@ def body(text: str, token: str) -> str:
 # Production structs and bodies require only standard containers and xxhash.
 structs = header[header.index("  struct MemoryLRUKey {"):header.index("  struct __attribute__((packed)) BlobFixedHeader")]
 lookup = body(source, "  IndexEntry* DiskCache::LookupLocked(")
+erase = body(source, "  void DiskCache::EraseEntryLocked(")
 prune = body(source, "  struct DiskCache::PruneMemoryLRUWorkItem final") + ";"
 writer = body(source, "  struct DiskCache::CacheStoreWorkItem final") + ";"
 publication = body(source[source.index("    NewEntry.GuestExtents = ExactGuestCodeExtents;"):], "    {\n      std::lock_guard Guard(IndexLock);")
 extra = body(source, "  struct __attribute__((packed)) IndexExtraBlobHeader") + ";"
 common = body(source, "    struct __attribute__((packed)) mesa_index_db_file_entry") + ";"
+selection_start = source.index("    bool TriedMainEntry = false;")
+selection_loop = source.index("    bool FoundMatchingHash = false;", selection_start)
+selection_end = source.index("      if (!EntryUnderReview->DB && !BlobRef)", selection_loop)
+snapshot = source[selection_start:selection_loop]
+selection = source[selection_loop:selection_end]
 
 harness = r'''
 #include <atomic>
@@ -88,6 +94,7 @@ public:
   struct CacheStoreWorkItem;
   struct PruneMemoryLRUWorkItem;
   IndexEntry* LookupLocked(uint64_t, const XXH128_hash_t&, uint64_t);
+  void EraseEntryLocked(uint64_t, IndexEntry*);
   bool Publish(uint64_t LookupKey, uint64_t GuestFootprint, XXH128_hash_t Hash,
                const std::shared_ptr<std::vector<uint8_t>>& BlobRef, bool& Queued) {
     struct { XXH128_hash_t GuestHash; } Header {Hash};
@@ -96,8 +103,20 @@ public:
     Queued = true;
     return true;
   }
+  std::optional<std::vector<uint64_t>> ReadWhileWriterFails(uint64_t LookupKey) {
+    std::vector<uint64_t> Seen;
+''' + snapshot + r'''
+    Writer->Drain(); // Delete the real index after the production lookup snapshot.
+    assert(Index.empty());
+''' + selection + r'''
+      assert(EntryUnderReview && BlobRef == EntryUnderReview->MemoryBlob);
+      assert(LRUIter == EntryUnderReview->LRUEntry);
+      Seen.push_back(CurrentFootprint);
+    }
+    return Seen;
+  }
 };
-''' + lookup + prune + writer + r'''
+''' + lookup + erase + prune + writer + r'''
 } }
 using namespace FEXCore::DiskCache;
 int main() {
@@ -119,7 +138,7 @@ int main() {
     return Queued;
   };
   // In-flight duplicates must not queue another writer. Failure with zero memory
-  // budget makes the entry dead; repopulation must reuse the existing index slot.
+  // budget removes the entry; retry must remain possible.
   assert(Store(Footprint, Hash));
   assert(!Store(Footprint, Hash));
   auto* Entry = Cache.LookupLocked(Key, Hash, Footprint);
@@ -127,13 +146,14 @@ int main() {
   auto Work = std::move(Cache.Writer->Queue.front());
   Cache.Writer->Queue.clear();
   Work->Run();
-  assert(Entry && !Entry->DB && !Entry->MemoryBlob && !Entry->LRUEntry);
+  assert(!Cache.LookupLocked(Key, Hash, Footprint) && Cache.Index.empty());
   assert(!PendingBlob.expired()); // The writer still owns its input after index reset.
   Work.reset();
   assert(PendingBlob.expired());
   assert(Store(Footprint, Hash));
   DB.Success = true;
   Cache.Writer->Drain();
+  Entry = Cache.LookupLocked(Key, Hash, Footprint);
   assert(DB.Writes == 2 && Entry->DB == &DB && Entry->Offset == 123);
   assert(!Store(Footprint, Hash));
 
@@ -151,20 +171,71 @@ int main() {
   assert(MemoryEntry->MemoryBlob && Cache.MemoryLRUCurrentSize == 64);
   Reader.reset();
   Prune.Run(); // Explicit eviction signal, no sleep or polling.
-  assert(!MemoryEntry->MemoryBlob && !MemoryEntry->LRUEntry && Cache.MemoryLRU.empty());
+  assert(!Cache.LookupLocked(Key, Hash, Footprint + 1) && Cache.MemoryLRU.empty());
   assert(Cache.MemoryLRUCurrentSize == 0);
   for (unsigned Retry = 0; Retry < 3; ++Retry) {
     assert(Store(Footprint + 1, Hash, false));
     Cache.MemoryLRUMaxSize = 64;
     Cache.Writer->Drain();
-    assert(Cache.LookupLocked(Key, Hash, Footprint + 1) == MemoryEntry);
+    MemoryEntry = Cache.LookupLocked(Key, Hash, Footprint + 1);
     assert(MemoryEntry->MemoryBlob && Cache.MemoryLRU.size() == 1 && Cache.MemoryLRUCurrentSize == 64);
     Cache.MemoryLRUMaxSize = 0;
     Prune.Run();
-    assert(!MemoryEntry->MemoryBlob && Cache.MemoryLRU.empty() && Cache.MemoryLRUCurrentSize == 0);
+    assert(!Cache.LookupLocked(Key, Hash, Footprint + 1) && Cache.MemoryLRU.empty() && Cache.MemoryLRUCurrentSize == 0);
   }
-  assert(Cache.Index.at(Key).MoreEntries->size() == 1);
-  std::puts("disk-cache CPU regression: PASS (failure retry, exact identity, live duplicate, eviction repopulation)");
+  assert(Cache.Index.at(Key).MoreEntries->empty());
+
+  // More distinct variants than the bucket limit must not accumulate dead slots,
+  // whether storage failed, the disk was full, or memory-only blobs were evicted.
+  for (unsigned Mode = 0; Mode < 3; ++Mode) {
+    for (unsigned I = 0; I < 2 * Cache.LOOKUP_KEY_MAX_BUCKET_DEPTH; ++I) {
+      const XXH128_hash_t Variant {I, Mode};
+      Cache.MemoryLRUMaxSize = Mode == 2 ? 64 : 0;
+      DB.Success = false;
+      assert(Store(Footprint, Variant, Mode == 0));
+      Cache.Writer->Drain();
+      Cache.MemoryLRUMaxSize = 0;
+      Prune.Run();
+      assert(!Cache.LookupLocked(Key, Variant, Footprint));
+      assert(Cache.Index.size() == 1 && Cache.Index.at(Key).MoreEntries->empty());
+      assert(Cache.LookupLocked(Key, Hash, Footprint)->DB == &DB);
+    }
+  }
+
+  // Erasing a main entry must promote its live collision without invalidating
+  // the queued writer or its LRU identity. Eventually the entire key disappears.
+  Cache.Index.clear();
+  Cache.MemoryLRUMaxSize = 64;
+  assert(Store(Footprint, Hash, false));
+  Cache.Writer->Drain();
+  assert(Store(Footprint + 1, Hash, false));
+  Cache.MemoryLRUMaxSize = 0;
+  Prune.Run();
+  assert(!Cache.LookupLocked(Key, Hash, Footprint));
+  assert(Cache.Index.at(Key).MainEntryFootprint == Footprint + 1);
+  Cache.Writer->Drain();
+  assert(Cache.Index.empty() && Cache.MemoryLRU.empty() && Cache.MemoryLRUCurrentSize == 0);
+
+  // Failed writers can erase all candidates while lookup is examining its snapshot.
+  assert(Store(Footprint, Hash));
+  assert(Store(Footprint + 1, Hash));
+  assert(Store(Footprint + 2, Hash));
+  const auto Seen = Cache.ReadWhileWriterFails(Key);
+  assert(Seen && *Seen == (std::vector<uint64_t> {Footprint + 1, Footprint + 2, Footprint}));
+
+  // Distinct lookup keys also disappear after a failed write.
+  for (unsigned I = 0; I < 100; ++I) {
+    auto Blob = std::make_shared<std::vector<uint8_t>>(64, 0xa5);
+    bool Queued = false;
+    assert(Cache.Publish(I, Footprint, Hash, Blob, Queued) && Queued);
+    IndexExtraBlobHeader Header {Hash, Footprint, 1, 2};
+    std::vector<uint8_t> IndexBlob(sizeof(Header));
+    std::memcpy(IndexBlob.data(), &Header, sizeof(Header));
+    DiskCache::CacheStoreWorkItem Work(&Cache, &DB, {}, I, Blob, std::move(IndexBlob), true);
+    Work.Run();
+    assert(Cache.Index.empty());
+  }
+  std::puts("disk-cache CPU regression: PASS (retry, reader lifetime, eviction, dead identities, bucket promotion)");
 }
 '''
 
