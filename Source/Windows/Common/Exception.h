@@ -9,6 +9,9 @@
 #include <FEXCore/Debug/InternalThreadState.h>
 
 namespace FEX::Windows {
+// Private Wine hook: ExceptionInformation carries thread handle, get/set, and NTSTATUS result.
+constexpr NTSTATUS STATUS_FEX_XSTATE_CONTEXT = static_cast<NTSTATUS>(0xe0424658);
+
 template<typename TReg>
 static inline EXCEPTION_RECORD HandleGuestException(FEXCore::Core::CpuStateFrame::SynchronousFaultDataStruct& Fault,
                                                     const EXCEPTION_RECORD& Src, TReg& Rip, TReg Rax, TReg Cx, BOOL& FirstChance) {
