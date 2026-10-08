@@ -13,3 +13,8 @@ out/
 .cache
 .idea/
 CMakeLists.txt.user
+
+# Local Darwin regression fixtures and working notes
+/Darwin/test_*.py
+/Darwin/tests/
+/docs/

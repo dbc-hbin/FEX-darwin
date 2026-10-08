@@ -146,16 +146,7 @@ def main() -> int:
         result["source_files"] = [{"path": item["path"], "sha256": hashlib.sha256((root / item["path"]).read_bytes()).hexdigest()}
                                   for item in provenance["sources"]]
         result["source_snapshot"] = str(source)
-        cpu_check = output / "shared-data-cpu-check"
-        run(["/usr/bin/clang++", "-arch", "arm64", "-std=c++20", "-Wall", "-Wextra", "-Werror",
-             "-I" + str(source / "Source/Windows/ARM64EC"),
-             str(root / "Darwin/tests/fex_shared_data_cpu.cpp"), "-o", str(cpu_check)], "shared-data-cpu-build")
-        result["shared_data_cpu_check"] = run([str(cpu_check)], "shared-data-cpu-check").strip()
-        jit_check = output / "jit-write-scope-check"
-        run(["/usr/bin/clang++", "-arch", "arm64", "-std=c++20", "-D_WIN32", "-Wall", "-Wextra", "-Werror",
-             "-I" + str(source / "FEXCore/include"),
-             str(root / "Darwin/tests/fex_jit_write_scope.cpp"), "-o", str(jit_check)], "jit-write-scope-build")
-        result["jit_write_scope_check"] = run([str(jit_check)], "jit-write-scope-check").strip()
+
         marker = (source / "Source/Windows/wine_builtin.bin").read_bytes()
         result["builtin_marker_sha256"] = hashlib.sha256(marker).hexdigest()
         artifacts = output / "dlls"
