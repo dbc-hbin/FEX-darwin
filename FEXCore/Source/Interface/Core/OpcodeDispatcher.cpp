@@ -3211,9 +3211,41 @@ void OpDispatchBuilder::StringMemOp(OpcodeArgs, bool Copy) {
     return;
   }
 
-  // ponytail: scalar iterations preserve fault progress; add a bulk path only with equivalent restart state.
+  const bool ChunkBytes = Is64BitMode && AddrSize == OpSize::i64Bit && Size == OpSize::i8Bit &&
+    !(Op->Flags & X86Tables::DecodeFlags::FLAG_SEGMENTS) && !CTX->IsMemcpyAtomicTSOEnabled();
   CalculateDeferredFlags();
   ForeachDirection([&](int32_t PtrDir) {
+    if (ChunkBytes && PtrDir == 1) {
+      Ref Alignment = LoadGPRRegister(X86State::REG_RDI, AddrSize);
+      if (Copy) Alignment = _Or(OpSize::i64Bit, Alignment, LoadGPRRegister(X86State::REG_RSI, AddrSize));
+      auto Unaligned = CondJump(_And(OpSize::i64Bit, Alignment, Constant(7)));
+      auto Header = CreateNewCodeBlockAfter(GetCurrentBlock());
+      SetFalseJumpTarget(Unaligned, Header);
+      SetCurrentCodeBlock(Header);
+      StartNewBlock();
+      auto Tail = CondJump(_Bfe(OpSize::i64Bit, 61, 3, LoadGPRRegister(X86State::REG_RCX, AddrSize)), CondClass::EQ);
+      auto Body = CreateNewCodeBlockAfter(Header);
+      SetFalseJumpTarget(Tail, Body);
+      SetCurrentCodeBlock(Body);
+      StartNewBlock();
+      _GuestOpcode(Op->PC - Entry);
+      Ref Src = Copy ? LoadGPRRegister(X86State::REG_RSI, AddrSize) : Invalid();
+      Ref Dest = LoadGPRRegister(X86State::REG_RDI, AddrSize);
+      Ref Value = Copy ? _LoadMem(RegClass::GPR, OpSize::i64Bit, Src, Invalid(), OpSize::i64Bit, MemOffsetType::SXTX, 1)
+        : _Mul(OpSize::i64Bit, _Bfe(OpSize::i64Bit, 8, 0, LoadGPRRegister(X86State::REG_RAX)), Constant(0x0101010101010101ULL));
+      // Aligned 8-byte accesses cannot straddle a protection page or overlap within a chunk.
+      // Load each chunk after the preceding store, retaining scalar propagation at distance 8.
+      _StoreMem(RegClass::GPR, OpSize::i64Bit, Value, Dest, Invalid(), OpSize::i64Bit, MemOffsetType::SXTX, 1);
+      StoreOffset(X86State::REG_RDI, Add(OpSize::i64Bit, Dest, 8));
+      if (Copy) StoreOffset(X86State::REG_RSI, Add(OpSize::i64Bit, Src, 8));
+      StoreOffset(X86State::REG_RCX, Sub(OpSize::i64Bit, LoadGPRRegister(X86State::REG_RCX, AddrSize), 8));
+      Jump(Header);
+      auto Scalar = CreateNewCodeBlockAfter(Body);
+      SetTrueJumpTarget(Unaligned, Scalar);
+      SetTrueJumpTarget(Tail, Scalar);
+      SetCurrentCodeBlock(Scalar);
+      StartNewBlock();
+    }
     auto Begin = Jump();
     auto Header = CreateNewCodeBlockAfter(GetCurrentBlock());
     SetJumpTarget(Begin, Header);
