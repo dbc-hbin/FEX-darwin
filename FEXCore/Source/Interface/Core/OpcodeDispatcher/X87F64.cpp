@@ -28,6 +28,7 @@ void OpDispatchBuilder::X87LDENVF64(OpcodeArgs) {
 
   const auto Size = OpSizeFromSrc(Op);
   Ref Mem = MakeSegmentAddress(Op, Op->Src[0]);
+  CheckGuestMemSpan(Op, Mem, Constant(Size == OpSize::i16Bit ? 14 : 28));
 
   auto NewFCW = _LoadMemGPR(OpSize::i16Bit, Mem, OpSize::i16Bit);
   // ignore the rounding precision, we're always 64-bit in F64.

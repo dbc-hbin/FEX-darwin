@@ -19,6 +19,7 @@ $end_info$
 #include <FEXCore/Core/X86Enums.h>
 #include <FEXCore/HLE/SyscallHandler.h>
 #include <FEXCore/Utils/Allocator.h>
+#include <FEXCore/Utils/JitWriteScope.h>
 #include <FEXCore/Utils/LogManager.h>
 #include <FEXCore/Utils/Profiler.h>
 #include <FEXCore/Utils/Telemetry.h>
@@ -119,6 +120,7 @@ int32_t Decoder::CheckRangeExecutable(uint64_t Address, uint64_t Size) {
       // Return the number of bytes that couldn't be decoded.
       return -(Size - RemainingSize);
     }
+    InstructionHasWritableBytes |= ExecutableRangeWritable;
 
     uint64_t RangeRemainingSize = ExecutableRangeEnd - Address;
     if (RemainingSize > RangeRemainingSize) {
@@ -127,6 +129,7 @@ int32_t Decoder::CheckRangeExecutable(uint64_t Address, uint64_t Size) {
     }
   }
 
+  InstructionHasWritableBytes |= ExecutableRangeWritable;
   // Say all bytes are readable.
   return Size;
 }
@@ -1345,6 +1348,7 @@ void Decoder::AddBranchTarget(uint64_t Target) {
           .NumInstructions = BlockIt->NumInstructions - SplitIdx,
           .DecodedInstructions = BlockIt->DecodedInstructions + SplitIdx,
           .BlockStatus = BlockIt->BlockStatus,
+          .ForceFullSMCDetection = BlockIt->ForceFullSMCDetection,
         };
 
         if (BlockIt->DataMasks.size()) {
@@ -1558,6 +1562,12 @@ void Decoder::PruneInlinedBranchDataMasks() {
 }
 
 void Decoder::DecodeLoop(const uint8_t* _InstStream, uint64_t GuestSizePause) {
+  bool ValidateWritableCode = false;
+#ifdef _WIN32
+  // ponytail: validate writable Darwin code until Wine can trap a physical 16-KiB
+  // page without changing its four logical guest-page permissions.
+  ValidateWritableCode = FEXCore::Allocator::VirtualJitWriteProtect && CTX->Config.SMCChecks == FEXCore::Config::CONFIG_SMC_MTRACK;
+#endif
   // counter-intuitively, the masks are also needed for lookup on anon prefix decodes, not just stores
   bool WantsDataMasks = CTX->DiskCache.IsReadingDiskCache() || CTX->DiskCache.IsWritingDiskCache();
 
@@ -1611,6 +1621,7 @@ void Decoder::DecodeLoop(const uint8_t* _InstStream, uint64_t GuestSizePause) {
 
     while (1) {
       InstructionSize = 0;
+      InstructionHasWritableBytes = false;
 
       // MAX_INST_SIZE assumes worst case
       auto OpAddress = BlockIt->Entry + PCOffset;
@@ -1637,6 +1648,7 @@ void Decoder::DecodeLoop(const uint8_t* _InstStream, uint64_t GuestSizePause) {
 
       LastFieldReadSize = 0;
       BlockIt->BlockStatus = DecodeInstruction(OpAddress);
+      BlockIt->ForceFullSMCDetection |= ValidateWritableCode && InstructionHasWritableBytes;
       if (HitBadRelocation) {
         BlockInfo.TotalInstructionCount = 0;
         BlockInfo.Blocks = {*BlockIt};

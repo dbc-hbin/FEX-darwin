@@ -168,34 +168,20 @@ private:
   // Helpers
   Ref RotateRight8(uint32_t V, Ref Amount);
 
-  void F80SplitStore_Helper(const IROp_StoreStackMem* Op, Ref StackNode, Ref AddrNode, Ref Offset, OpSize Align, MemOffsetType OffsetType,
-                            uint8_t OffsetScale) {
-    IREmit->_StoreMemFPR(OpSize::i64Bit, StackNode, AddrNode, Offset, Align, OffsetType, OffsetScale);
+  void F80SplitStore_Helper(Ref StackNode, Ref AddrNode, OpSize Align) {
+    IREmit->_StoreMemFPR(OpSize::i64Bit, StackNode, AddrNode, IREmit->Invalid(), Align, MemOffsetType::SXTX, 1);
     auto Upper = IREmit->_VExtractToGPR(OpSize::i128Bit, OpSize::i64Bit, StackNode, 1);
 
     // Store the Upper part of the register (the remaining 2 bytes) into memory.
-    AddressMode A {.Base = AddrNode,
-                   .Index = Op->Offset.IsInvalid() ? nullptr : Offset,
-                   .Offset = 8,
-                   .IndexType = MemOffsetType::SXTX,
-                   .IndexScale = OffsetScale,
-                   .AddrSize = OpSize::i64Bit};
-    A = SelectAddressMode(IREmit, A, GPROpSize, Features.SupportsTSOImm9, false, false, OpSize::i16Bit);
-    IREmit->_StoreMemGPR(OpSize::i16Bit, Upper, A.Base, A.Index, OpSize::i64Bit, MemOffsetType::SXTX, A.IndexScale);
+    IREmit->_StoreMemGPR(OpSize::i16Bit, Upper, AddrNode, IREmit->Constant(8), OpSize::i64Bit, MemOffsetType::SXTX, 1);
   }
 
-  void Store80BitToMem(const IROp_StoreStackMem* Op, Ref StackNode, Ref AddrNode, Ref Offset, OpSize Align, MemOffsetType OffsetType,
-                       uint8_t OffsetScale) {
+  void Store80BitToMem(Ref StackNode, Ref AddrNode, OpSize Align) {
+    // StoreStackMem carries the complete architectural operand base.
     if (Features.SupportsSVE()) {
-      AddressMode A {.Base = AddrNode,
-                     .Index = Op->Offset.IsInvalid() ? nullptr : Offset,
-                     .IndexType = MemOffsetType::SXTX,
-                     .IndexScale = OffsetScale,
-                     .AddrSize = OpSize::i64Bit};
-      AddrNode = LoadEffectiveAddress(IREmit, A, GPROpSize, false);
       IREmit->_StoreMemX87SVEOptPredicate(OpSize::i128Bit, OpSize::i16Bit, StackNode, AddrNode);
     } else {
-      F80SplitStore_Helper(Op, StackNode, AddrNode, Offset, Align, OffsetType, OffsetScale);
+      F80SplitStore_Helper(StackNode, AddrNode, Align);
     }
   }
 
@@ -218,7 +204,7 @@ private:
     }
 
     case OpSize::f80Bit: {
-      Store80BitToMem(Op, StackNode, AddrNode, Offset, Align, OffsetType, OffsetScale);
+      Store80BitToMem(StackNode, AddrNode, Align);
       break;
     }
     default: ERROR_AND_DIE_FMT("Unsupported x87 size");
@@ -248,7 +234,7 @@ private:
 
     case OpSize::f80Bit: {
       StackNode = IREmit->_F80CVTTo(StackNode, OpSize::i64Bit);
-      Store80BitToMem(Op, StackNode, AddrNode, Offset, Align, OffsetType, OffsetScale);
+      Store80BitToMem(StackNode, AddrNode, Align);
       break;
     }
     default: ERROR_AND_DIE_FMT("Unsupported x87 size");
@@ -1026,7 +1012,7 @@ void X87StackOptimization::Run(IREmitter* Emit) {
         if (!SlowPath && Value->Source && Value->Source->Size == StoreSize) {
           Ref SourceValue = Value->Source->Node;
           if (Op->StoreSize == OpSize::f80Bit) {
-            Store80BitToMem(Op, SourceValue, AddrNode, Offset, Align, OffsetType, OffsetScale);
+            Store80BitToMem(SourceValue, AddrNode, Align);
           } else {
             IREmit->_StoreMemFPR(StoreSize, SourceValue, AddrNode, Offset, Align, OffsetType, OffsetScale);
           }

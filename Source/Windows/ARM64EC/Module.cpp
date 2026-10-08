@@ -361,6 +361,22 @@ void HandleImageUnmap(uint64_t Address, uint64_t Size) {
 }
 } // namespace
 
+class ScopedCallbackDisable {
+private:
+  bool Prev;
+
+public:
+  ScopedCallbackDisable() {
+    const auto CPUArea = GetCPUArea();
+    Prev = CPUArea.Area->InSyscallCallback;
+    CPUArea.Area->InSyscallCallback = true;
+  }
+
+  ~ScopedCallbackDisable() {
+    GetCPUArea().Area->InSyscallCallback = Prev;
+  }
+};
+
 namespace Exception {
 static std::optional<FEX::Windows::TSOHandlerConfig> HandlerConfig;
 static uintptr_t KiUserExceptionDispatcher;
@@ -599,10 +615,12 @@ static ARM64_NT_CONTEXT StoreStateToPackedECContext(FEXCore::Core::InternalThrea
   ECContext.X24 = 0;
   ECContext.X28 = 0;
 
-  // NZCV+SS will be converted into EFlags by ntdll, the rest are lost during exception handling.
-  // See HandleGuestException
+  // Wine carries PF/AF/DF in A64 RES0 bits 26/27/19; these packet bits must not reach native PSTATE.
   uint32_t EFlags = CTX->ReconstructCompactedEFLAGS(Thread, false, nullptr, 0);
   ECContext.Cpsr = 0;
+  ECContext.Cpsr |= (EFlags & (1U << FEXCore::X86State::RFLAG_PF_RAW_LOC)) ? (1U << 26) : 0;
+  ECContext.Cpsr |= (EFlags & (1U << FEXCore::X86State::RFLAG_AF_RAW_LOC)) ? (1U << 27) : 0;
+  ECContext.Cpsr |= (EFlags & (1U << FEXCore::X86State::RFLAG_DF_RAW_LOC)) ? (1U << 19) : 0;
   ECContext.Cpsr |= (EFlags & (1U << FEXCore::X86State::RFLAG_TF_RAW_LOC)) ? (1U << 21) : 0;
   ECContext.Cpsr |= (EFlags & (1U << FEXCore::X86State::RFLAG_OF_RAW_LOC)) ? (1U << 28) : 0;
   ECContext.Cpsr |= (EFlags & (1U << FEXCore::X86State::RFLAG_CF_RAW_LOC)) ? (1U << 29) : 0;
@@ -629,9 +647,7 @@ static ARM64_NT_CONTEXT StoreStateToPackedECContext(FEXCore::Core::InternalThrea
 static void RaiseException(FEXCore::Core::InternalThreadState* Thread, const EXCEPTION_RECORD& Rec, ARM64_NT_CONTEXT& GuestContext) {
   auto& Fault = Thread->CurrentFrame->SynchronousFaultData;
 
-  // X64 Windows always clears TF, DF and AF when handling an exception, restoring after.
-  // Current ARM64EC windows can only restore NZCV+SS when returning from an exception and other flags are left untouched from the handler context.
-  // TODO: Can extend wine to support this by mapping the remaining EFlags into reserved cpsr members.
+  // The saved context retains the original flags; clear TF for exception dispatch itself.
   uint32_t EFlags = CTX->ReconstructCompactedEFLAGS(Thread, false, nullptr, 0);
   EFlags &= ~(1 << FEXCore::X86State::RFLAG_TF_RAW_LOC);
   CTX->SetFlagsFromCompactedEFLAGS(Thread, EFlags);
@@ -720,6 +736,9 @@ public:
   }
 
   void InvalidateGuestCodeRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) override {
+    // Invalidating the call/return cache decommits memory. Do not reenter the
+    // memory notification callbacks while the code invalidation mutex is held.
+    ScopedCallbackDisable guard;
     InvalidationTracker->InvalidateAlignedInterval(Start, Length, false);
   }
 
@@ -744,11 +763,11 @@ public:
 extern "C" void SyncThreadContext(CONTEXT* Context) {
   ProcessPendingCrossProcessEmulatorWork();
   auto* Thread = GetCPUArea().ThreadState();
-  // All other EFlags bits are lost when converting to/from an ARM64EC context, so merge them in from the current JIT state.
-  // This is advisable over dropping their values as thread suspend/resume uses this function, and that can happen at any point in guest code.
+  // Wine transports arithmetic flags, DF and TF. Preserve only the system flags absent from that packet.
   static constexpr uint32_t ECValidEFlagsMask {(1U << FEXCore::X86State::RFLAG_OF_RAW_LOC) | (1U << FEXCore::X86State::RFLAG_CF_RAW_LOC) |
                                                (1U << FEXCore::X86State::RFLAG_ZF_RAW_LOC) | (1U << FEXCore::X86State::RFLAG_SF_RAW_LOC) |
-                                               (1U << FEXCore::X86State::RFLAG_TF_RAW_LOC)};
+                                               (1U << FEXCore::X86State::RFLAG_TF_RAW_LOC) | (1U << FEXCore::X86State::RFLAG_PF_RAW_LOC) |
+                                               (1U << FEXCore::X86State::RFLAG_AF_RAW_LOC) | (1U << FEXCore::X86State::RFLAG_DF_RAW_LOC)};
 
   uint32_t StateEFlags = CTX->ReconstructCompactedEFLAGS(Thread, false, nullptr, 0);
   Context->EFlags = (Context->EFlags & ECValidEFlagsMask) | (StateEFlags & ~ECValidEFlagsMask);
@@ -841,22 +860,6 @@ NTSTATUS ProcessInit() {
 }
 
 void ProcessTerm(HANDLE Handle, BOOL After, NTSTATUS Status) {}
-
-class ScopedCallbackDisable {
-private:
-  bool Prev;
-
-public:
-  ScopedCallbackDisable() {
-    const auto CPUArea = GetCPUArea();
-    Prev = CPUArea.Area->InSyscallCallback;
-    CPUArea.Area->InSyscallCallback = true;
-  }
-
-  ~ScopedCallbackDisable() {
-    GetCPUArea().Area->InSyscallCallback = Prev;
-  }
-};
 
 // Returns true if exception dispatch should be halted and the execution context restored to NativeContext
 bool ResetToConsistentStateImpl(const ThreadCPUArea CPUArea, EXCEPTION_RECORD* Exception, CONTEXT* GuestContext, ARM64_NT_CONTEXT* NativeContext) {

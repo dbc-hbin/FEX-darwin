@@ -135,8 +135,9 @@ void OpDispatchBuilder::FST(OpcodeArgs, IR::OpSize Width) {
   const auto SourceSize = ReducedPrecisionMode ? OpSize::i64Bit : OpSize::f80Bit;
   AddressMode A = DecodeAddress(Op, Op->Dest, MemoryAccessType::DEFAULT, false);
 
-  A = SelectAddressMode(this, A, GetGPROpSize(), CTX->HostFeatures.SupportsTSOImm9, false, false, Width);
-  _StoreStackMem(SourceSize, Width, A.Base, A.Index, OpSize::iInvalid, A.IndexType, A.IndexScale);
+  Ref Mem = LoadEffectiveAddress(this, A, GetGPROpSize(), true);
+  CheckGuestMemSpan(Op, Mem, Constant(IR::OpSizeToSize(Width)));
+  _StoreStackMem(SourceSize, Width, Mem, Invalid(), OpSize::iInvalid, MemOffsetType::SXTX, 1);
 
   if (Op->TableInfo->Flags & X86Tables::InstFlags::FLAGS_POP) {
     _PopStackDestroy();
@@ -392,12 +393,13 @@ void OpDispatchBuilder::X87FNSTENV(OpcodeArgs) {
   // 4 bytes : data pointer offset
   // 4 bytes : data pointer selector
 
-  // Before we store anything we need to sync our stack to the registers.
-  _SyncStackToSlow();
-
   const auto Size = OpSizeFromSrc(Op);
   Ref Mem = LoadSourceGPR(Op, Op->Dest, Op->Flags, {.LoadData = false});
   Mem = AppendSegmentOffset(Mem, Op->Flags);
+  CheckGuestMemSpan(Op, Mem, Constant(IR::OpSizeToSize(Size) * 7));
+
+  // Before we store anything we need to sync our stack to the registers.
+  _SyncStackToSlow();
 
   {
     auto FCW = _LoadContextGPR(OpSize::i16Bit, offsetof(FEXCore::Core::CPUState, FCW));
@@ -454,29 +456,25 @@ Ref OpDispatchBuilder::ReconstructX87StateFromFSW_Helper(Ref FSW) {
 }
 
 void OpDispatchBuilder::X87LDENV(OpcodeArgs) {
-  _StackForceSlow();
-
   const auto Size = OpSizeFromSrc(Op);
   Ref Mem = LoadSourceGPR(Op, Op->Src[0], Op->Flags, {.LoadData = false});
   Mem = AppendSegmentOffset(Mem, Op->Flags);
+  CheckGuestMemSpan(Op, Mem, Constant(IR::OpSizeToSize(Size) * 7));
+  _StackForceSlow();
 
   auto NewFCW = _LoadMemGPR(OpSize::i16Bit, Mem, OpSize::i16Bit);
   _StoreContextGPR(OpSize::i16Bit, NewFCW, offsetof(FEXCore::Core::CPUState, FCW));
 
-  Ref MemLocation = Add(OpSize::i64Bit, Mem, IR::OpSizeToSize(Size) * 1);
-  auto NewFSW = _LoadMemGPR(Size, MemLocation, Size);
+  auto NewFSW = _LoadMemGPR(Size, Mem, Constant(IR::OpSizeToSize(Size) * 1), Size, MemOffsetType::SXTX, 1);
   ReconstructX87StateFromFSW_Helper(NewFSW);
 
   {
     // FTW
-    Ref MemLocation = Add(OpSize::i64Bit, Mem, IR::OpSizeToSize(Size) * 2);
-    SetX87FTW(_LoadMemGPR(Size, MemLocation, Size));
+    SetX87FTW(_LoadMemGPR(Size, Mem, Constant(IR::OpSizeToSize(Size) * 2), Size, MemOffsetType::SXTX, 1));
   }
 }
 
 void OpDispatchBuilder::X87FNSAVE(OpcodeArgs) {
-  _SyncStackToSlow();
-
   // 14 bytes for 16bit
   // 2 Bytes : FCW
   // 2 Bytes : FSW
@@ -497,6 +495,8 @@ void OpDispatchBuilder::X87FNSAVE(OpcodeArgs) {
   // 4 bytes : data pointer selector
   const auto Size = OpSizeFromDst(Op);
   Ref Mem = MakeSegmentAddress(Op, Op->Dest);
+  CheckGuestMemSpan(Op, Mem, Constant(IR::OpSizeToSize(Size) * 7 + 80));
+  _SyncStackToSlow();
   Ref Top = GetX87Top();
   {
     auto FCW = _LoadContextGPR(OpSize::i16Bit, offsetof(FEXCore::Core::CPUState, FCW));
@@ -561,9 +561,10 @@ void OpDispatchBuilder::X87FNSAVE(OpcodeArgs) {
 }
 
 void OpDispatchBuilder::X87FRSTOR(OpcodeArgs) {
-  _StackForceSlow();
   const auto Size = OpSizeFromSrc(Op);
   Ref Mem = MakeSegmentAddress(Op, Op->Src[0]);
+  CheckGuestMemSpan(Op, Mem, Constant(IR::OpSizeToSize(Size) * 7 + 80));
+  _StackForceSlow();
 
   auto NewFCW = _LoadMemGPR(OpSize::i16Bit, Mem, OpSize::i16Bit);
   _StoreContextGPR(OpSize::i16Bit, NewFCW, offsetof(FEXCore::Core::CPUState, FCW));
