@@ -251,7 +251,7 @@ namespace DiskCache {
   // TODO: This header is in global installed header path, but uses internal headers.
   // Migrate this once that is fixed.
   // Owned Darwin codegen, including operand spans and restartable string/gather operations.
-  static constexpr uint16_t FormatVersion = 0xA60F;
+  static constexpr uint16_t FormatVersion = 0xA611;
   FEX_DEFAULT_VISIBILITY uint16_t GetFormatVersion();
 
   static constexpr uint32_t LOOKUP_KEY_MAX_BUCKET_DEPTH = 500;

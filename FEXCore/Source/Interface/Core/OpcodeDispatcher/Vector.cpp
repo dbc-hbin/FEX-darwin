@@ -3203,6 +3203,7 @@ void OpDispatchBuilder::XRstorOpImpl(OpcodeArgs) {
     CheckGuestMemSpan(Op, Base, Constant(576));
     if (CTX->HostFeatures.SupportsAVX) {
       Ref Mask = _LoadMemGPR(OpSize::i64Bit, Base, Constant(512), OpSize::i64Bit, MemOffsetType::SXTX, 1);
+      Mask = _And(OpSize, Mask, LoadGPRRegister(X86State::REG_RAX));
       Ref AVXActive = _Bfe(OpSize, 1, 2, Mask);
       Ref Bytes = _Select(OpSize::i64Bit, OpSize, CondClass::NEQ, AVXActive, Constant(0), Constant(704), Constant(576));
       CheckGuestMemSpan(Op, Base, Bytes);
@@ -3210,10 +3211,23 @@ void OpDispatchBuilder::XRstorOpImpl(OpcodeArgs) {
   }
 #endif
 
-  // If a bit in our XSTATE_BV is set, then we restore from that region of the XSAVE area,
-  // otherwise, if not set, then we need to set the relevant data the bit corresponds to
-  // to it's defined initial configuration.
-  const auto RestoreIfFlagSetOrDefault = [this, Op, OpSize](uint32_t BitIndex, auto restore_fn, auto default_fn, uint32_t FieldSize = 1) {
+  // XRSTOR accesses the header even for an empty request. Pair loads retain
+  // their faulting access when both results are unused.
+  LoadMemPair(RegClass::GPR, OpSize::i64Bit, _Add(OpSize, XSaveBase(Op), Constant(512)), 0);
+
+  // Unrequested components are untouched. Requested components either load saved
+  // state or reset to their initial state according to XSTATE_BV. Supported XCR0
+  // bits are all in EAX; EDX cannot request another implemented component.
+  const auto RestoreIfFlagSetOrDefault = [this, Op, OpSize](uint32_t BitIndex, auto restore_fn, auto default_fn) {
+    Ref Requested = _Bfe(OpSize, 1, BitIndex, LoadGPRRegister(X86State::REG_RAX));
+    auto RequestedJump = CondJump(Requested, CondClass::NEQ);
+    auto RequestedBlock = CreateNewCodeBlockAfter(GetCurrentBlock());
+    auto ExitBlock = CreateNewCodeBlockAfter(RequestedBlock);
+    SetTrueJumpTarget(RequestedJump, RequestedBlock);
+    SetFalseJumpTarget(RequestedJump, ExitBlock);
+    SetCurrentCodeBlock(RequestedBlock);
+    StartNewBlock();
+
     // Set up base address for the XSAVE region to restore from, and also read
     // the XSTATE_BV bit flags out of the XSTATE header.
     //
@@ -3222,7 +3236,7 @@ void OpDispatchBuilder::XRstorOpImpl(OpcodeArgs) {
     Ref Base = XSaveBase(Op);
     Ref Mask = _LoadMemGPR(OpSize::i64Bit, Base, Constant(512), OpSize::i64Bit, MemOffsetType::SXTX, 1);
 
-    Ref BitFlag = _Bfe(OpSize, FieldSize, BitIndex, Mask);
+    Ref BitFlag = _Bfe(OpSize, 1, BitIndex, Mask);
     auto CondJump_ = CondJump(BitFlag, CondClass::NEQ);
 
     auto RestoreBlock = CreateNewCodeBlockAfter(GetCurrentBlock());
@@ -3232,7 +3246,6 @@ void OpDispatchBuilder::XRstorOpImpl(OpcodeArgs) {
     { restore_fn(); }
     auto RestoreExitJump = Jump();
     auto DefaultBlock = CreateNewCodeBlockAfter(RestoreBlock);
-    auto ExitBlock = CreateNewCodeBlockAfter(DefaultBlock);
     SetJumpTarget(RestoreExitJump, ExitBlock);
     SetFalseJumpTarget(CondJump_, DefaultBlock);
     SetCurrentCodeBlock(DefaultBlock);
@@ -3259,15 +3272,22 @@ void OpDispatchBuilder::XRstorOpImpl(OpcodeArgs) {
   }
 
   {
-    // We need to restore the MXCSR if either SSE or AVX are requested to be saved
-    RestoreIfFlagSetOrDefault(
-      1,
-      [this, Op] {
-        Ref Base = XSaveBase(Op);
-        Ref MXCSR = _LoadMemGPR(OpSize::i32Bit, Base, Constant(24), OpSize::i32Bit, MemOffsetType::SXTX, 1);
-        RestoreMXCSRState(MXCSR);
-      },
-      [] { /* Intentionally do nothing*/ }, 2);
+    // MXCSR is restored for a requested SSE/AVX component even when its
+    // XSTATE_BV bit is clear. Unsupported AVX requests do not select MXCSR.
+    Ref Requested = _And(OpSize, LoadGPRRegister(X86State::REG_RAX), Constant(CTX->HostFeatures.SupportsAVX ? 6 : 2));
+    auto RequestedJump = CondJump(Requested, CondClass::NEQ);
+    auto RestoreBlock = CreateNewCodeBlockAfter(GetCurrentBlock());
+    auto ExitBlock = CreateNewCodeBlockAfter(RestoreBlock);
+    SetTrueJumpTarget(RequestedJump, RestoreBlock);
+    SetFalseJumpTarget(RequestedJump, ExitBlock);
+    SetCurrentCodeBlock(RestoreBlock);
+    StartNewBlock();
+    Ref Base = XSaveBase(Op);
+    Ref MXCSR = _LoadMemGPR(OpSize::i32Bit, Base, Constant(24), OpSize::i32Bit, MemOffsetType::SXTX, 1);
+    RestoreMXCSRState(MXCSR);
+    Jump(ExitBlock);
+    SetCurrentCodeBlock(ExitBlock);
+    StartNewBlock();
   }
 }
 

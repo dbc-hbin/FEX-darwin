@@ -16,7 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 PROBES = {"smc_probe": "smc_checks", "thread_termination": "thread_termination", "pcmp_probe": "pcmp_checks",
           "disk_cache_lookup": "cache_checks", "x87_probe": "x87_checks", "wine_unix_probe": "wine_unix_checks",
           "wine_user_probe": "wine_user_checks", "boundary_probe": "boundary_checks", "pair_probe": "pair_checks",
-          "rep_probe": "rep_checks", "gather_probe": "gather_checks"}
+          "rep_probe": "rep_checks", "gather_probe": "gather_checks", "xstate_probe": "xstate_checks"}
 
 
 def probe_result(text: str, key: str, bits: int) -> dict:
@@ -84,7 +84,7 @@ def main() -> int:
             for probe in args.probe or (*PROBES, "shared_data_probe", "callret_guard"):
                 if bits == 64 and probe == "boundary_probe":
                     continue
-                if bits == 32 and probe in ("shared_data_probe", "callret_guard", "pair_probe", "gather_probe"):
+                if bits == 32 and probe in ("shared_data_probe", "callret_guard", "pair_probe", "gather_probe", "xstate_probe"):
                     continue
                 executable = output / f"{arch}-{probe}.exe"
                 command = [str(args.llvm_mingw / "bin" / (arch + "-w64-mingw32-clang++")),
@@ -109,7 +109,7 @@ def main() -> int:
         for executable, bits, probe in fixtures:
             modes = (("default", "full") if probe == "smc_probe" else ("default", "vector_tso") if probe == "pair_probe"
                      else ("default", "memcpy_tso") if probe == "rep_probe"
-                     else ("full", "reduced") if probe in ("x87_probe", "boundary_probe")
+                     else ("full", "reduced") if probe in ("x87_probe", "boundary_probe", "xstate_probe")
                      else ("cold", "warm") if probe == "disk_cache_lookup" else ("default",))
             for mode in modes:
                 label = executable.stem + "-" + mode
