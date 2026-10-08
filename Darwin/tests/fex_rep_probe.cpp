@@ -243,6 +243,61 @@ static void normal_cases(unsigned char* source, unsigned char* dest, unsigned ch
   }
 }
 
+#ifdef _WIN64
+static void byte_chunk_cases(unsigned char* source, unsigned char* dest, unsigned char* expected) {
+  constexpr unsigned count = 23; // Two aligned chunks and a seven-byte scalar tail.
+  for (unsigned alignment = 0; alignment < 4; ++alignment) {
+    for (bool stos : {false, true}) {
+      case_name = stos ? "stosb-chunks-tail-alignment" : "movsb-chunks-tail-alignment";
+      for (size_t i = 0; i < Arena; ++i) source[i] = static_cast<unsigned char>(i * 17 + i / 256 + 3);
+      std::memset(dest, 0xa5, Arena); std::memcpy(expected, dest, Arena);
+      auto* s = source + 256 + (alignment & 1);
+      auto* d = dest + 256 + (alignment >> 1);
+      for (unsigned i = 0; i < count; ++i) expected[d - dest + i] = stos ? static_cast<unsigned char>(Fill) : s[i];
+      const auto si = reinterpret_cast<uintptr_t>(s), di = reinterpret_cast<uintptr_t>(d);
+      execute(stos, 1, false, si, di, count);
+      registers(stos, stos ? si : si + count, di + count, 0);
+      CHECK(!std::memcmp(dest, expected, Arena)); ++completed;
+    }
+  }
+  for (ptrdiff_t distance : {0, 8, -8}) {
+    case_name = "movsb-chunks-overlap";
+    for (size_t i = 0; i < Arena; ++i) dest[i] = static_cast<unsigned char>(i * 29 + 7);
+    std::memcpy(expected, dest, Arena);
+    auto* s = dest + 256;
+    auto* d = s + distance;
+    for (unsigned i = 0; i < count; ++i) expected[d - dest + i] = expected[s - dest + i];
+    const auto si = reinterpret_cast<uintptr_t>(s), di = reinterpret_cast<uintptr_t>(d);
+    execute(false, 1, false, si, di, count);
+    registers(false, si + count, di + count, 0);
+    CHECK(!std::memcmp(dest, expected, Arena)); ++completed;
+  }
+  for (unsigned unaligned : {0U, 1U}) {
+    for (unsigned kind = 0; kind < 3; ++kind) {
+      const bool stos = kind == 2, source_fault = kind == 0;
+      case_name = unaligned ? "byte-rep-unaligned-fault-progress" : "byte-rep-three-chunks-fault-progress";
+      const unsigned done = 24 + unaligned, total = done + 11;
+      for (size_t i = 0; i < Arena; ++i) source[i] = static_cast<unsigned char>(i * 17 + i / 256 + 3);
+      std::memset(dest, 0xa5, Arena); std::memcpy(expected, dest, Arena);
+      auto* s = source + Page - done;
+      auto* d = dest + Page - done;
+      for (unsigned i = 0; i < total; ++i) expected[d - dest + i] = stos ? static_cast<unsigned char>(Fill) : s[i];
+      const auto si = reinterpret_cast<uintptr_t>(s), di = reinterpret_cast<uintptr_t>(d);
+      void* locked = (source_fault ? source : dest) + Page;
+      DWORD old;
+      CHECK(VirtualProtect(locked, Page, PAGE_NOACCESS, &old));
+      fault = {0, stos ? si : si + done, di + done, total - done, ArithmeticFlags,
+               reinterpret_cast<uintptr_t>(locked), source_fault ? 0U : 1U, 0, locked, s, 1, done, false, !stos};
+      execute(stos, 1, false, si, di, total);
+      CHECK(fault.seen == 1);
+      registers(stos, stos ? si : si + total, di + total, 0);
+      CHECK(!std::memcmp(dest, expected, Arena));
+      fault = {}; ++completed;
+    }
+  }
+}
+#endif
+
 #ifndef _WIN64
 using Query64 = LONG (WINAPI*)(HANDLE, ULONG, void*, ULONG, ULONG*);
 using Allocate64 = LONG (WINAPI*)(HANDLE, uint64_t*, uint64_t, uint64_t*, ULONG, ULONG);
@@ -358,6 +413,9 @@ int main() {
   const auto veh = AddVectoredExceptionHandler(1, handler);
   CHECK(veh);
   normal_cases(source, dest, expected);
+#ifdef _WIN64
+  byte_chunk_cases(source, dest, expected);
+#endif
 #ifndef _WIN64
   boundary_cases();
 #endif

@@ -314,7 +314,7 @@
     }
   ],
   "cache": {
-    "format_version": "0xA611",
+    "format_version": "0xA612",
     "enabled_by_default": false,
     "memory_budget_default": 0,
     "main_file_cap_default": 1073741824,
