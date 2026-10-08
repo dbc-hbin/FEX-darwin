@@ -69,6 +69,7 @@ class ECSyscallHandler;
 }
 
 extern "C" {
+NTSYSAPI DECLSPEC_NORETURN void NTAPI RtlRaiseStatus(NTSTATUS Status);
 extern IMAGE_DOS_HEADER __ImageBase; // Provided by the linker
 
 extern void* ExitFunctionEC;
@@ -389,15 +390,31 @@ static void LoadStateFromECContext(FEXCore::Core::InternalThreadState* Thread, C
     State.ds_cached = 0;
   }
 
-  if ((Context.ContextFlags & CONTEXT_FLOATING_POINT) == CONTEXT_FLOATING_POINT) {
-    // Floating-point register state
-    if ((Context.ContextFlags & CONTEXT_XSTATE) == CONTEXT_XSTATE) {
-      const auto* Ymm = RtlLocateExtendedFeature(reinterpret_cast<CONTEXT_EX*>(&Context + 1), XSTATE_AVX, nullptr);
-      CTX->SetXMMRegistersFromState(Thread, reinterpret_cast<const __uint128_t*>(Context.FltSave.XmmRegisters),
-                                    reinterpret_cast<const __uint128_t*>(Ymm));
-    } else {
-      CTX->SetXMMRegistersFromState(Thread, reinterpret_cast<const __uint128_t*>(Context.FltSave.XmmRegisters), nullptr);
+  const bool FloatingPoint = (Context.ContextFlags & CONTEXT_FLOATING_POINT) == CONTEXT_FLOATING_POINT;
+  const bool XState = (Context.ContextFlags & CONTEXT_XSTATE) == CONTEXT_XSTATE;
+  if (FloatingPoint || XState) {
+    alignas(16) __uint128_t Low[16], High[16] {};
+    CTX->ReconstructXMMRegisters(Thread, Low, High);
+    if (FloatingPoint) memcpy(Low, Context.FltSave.XmmRegisters, sizeof(Low));
+    if (XState) {
+      auto* Extended = reinterpret_cast<CONTEXT_EX*>(&Context + 1);
+      if (Extended->XState.Length < sizeof(XSAVE_AREA_HEADER)) RtlRaiseStatus(STATUS_INVALID_PARAMETER);
+      auto* Header = reinterpret_cast<XSAVE_AREA_HEADER*>(reinterpret_cast<uint8_t*>(Extended) + Extended->XState.Offset);
+      if (Header->Mask & XSTATE_MASK_AVX) {
+        ULONG Length;
+        const auto* Ymm = RtlLocateExtendedFeature(Extended, XSTATE_AVX, &Length);
+        if (!Ymm || Length != sizeof(High)) RtlRaiseStatus(STATUS_INVALID_PARAMETER);
+        memcpy(High, Ymm, sizeof(High));
+      } else {
+        memset(High, 0, sizeof(High));
+      }
     }
+    // Legacy FP updates preserve high; XSTATE-only updates preserve low and x87.
+    CTX->SetXMMRegistersFromState(Thread, Low, High);
+  }
+
+  if (FloatingPoint) {
+    // Floating-point register state
     memcpy(State.mm, Context.FltSave.FloatRegisters, sizeof(State.mm));
 
     State.FCW = Context.FltSave.ControlWord;
@@ -773,6 +790,65 @@ bool ResetToConsistentStateImpl(const ThreadCPUArea CPUArea, EXCEPTION_RECORD* E
 }
 
 NTSTATUS ResetToConsistentState(EXCEPTION_RECORD* Exception, CONTEXT* GuestContext, ARM64_NT_CONTEXT* NativeContext) {
+  if (!NativeContext && Exception->ExceptionCode == FEX::Windows::STATUS_FEX_XSTATE_CONTEXT) {
+    // Wine uses this private request only with a bounded initialized XSTATE tail.
+    auto& Status = Exception->ExceptionInformation[2];
+    Status = STATUS_NOT_SUPPORTED;
+    if (Exception->NumberParameters != 3 || Exception->ExceptionInformation[1] > 1 || !GuestContext ||
+        (GuestContext->ContextFlags & CONTEXT_XSTATE) != CONTEXT_XSTATE) {
+      Status = STATUS_INVALID_PARAMETER;
+      return STATUS_SUCCESS;
+    }
+    if (!CPUFeatures->IsFeaturePresent(PF_AVX2_INSTRUCTIONS_AVAILABLE)) return STATUS_SUCCESS;
+    THREAD_BASIC_INFORMATION Info {};
+    const auto Handle = reinterpret_cast<HANDLE>(Exception->ExceptionInformation[0]);
+    Status = NtQueryInformationThread(Handle, ThreadBasicInformation, &Info, sizeof(Info), nullptr);
+    if (Status == STATUS_ACCESS_DENIED) {
+      // Wine has already checked GET/SET_CONTEXT. Like ThreadTerm, acquire our
+      // own query handle rather than requiring callers to request query rights.
+      auto QueryHandle = FEX::Windows::DupHandle(Handle, THREAD_QUERY_LIMITED_INFORMATION);
+      if (QueryHandle) Status = NtQueryInformationThread(*QueryHandle, ThreadBasicInformation, &Info, sizeof(Info), nullptr);
+    }
+    if (Status != STATUS_SUCCESS) return STATUS_SUCCESS;
+    // A remote process's FEX state is never directly addressable here; its JIT packet uses the server.
+    if (HandleToULong(Info.ClientId.UniqueProcess) != GetCurrentProcessId()) {
+      Status = STATUS_NOT_SUPPORTED;
+      return STATUS_SUCCESS;
+    }
+    std::scoped_lock Lock(ThreadCreationMutex);
+    const auto Entry = Threads.find(HandleToULong(Info.ClientId.UniqueThread));
+    if (Entry == Threads.end()) {
+      Status = STATUS_NOT_SUPPORTED;
+      return STATUS_SUCCESS;
+    }
+    auto* Extended = reinterpret_cast<CONTEXT_EX*>(GuestContext + 1);
+    ULONG Length;
+    if (Extended->XState.Length < sizeof(XSAVE_AREA_HEADER)) {
+      Status = STATUS_INVALID_PARAMETER;
+      return STATUS_SUCCESS;
+    }
+    auto* Header = reinterpret_cast<XSAVE_AREA_HEADER*>(reinterpret_cast<uint8_t*>(Extended) + Extended->XState.Offset);
+    void* Ymm = nullptr;
+    if (!Exception->ExceptionInformation[1] || (Header->Mask & XSTATE_MASK_AVX)) {
+      Ymm = RtlLocateExtendedFeature(Extended, XSTATE_AVX, &Length);
+      if (!Ymm || Length != 16 * sizeof(__uint128_t)) {
+        Status = STATUS_INVALID_PARAMETER;
+        return STATUS_SUCCESS;
+      }
+    }
+    alignas(16) __uint128_t Low[16], High[16] {};
+    CTX->ReconstructXMMRegisters(Entry->second, Low, High);
+    if (Exception->ExceptionInformation[1]) {
+      if (Header->Mask & XSTATE_MASK_AVX) memcpy(High, Ymm, sizeof(High));
+      else memset(High, 0, sizeof(High));
+      CTX->SetXMMRegistersFromState(Entry->second, Low, High);
+    } else {
+      memcpy(Ymm, High, sizeof(High));
+      Header->Mask |= XSTATE_MASK_AVX;
+    }
+    Status = STATUS_SUCCESS;
+    return STATUS_SUCCESS;
+  }
   bool Cont {};
   if (Exception->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
     const auto FaultAddress = static_cast<uint64_t>(Exception->ExceptionInformation[1]);

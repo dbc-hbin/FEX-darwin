@@ -16,7 +16,8 @@ ROOT = Path(__file__).resolve().parents[1]
 PROBES = {"smc_probe": "smc_checks", "thread_termination": "thread_termination", "pcmp_probe": "pcmp_checks",
           "disk_cache_lookup": "cache_checks", "x87_probe": "x87_checks", "wine_unix_probe": "wine_unix_checks",
           "wine_user_probe": "wine_user_checks", "boundary_probe": "boundary_checks", "pair_probe": "pair_checks",
-          "rep_probe": "rep_checks", "gather_probe": "gather_checks", "xstate_probe": "xstate_checks"}
+          "rep_probe": "rep_checks", "gather_probe": "gather_checks", "xstate_probe": "xstate_checks",
+          "context_probe": "context_checks"}
 
 
 def probe_result(text: str, key: str, bits: int) -> dict:
@@ -84,7 +85,7 @@ def main() -> int:
             for probe in args.probe or (*PROBES, "shared_data_probe", "callret_guard"):
                 if bits == 64 and probe == "boundary_probe":
                     continue
-                if bits == 32 and probe in ("shared_data_probe", "callret_guard", "pair_probe", "gather_probe", "xstate_probe"):
+                if bits == 32 and probe in ("shared_data_probe", "callret_guard", "pair_probe", "gather_probe", "xstate_probe", "context_probe"):
                     continue
                 executable = output / f"{arch}-{probe}.exe"
                 command = [str(args.llvm_mingw / "bin" / (arch + "-w64-mingw32-clang++")),
