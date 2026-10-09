@@ -439,6 +439,7 @@ public:
     LOGMAN_THROW_A_FMT(rhs.DualListData.ListBackingSize() <= DualListData.ListBackingSize(), "Trying to take ownership of data that is too "
                                                                                              "large");
     DualListData.CopyData(rhs.DualListData);
+    CachedCodeBlockTail = nullptr;
     InvalidNode = rhs.InvalidNode->Wrapped(rhs.DualListData.ListBegin()).GetNode(DualListData.ListBegin());
     CurrentWriteCursor = rhs.CurrentWriteCursor;
     CodeBlocks = rhs.CodeBlocks;
@@ -568,6 +569,8 @@ protected:
 
   Ref InvalidNode {};
   Ref CurrentCodeBlock {};
+  // Reachable anchor; explicit insertions may extend the chain after it.
+  Ref CachedCodeBlockTail {};
   fextl::vector<Ref> CodeBlocks;
   uint64_t Entry {};
   bool SupportsTSOImm9 {};
