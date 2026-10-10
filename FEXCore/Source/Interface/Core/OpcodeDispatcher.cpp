@@ -2987,7 +2987,7 @@ void OpDispatchBuilder::AAMOp(OpcodeArgs) {
   auto Imm8 = Constant(Op->Src[0].Literal() & 0xFF);
   Ref Quotient = _AllocateGPR(true);
   Ref Remainder = _AllocateGPR(true);
-  _UDiv(OpSize::i64Bit, AL, Invalid(), Imm8, Quotient, Remainder);
+  _UDiv(OpSize::i64Bit, AL, Invalid(), Imm8, true, Quotient, Remainder);
   auto Res = _AddShift(OpSize::i64Bit, Remainder, Quotient, ShiftType::LSL, 8);
   StoreGPRRegister(X86State::REG_RAX, Res, OpSize::i16Bit);
 
@@ -3809,13 +3809,13 @@ void OpDispatchBuilder::DIVOp(OpcodeArgs) {
     return;
   }
 
-  Ref Quotient = _AllocateGPR(true);
-  Ref Remainder = _AllocateGPR(true);
+  Ref Quotient = _AllocateGPR(!DivRemainderDead);
+  Ref Remainder = DivRemainderDead && Size != OpSize::i64Bit ? Invalid() : _AllocateGPR(!DivRemainderDead);
 
   if (Size == OpSize::i8Bit) {
     Ref Src1 = LoadGPRRegister(X86State::REG_RAX, OpSize::i16Bit);
 
-    _UDiv(OpSize::i16Bit, Src1, Invalid(), Divisor, Quotient, Remainder);
+    _UDiv(OpSize::i16Bit, Src1, Invalid(), Divisor, true, Quotient, Remainder);
 
     // AX[15:0] = concat<URem[7:0]:UDiv[7:0]>
     auto ResultAX = _Bfi(GPRSize, 8, 8, Quotient, Remainder);
@@ -3824,16 +3824,20 @@ void OpDispatchBuilder::DIVOp(OpcodeArgs) {
     Ref Src1 = LoadGPRRegister(X86State::REG_RAX);
     Ref Src2 = LoadGPRRegister(X86State::REG_RDX);
 
-    _UDiv(Size, Src1, Src2, Divisor, Quotient, Remainder);
+    _UDiv(Size, Src1, Src2, Divisor, !DivRemainderDead, Quotient, Remainder);
 
     if (Size == OpSize::i32Bit) {
       Quotient = _Bfe(OpSize::i32Bit, IR::OpSizeAsBits(Size), 0, Quotient);
-      Remainder = _Bfe(OpSize::i32Bit, IR::OpSizeAsBits(Size), 0, Remainder);
+      if (!DivRemainderDead) {
+        Remainder = _Bfe(OpSize::i32Bit, IR::OpSizeAsBits(Size), 0, Remainder);
+      }
       Size = OpSize::iInvalid;
     }
 
     StoreGPRRegister(X86State::REG_RAX, Quotient, Size);
-    StoreGPRRegister(X86State::REG_RDX, Remainder, Size);
+    if (!DivRemainderDead) {
+      StoreGPRRegister(X86State::REG_RDX, Remainder, Size);
+    }
   }
 
   // All flags are undefined.
@@ -3854,15 +3858,15 @@ void OpDispatchBuilder::IDIVOp(OpcodeArgs) {
     return;
   }
 
-  Ref Quotient = _AllocateGPR(true);
-  Ref Remainder = _AllocateGPR(true);
+  Ref Quotient = _AllocateGPR(!DivRemainderDead);
+  Ref Remainder = DivRemainderDead && Size != OpSize::i64Bit ? Invalid() : _AllocateGPR(!DivRemainderDead);
 
   if (Size == OpSize::i8Bit) {
     Ref Src1 = LoadGPRRegister(X86State::REG_RAX);
     Src1 = _Sbfe(OpSize::i64Bit, 16, 0, Src1);
     Divisor = _Sbfe(OpSize::i64Bit, 8, 0, Divisor);
 
-    _Div(OpSize::i64Bit, Src1, Invalid(), Divisor, Quotient, Remainder);
+    _Div(OpSize::i64Bit, Src1, Invalid(), Divisor, true, Quotient, Remainder);
 
     // AX[15:0] = concat<URem[7:0]:UDiv[7:0]>
     auto ResultAX = _Bfi(GPRSize, 8, 8, Quotient, Remainder);
@@ -3871,16 +3875,20 @@ void OpDispatchBuilder::IDIVOp(OpcodeArgs) {
     Ref Src1 = LoadGPRRegister(X86State::REG_RAX);
     Ref Src2 = LoadGPRRegister(X86State::REG_RDX);
 
-    _Div(Size, Src1, Src2, Divisor, Quotient, Remainder);
+    _Div(Size, Src1, Src2, Divisor, !DivRemainderDead, Quotient, Remainder);
 
     if (Size == OpSize::i32Bit) {
       Quotient = _Bfe(OpSize::i32Bit, IR::OpSizeAsBits(Size), 0, Quotient);
-      Remainder = _Bfe(OpSize::i32Bit, IR::OpSizeAsBits(Size), 0, Remainder);
+      if (!DivRemainderDead) {
+        Remainder = _Bfe(OpSize::i32Bit, IR::OpSizeAsBits(Size), 0, Remainder);
+      }
       Size = OpSize::iInvalid;
     }
 
     StoreGPRRegister(X86State::REG_RAX, Quotient, Size);
-    StoreGPRRegister(X86State::REG_RDX, Remainder, Size);
+    if (!DivRemainderDead) {
+      StoreGPRRegister(X86State::REG_RDX, Remainder, Size);
+    }
   }
 
   // All flags are undefined.
@@ -4784,6 +4792,7 @@ void OpDispatchBuilder::ResetWorkingList() {
   JumpTargets.clear();
   BlockSetRIP = false;
   DecodeFailure = false;
+  DivRemainderDead = false;
   ShouldDump = false;
   CurrentCodeBlock = nullptr;
   RegCache.Written = 0;

@@ -164,6 +164,7 @@ namespace DiskCache {
 
   class IndexedDB {
   public:
+    ~IndexedDB();
     bool Open(const fextl::string& CacheDBName, bool ReadOnly);
     void PopulateIndex(Index& CacheIndex, bool& FoundMetadata);
     bool ReadCacheBlob(uint64_t Offset, std::span<uint8_t> OutBlob);
@@ -180,12 +181,15 @@ namespace DiskCache {
 
     FOZFile CacheFOZ;
     uint8_t* CacheFileMapping = nullptr;
-    std::atomic<uint64_t> CacheFileSize;
+    uint64_t CacheFileMappingSize = 0;
+    std::atomic<uint64_t> CacheFileSize {};
+    bool OwnsCacheFileMapping = false;
     FOZFile IndexFOZ;
     bool ReadOnly = false;
     std::atomic<bool> MaxSizeReached {};
 
     FEX_CONFIG_OPT(MaxFileSize, DISKCACHEMAXFILESIZE);
+    FEX_CONFIG_OPT(MapDiskCacheFiles, DISKCACHEFILEMAPPING);
   };
 
   class DiskCache {
@@ -251,7 +255,7 @@ namespace DiskCache {
   // The current version of the diskcache.
   // This must be changed any time codegen changes occur!
   // Be aware of the impact of changing this frequently!
-  static constexpr uint16_t FormatVersion = 0xA612;
+  static constexpr uint16_t FormatVersion = 0xA613;
 
   static constexpr uint32_t LOOKUP_KEY_MAX_BUCKET_DEPTH = 500;
 

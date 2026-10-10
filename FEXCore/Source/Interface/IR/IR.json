@@ -1632,20 +1632,26 @@
         ]
       },
 
-      "GPR:$Quotient, GPR:$Remainder = Div OpSize:#Size, GPR:$Lower, GPR:$Upper, GPR:$Divisor": {
+      "GPR:$Quotient, GPR:$Remainder = Div OpSize:#Size, GPR:$Lower, GPR:$Upper, GPR:$Divisor, i1:$NeedsRemainder": {
         "Desc": ["Integer long signed division returning lower bits",
                  "The Lower and Upper registers will be concated together to generate a dividend twice the size",
                  "Then the divisor divides the temporary dividend and returns the results in the original sized register",
-                 "If Upper is invalid, this is a non-long division."
+                 "If Upper is invalid, this is a non-long division.",
+                 "NeedsRemainder requires a valid Remainder.",
+                 "64-bit long division also requires Remainder as scratch, even when NeedsRemainder is false.",
+                 "Otherwise Remainder may be invalid when NeedsRemainder is false."
                 ],
         "DestSize": "Size",
         "HasSideEffects": true
       },
-      "GPR:$Quotient, GPR:$Remainder = UDiv OpSize:#Size, GPR:$Lower, GPR:$Upper, GPR:$Divisor": {
+      "GPR:$Quotient, GPR:$Remainder = UDiv OpSize:#Size, GPR:$Lower, GPR:$Upper, GPR:$Divisor, i1:$NeedsRemainder": {
         "Desc": ["Integer long unsigned division returning lower bits",
                  "The Lower and Upper registers will be concated together to generate a dividend twice the size",
                  "Then the divisor divides the temporary dividend and returns the results in the original sized register",
-                 "If Upper is invalid, this is a non-long division."
+                 "If Upper is invalid, this is a non-long division.",
+                 "NeedsRemainder requires a valid Remainder.",
+                 "64-bit long division also requires Remainder as scratch, even when NeedsRemainder is false.",
+                 "Otherwise Remainder may be invalid when NeedsRemainder is false."
                 ],
         "DestSize": "Size",
         "HasSideEffects": true

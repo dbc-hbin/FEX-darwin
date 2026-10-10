@@ -1515,9 +1515,8 @@ Ref OpDispatchBuilder::Single128Bit4ByteVectorShuffle(Ref Src, uint8_t Shuffle) 
   }
   case 0b00'00'10'10: {
     // Weird reverse low elements and broadcast to each half of the register
-    Ref Tmp = _VUnZip(OpSize::i128Bit, OpSize::i32Bit, Src, Src);
-    Tmp = _VRev64(OpSize::i128Bit, OpSize::i32Bit, Tmp);
-    return _VZip(OpSize::i128Bit, OpSize::i32Bit, Tmp, Tmp);
+    Ref Tmp = _VExtr(OpSize::i128Bit, OpSize::i8Bit, Src, Src, 4);
+    return _VTrn2(OpSize::i128Bit, OpSize::i32Bit, Tmp, Tmp);
   }
   case 0b00'00'11'10: {
     // First element duplicated and shifted in to the top.
@@ -1546,8 +1545,7 @@ Ref OpDispatchBuilder::Single128Bit4ByteVectorShuffle(Ref Src, uint8_t Shuffle) 
   }
   case 0b00'10'10'00: {
     // Weird reversed low elements in upper half of the register
-    Ref Tmp = _VUnZip(OpSize::i128Bit, OpSize::i32Bit, Src, Src);
-    Tmp = _VZip(OpSize::i128Bit, OpSize::i32Bit, Tmp, Tmp);
+    Ref Tmp = _VTrn(OpSize::i128Bit, OpSize::i32Bit, Src, Src);
     return _VExtr(OpSize::i128Bit, OpSize::i8Bit, Tmp, Tmp, 4);
   }
   case 0b00'11'00'11: {
