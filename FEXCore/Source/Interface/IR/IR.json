@@ -1613,7 +1613,8 @@
         "Desc": ["Integer long signed division returning lower bits",
                  "The Lower and Upper registers will be concated together to generate a dividend twice the size",
                  "Then the divisor divides the temporary dividend and returns the results in the original sized register",
-                 "If Upper is invalid, this is a non-long division."
+                 "If Upper is invalid, this is a non-long division.",
+                 "If Remainder is invalid, only Quotient is produced."
                 ],
         "DestSize": "Size",
         "HasSideEffects": true
@@ -1622,7 +1623,8 @@
         "Desc": ["Integer long unsigned division returning lower bits",
                  "The Lower and Upper registers will be concated together to generate a dividend twice the size",
                  "Then the divisor divides the temporary dividend and returns the results in the original sized register",
-                 "If Upper is invalid, this is a non-long division."
+                 "If Upper is invalid, this is a non-long division.",
+                 "If Remainder is invalid, only Quotient is produced."
                 ],
         "DestSize": "Size",
         "HasSideEffects": true

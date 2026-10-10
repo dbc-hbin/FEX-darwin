@@ -31,6 +31,7 @@ namespace {
     // allocated to R. Else, RegToSSA[R] is UNDEFINED, no need to clear this
     // when freeing registers.
     Ref RegToSSA[32];
+    uint32_t SRAEpoch[32];
   };
 
   IR::RegClass GetRegClassFromNode(const IR::IROp_Header* IROp) {
@@ -512,7 +513,7 @@ bool ConstrainedRAPass::TryPostRAMerge(Ref LastNode, Ref CodeNode, IROp_Header* 
     if (!Op->Upper.IsInvalid() && PhysicalRegister(Op->Upper) == PhysicalRegister(LastNode)) {
       if (IROp->Op == OP_DIV ? IsSignext(LastOp, Op->Lower, IROp->Size) : IsZero(LastOp)) {
         Op->Upper.SetInvalid();
-        return PhysicalRegister(LastNode) == PhysicalRegister(Op->OutRemainder);
+        return !Op->OutRemainder.IsInvalid() && PhysicalRegister(LastNode) == PhysicalRegister(Op->OutRemainder);
       }
     }
   } else if (IROp->Op == OP_XGETBV && PhysicalRegister(IROp->Args[0]) == PhysicalRegister(LastNode) && LastOp->Op == OP_CONSTANT) {
@@ -600,6 +601,7 @@ void ConstrainedRAPass::Run(IREmitter* IREmit_) {
       // We grab these nodes this way so we can iterate easily
       auto CodeBegin = IR->at(BlockIROp->Begin);
       auto CodeLast = IR->at(BlockIROp->Last);
+      uint32_t Epoch = 0;
 
       while (1) {
         auto [CodeNode, IROp] = CodeLast();
@@ -613,6 +615,7 @@ void ConstrainedRAPass::Run(IREmitter* IREmit_) {
 
           PreferredReg[IR->GetID(Node).Value] = Reg;
           GetClass(Reg)->RegToSSA[Reg.Reg] = CodeNode;
+          GetClass(Reg)->SRAEpoch[Reg.Reg] = Epoch;
         }
 
         // Coalescing an SRA store is equivalent to hoisting the store,
@@ -628,9 +631,20 @@ void ConstrainedRAPass::Run(IREmitter* IREmit_) {
           auto Node = GetClass(Reg)->RegToSSA[Reg.Reg];
           IROp_Header* Header = IR->GetOp<IROp_Header>(Node);
 
-          if (CodeNode != DecodeSRANode(Header, Node)) {
+          if (CodeNode != DecodeSRANode(Header, Node) || GetClass(Reg)->SRAEpoch[Reg.Reg] != Epoch) {
             PreferredReg[IR->GetID(CodeNode).Value] = PhysicalRegister::Invalid();
           }
+        }
+
+        // A coalesced store must not become visible before an intervening fault
+        // or guest boundary. Plain loads are not marked HasSideEffects in IR.
+        // Increment after checking this node: a faulting load may still write
+        // its own destination directly, since a failed load does not commit it.
+        if ((IR::HasSideEffects(IROp->Op) && !DecodeSRANode(IROp, CodeNode)) ||
+            IROp->Op == OP_LOADMEM || IROp->Op == OP_LOADMEMTSO || IROp->Op == OP_LOADMEMX87SVEOPTPREDICATE ||
+            IROp->Op == OP_VLOADVECTORMASKED || IROp->Op == OP_VLOADVECTORGATHERMASKED ||
+            IROp->Op == OP_VLOADVECTORGATHERMASKEDQPS || IROp->Op == OP_VLOADVECTORELEMENT || IROp->Op == OP_VBROADCASTFROMMEM) {
+          ++Epoch;
         }
 
         const int NumArgs = IR::GetRAArgs(IROp->Op);

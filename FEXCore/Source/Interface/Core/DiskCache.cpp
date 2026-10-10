@@ -26,6 +26,9 @@
 #include <winternl.h>
 extern "C" NTSTATUS RtlUnicodeToUTF8N(PCHAR, ULONG, PULONG, PCWCH, ULONG);
 extern "C" NTSTATUS WINAPI NtQueryAttributesFile(const OBJECT_ATTRIBUTES*, FILE_BASIC_INFORMATION*);
+extern "C" NTSTATUS WINAPI NtCreateSection(HANDLE*, ACCESS_MASK, const OBJECT_ATTRIBUTES*, const LARGE_INTEGER*, ULONG, ULONG, HANDLE);
+extern "C" NTSTATUS WINAPI NtMapViewOfSection(HANDLE, HANDLE, void**, ULONG_PTR, SIZE_T, const LARGE_INTEGER*, SIZE_T*, ULONG, ULONG, ULONG);
+extern "C" NTSTATUS WINAPI NtUnmapViewOfSection(HANDLE, void*);
 #endif
 
 namespace FEXCore {
@@ -182,13 +185,43 @@ namespace DiskCache {
     }
 
     File::File::FileHandleType CacheFileHandle = CacheFOZ.GetHandle();
-    if (FileMapper && CacheFileHandle != (File::File::FileHandleType)-1) {
-      CacheFileMapping = reinterpret_cast<uint8_t*>(FileMapper(CacheFileHandle, ReadOnly ? CacheFOZ.Size() : BIG_MAPPING_SIZE));
-      CacheFileSize = CacheFOZ.Size();
+    const ssize_t FileSize = CacheFOZ.Size();
+    if (MapDiskCacheFiles && FileSize > 0 && CacheFileHandle != (File::File::FileHandleType)-1) {
+      CacheFileSize = FileSize;
+      if (FileMapper) {
+        CacheFileMappingSize = ReadOnly ? FileSize : BIG_MAPPING_SIZE;
+        CacheFileMapping = reinterpret_cast<uint8_t*>(FileMapper(CacheFileHandle, CacheFileMappingSize));
+      }
+#ifdef _WIN32
+      else {
+        // FOZ is append-only. Keep this read-only snapshot fixed; later appends use positional reads.
+        LARGE_INTEGER MappingSize {.QuadPart = FileSize};
+        HANDLE Mapping;
+        if (NtCreateSection(&Mapping, SECTION_MAP_READ, nullptr, &MappingSize, PAGE_READONLY, SEC_COMMIT, CacheFileHandle) >= 0) {
+          void* View = nullptr;
+          SIZE_T ViewSize = FileSize;
+          const auto Status = NtMapViewOfSection(Mapping, GetCurrentProcess(), &View, 0, 0, nullptr, &ViewSize, /* ViewUnmap */ 2, 0, PAGE_READONLY);
+          NtClose(Mapping);
+          if (Status >= 0) {
+            CacheFileMapping = static_cast<uint8_t*>(View);
+            CacheFileMappingSize = FileSize;
+            OwnsCacheFileMapping = true;
+          }
+        }
+      }
+#endif
     }
 
     this->ReadOnly = ReadOnly;
     return true;
+  }
+
+  IndexedDB::~IndexedDB() {
+#ifdef _WIN32
+    if (OwnsCacheFileMapping) {
+      NtUnmapViewOfSection(GetCurrentProcess(), CacheFileMapping);
+    }
+#endif
   }
 
   void IndexedDB::PopulateIndex(Index& CacheIndex, bool& FoundMetadata) {
@@ -267,8 +300,13 @@ namespace DiskCache {
   }
 
   bool IndexedDB::ReadCacheBlob(uint64_t Offset, std::span<uint8_t> OutBlob) {
-    if (CacheFileMapping && (ReadOnly || Offset + OutBlob.size() <= BIG_MAPPING_SIZE)) {
-      if (Offset + OutBlob.size() > CacheFileSize) {
+    if (OutBlob.size() > UINT64_MAX - Offset) {
+      return false;
+    }
+    if (CacheFileMapping && ((ReadOnly && !OwnsCacheFileMapping) ||
+                             (Offset <= CacheFileMappingSize && OutBlob.size() <= CacheFileMappingSize - Offset))) {
+      const uint64_t FileSize = CacheFileSize;
+      if (Offset > FileSize || OutBlob.size() > FileSize - Offset) {
         return false;
       }
       // todo could reduce copies by having a private mapping for relocs, etc

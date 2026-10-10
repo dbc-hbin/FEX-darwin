@@ -3673,8 +3673,8 @@ void OpDispatchBuilder::DIVOp(OpcodeArgs) {
     return;
   }
 
-  Ref Quotient = _AllocateGPR(true);
-  Ref Remainder = _AllocateGPR(true);
+  Ref Quotient = _AllocateGPR(!DivRemainderDead);
+  Ref Remainder = DivRemainderDead ? Invalid() : _AllocateGPR(true);
 
   if (Size == OpSize::i8Bit) {
     Ref Src1 = LoadGPRRegister(X86State::REG_RAX, OpSize::i16Bit);
@@ -3692,12 +3692,16 @@ void OpDispatchBuilder::DIVOp(OpcodeArgs) {
 
     if (Size == OpSize::i32Bit) {
       Quotient = _Bfe(OpSize::i32Bit, IR::OpSizeAsBits(Size), 0, Quotient);
-      Remainder = _Bfe(OpSize::i32Bit, IR::OpSizeAsBits(Size), 0, Remainder);
+      if (!DivRemainderDead) {
+        Remainder = _Bfe(OpSize::i32Bit, IR::OpSizeAsBits(Size), 0, Remainder);
+      }
       Size = OpSize::iInvalid;
     }
 
     StoreGPRRegister(X86State::REG_RAX, Quotient, Size);
-    StoreGPRRegister(X86State::REG_RDX, Remainder, Size);
+    if (!DivRemainderDead) {
+      StoreGPRRegister(X86State::REG_RDX, Remainder, Size);
+    }
   }
 }
 
@@ -3714,8 +3718,8 @@ void OpDispatchBuilder::IDIVOp(OpcodeArgs) {
     return;
   }
 
-  Ref Quotient = _AllocateGPR(true);
-  Ref Remainder = _AllocateGPR(true);
+  Ref Quotient = _AllocateGPR(!DivRemainderDead);
+  Ref Remainder = DivRemainderDead ? Invalid() : _AllocateGPR(true);
 
   if (Size == OpSize::i8Bit) {
     Ref Src1 = LoadGPRRegister(X86State::REG_RAX);
@@ -3735,12 +3739,16 @@ void OpDispatchBuilder::IDIVOp(OpcodeArgs) {
 
     if (Size == OpSize::i32Bit) {
       Quotient = _Bfe(OpSize::i32Bit, IR::OpSizeAsBits(Size), 0, Quotient);
-      Remainder = _Bfe(OpSize::i32Bit, IR::OpSizeAsBits(Size), 0, Remainder);
+      if (!DivRemainderDead) {
+        Remainder = _Bfe(OpSize::i32Bit, IR::OpSizeAsBits(Size), 0, Remainder);
+      }
       Size = OpSize::iInvalid;
     }
 
     StoreGPRRegister(X86State::REG_RAX, Quotient, Size);
-    StoreGPRRegister(X86State::REG_RDX, Remainder, Size);
+    if (!DivRemainderDead) {
+      StoreGPRRegister(X86State::REG_RDX, Remainder, Size);
+    }
   }
 }
 
@@ -4615,6 +4623,7 @@ void OpDispatchBuilder::ResetWorkingList() {
   JumpTargets.clear();
   BlockSetRIP = false;
   DecodeFailure = false;
+  DivRemainderDead = false;
   ShouldDump = false;
   CurrentCodeBlock = nullptr;
   RegCache.Written = 0;

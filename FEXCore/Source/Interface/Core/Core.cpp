@@ -555,6 +555,10 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
                                         AreMonoHacksActive() && MonoBackpatcherBlock.load(std::memory_order_relaxed) == GuestRIP);
 
     const auto GPRSize = Thread->OpDispatcher->GetGPROpSize();
+#ifdef _WIN32
+    const bool CanElideDivRemainder = !ExtendedDebugInfo && MaxInst != 1 && !FEXCore::Config::Get_O0() &&
+                                    Config.SMCChecks != FEXCore::Config::CONFIG_SMC_FULL;
+#endif
 
 #ifdef ZYDIS_DISASSEMBLER
     const auto ZydisMachineMode = Config.Is64BitMode ? ZYDIS_MACHINE_MODE_LONG_64 : ZYDIS_MACHINE_MODE_LEGACY_32;
@@ -623,6 +627,29 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
 #endif
 
         bool IsLocked = DecodedInfo->Flags & FEXCore::X86Tables::DecodeFlags::FLAG_LOCK;
+        bool DivRemainderDead = false;
+#ifdef _WIN32
+        // Windows suspends at block boundaries. Only a non-faulting adjacent full
+        // overwrite may hide RDX; Linux can expose the intermediate host context.
+        using namespace FEXCore::X86Tables::DecodeFlags;
+        using Builder = FEXCore::IR::OpDispatchBuilder;
+        const auto DivSize = GetSizeSrcFlags(DecodedInfo->Flags);
+        if (CanElideDivRemainder && !Block.ForceFullSMCDetection && !IsLocked && i + 1 < InstsInBlock &&
+            TableInfo && (TableInfo->OpcodeDispatcher.OpDispatch == &Builder::DIVOp ||
+                          TableInfo->OpcodeDispatcher.OpDispatch == &Builder::IDIVOp) &&
+            DecodedInfo->Dest.IsGPR() && (DivSize == SIZE_32BIT || DivSize == SIZE_64BIT)) {
+          const auto& Next = Block.DecodedInstructions[i + 1];
+          const auto NextSize = GetSizeDstFlags(Next.Flags);
+          if (Next.TableInfo && !(Next.Flags & FLAG_LOCK) && Next.Dest.IsGPR() &&
+              Next.Dest.Data.GPR.GPR == FEXCore::X86State::REG_RDX &&
+              (NextSize == SIZE_32BIT || NextSize == SIZE_64BIT)) {
+            const auto NextFn = Next.TableInfo->OpcodeDispatcher.OpDispatch;
+            DivRemainderDead = (NextFn == &Builder::Bind<&Builder::MOVGPROp, 0> && Next.Src[0].IsLiteral()) ||
+                               (NextFn == &Builder::Bind<&Builder::MOVGPROp, 1> && Next.Src[1].IsLiteral());
+          }
+        }
+#endif
+        Thread->OpDispatcher->SetDivRemainderDead(DivRemainderDead);
 
         // Do a partial register cache flush before every instruction. This
         // prevents cross-instruction static register caching, while allowing
@@ -638,7 +665,7 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
         // that more explicitly later.
         Thread->OpDispatcher->FlushRegisterCache(true);
 
-        if (ExtendedDebugInfo || Thread->OpDispatcher->CanHaveSideEffects(TableInfo, DecodedInfo)) {
+        if (ExtendedDebugInfo || DivRemainderDead || Thread->OpDispatcher->CanHaveSideEffects(TableInfo, DecodedInfo)) {
           Thread->OpDispatcher->_GuestOpcode(InstAddress - GuestRIP);
         }
 

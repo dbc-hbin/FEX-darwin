@@ -308,6 +308,9 @@ public:
 
   // Should only be called at the start of IR Emission.
   void ResetWorkingList();
+  void SetDivRemainderDead(bool Dead) {
+    DivRemainderDead = Dead;
+  }
 
   void ResetDecodeFailure() {
     NeedsBlockEnd = DecodeFailure = false;
@@ -1331,6 +1334,7 @@ private:
   fextl::map<uint64_t, JumpTargetInfo> JumpTargets;
   bool HandledLock {false};
   bool DecodeFailure {false};
+  bool DivRemainderDead {false};
   bool NeedsBlockEnd {false};
   ForceTSOMode ForceTSO {ForceTSOMode::NoOverride};
   // Used during new op bringup

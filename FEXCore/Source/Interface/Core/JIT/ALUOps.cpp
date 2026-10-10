@@ -859,7 +859,8 @@ DEF_OP(Div) {
   const auto OpSize = IROp->Size;
 
   const auto Quotient = GetReg(Op->OutQuotient);
-  const auto Remainder = GetReg(Op->OutRemainder);
+  const bool NeedsRemainder = !Op->OutRemainder.IsInvalid();
+  const auto Remainder = NeedsRemainder ? GetReg(Op->OutRemainder) : ARMEmitter::Reg::zr;
   auto Lower = GetReg(Op->Lower);
   auto Divisor = GetReg(Op->Divisor);
 
@@ -881,7 +882,9 @@ DEF_OP(Div) {
     }
 
     sdiv(EmitSize, Quotient, Lower, Divisor);
-    msub(EmitSize, Remainder, Quotient, Divisor, Lower);
+    if (NeedsRemainder) {
+      msub(EmitSize, Remainder, Quotient, Divisor, Lower);
+    }
     return;
   }
 
@@ -896,7 +899,9 @@ DEF_OP(Div) {
     bfi(EmitSize, TMP1, Upper, 16, 16);
     sxth(EmitSize, TMP2, Divisor);
     sdiv(EmitSize, Quotient, TMP1, TMP2);
-    msub(EmitSize, Remainder, Quotient, TMP2, TMP1);
+    if (NeedsRemainder) {
+      msub(EmitSize, Remainder, Quotient, TMP2, TMP1);
+    }
     break;
   }
   case IR::OpSize::i32Bit: {
@@ -905,7 +910,9 @@ DEF_OP(Div) {
     bfi(EmitSize, TMP1, Upper, 32, 32);
     sxtw(TMP2, Divisor.W());
     sdiv(EmitSize, Quotient, TMP1, TMP2);
-    msub(EmitSize, Remainder, Quotient, TMP2, TMP1);
+    if (NeedsRemainder) {
+      msub(EmitSize, Remainder, Quotient, TMP2, TMP1);
+    }
     break;
   }
   case IR::OpSize::i64Bit: {
@@ -934,7 +941,9 @@ DEF_OP(Div) {
 
       // Move results to the destination registers
       mov(EmitSize, Quotient, TMP1);
-      mov(EmitSize, Remainder, TMP2);
+      if (NeedsRemainder) {
+        mov(EmitSize, Remainder, TMP2);
+      }
 
       // Skip 64-bit path
       (void)b(&LongDIVRet);
@@ -944,7 +953,9 @@ DEF_OP(Div) {
     // 64-Bit only
     {
       sdiv(EmitSize, Quotient, Lower, Divisor);
-      msub(EmitSize, Remainder, Quotient, Divisor, Lower);
+      if (NeedsRemainder) {
+        msub(EmitSize, Remainder, Quotient, Divisor, Lower);
+      }
     }
 
     (void)Bind(&LongDIVRet);
@@ -959,7 +970,8 @@ DEF_OP(UDiv) {
   const auto OpSize = IROp->Size;
 
   const auto Quotient = GetReg(Op->OutQuotient);
-  const auto Remainder = GetReg(Op->OutRemainder);
+  const bool NeedsRemainder = !Op->OutRemainder.IsInvalid();
+  const auto Remainder = NeedsRemainder ? GetReg(Op->OutRemainder) : ARMEmitter::Reg::zr;
   const auto Lower = GetReg(Op->Lower);
   const auto Divisor = GetReg(Op->Divisor);
 
@@ -968,7 +980,9 @@ DEF_OP(UDiv) {
   if (Op->Upper.IsInvalid()) {
     const auto EmitSize = ConvertSize(IROp);
     udiv(EmitSize, Quotient, Lower, Divisor);
-    msub(EmitSize, Remainder, Quotient, Divisor, Lower);
+    if (NeedsRemainder) {
+      msub(EmitSize, Remainder, Quotient, Divisor, Lower);
+    }
     return;
   }
 
@@ -980,7 +994,9 @@ DEF_OP(UDiv) {
     uxth(EmitSize, TMP1, Lower);
     bfi(EmitSize, TMP1, Upper, 16, 16);
     udiv(EmitSize, Quotient, TMP1, Divisor);
-    msub(EmitSize, Remainder, Quotient, Divisor, TMP1);
+    if (NeedsRemainder) {
+      msub(EmitSize, Remainder, Quotient, Divisor, TMP1);
+    }
     break;
   }
   case IR::OpSize::i32Bit: {
@@ -992,7 +1008,9 @@ DEF_OP(UDiv) {
     mov(EmitSize, TMP1, Lower);
     bfi(EmitSize, TMP1, Upper, 32, 32);
     udiv(EmitSize, Quotient, TMP1, TMP2);
-    msub(EmitSize, Remainder, Quotient, TMP2, TMP1);
+    if (NeedsRemainder) {
+      msub(EmitSize, Remainder, Quotient, TMP2, TMP1);
+    }
     break;
   }
   case IR::OpSize::i64Bit: {
@@ -1017,7 +1035,9 @@ DEF_OP(UDiv) {
 
       // Move results to the destination registers
       mov(EmitSize, Quotient, TMP1);
-      mov(EmitSize, Remainder, TMP2);
+      if (NeedsRemainder) {
+        mov(EmitSize, Remainder, TMP2);
+      }
 
       // Skip 64-bit path
       (void)b(&LongDIVRet);
@@ -1027,7 +1047,9 @@ DEF_OP(UDiv) {
     // 64-Bit only
     {
       udiv(EmitSize, Quotient, Lower, Divisor);
-      msub(EmitSize, Remainder, Quotient, Divisor, Lower);
+      if (NeedsRemainder) {
+        msub(EmitSize, Remainder, Quotient, Divisor, Lower);
+      }
     }
 
     (void)Bind(&LongDIVRet);
