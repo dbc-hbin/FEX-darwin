@@ -690,11 +690,16 @@ Ref X87StackOptimization::SynchronizeStackValues() {
   // Before leaving we need to write the current values in the stack to
   // context so that the values are correct. Copy SourceDataNode in the
   // stack to the respective mmX register.
+  // On the fast path TopValueCache/TopValidCache are only filled here and flushed right after, and
+  // every direct x87 context writer first leaves the fast path or reinitializes the stack. With TOP
+  // unchanged they therefore describe the context as of the previous synchronization in this block,
+  // so only slots and tags that changed since then are written. A TOP change above went through
+  // SetTopWithCache_Slow, which cleared both caches.
   Ref TopValue = GetTopWithCache_Slow();
   for (size_t i = 0; i < StackData.size; ++i) {
     const auto& [Valid, StackMember] = StackData.top(i);
 
-    if (Valid == StackSlot::VALID) {
+    if (Valid == StackSlot::VALID && TopValueCache[i] != StackMember.StackDataNode) {
       StoreStackValueAtOffset_Slow(StackMember.StackDataNode, i, false);
     }
   }
@@ -702,12 +707,16 @@ Ref X87StackOptimization::SynchronizeStackValues() {
     uint8_t ValidMask = StackData.getValidMask();
     uint8_t InvalidMask = StackData.getInvalidMask();
     for (auto& Elem : TopValidCache) {
-      Elem = (ValidMask & 1) ? StackSlot::VALID : ((InvalidMask & 1) ? StackSlot::INVALID : StackSlot::UNUSED);
+      const auto New = (ValidMask & 1) ? StackSlot::VALID : ((InvalidMask & 1) ? StackSlot::INVALID : StackSlot::UNUSED);
+      // UNUSED leaves the context tag alone, so only a changed known tag needs an FTW update.
+      if (New != StackSlot::UNUSED && New != Elem) {
+        FlushValidPending = true;
+      }
+      Elem = New;
 
       ValidMask >>= 1;
       InvalidMask >>= 1;
     }
-    FlushValidPending = true;
   }
 
   return TopValue;

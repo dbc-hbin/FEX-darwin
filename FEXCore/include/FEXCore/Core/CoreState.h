@@ -385,6 +385,7 @@ struct JITPointers {
   uint64_t SyscallHandlerObj {};
   uint64_t SyscallHandlerFunc {};
   uint64_t ExitFunctionLink {};
+  uint64_t InlineCacheFill {};
   uint64_t MonoBackpatcherWrite {};
   uint64_t RDRANDFallback {};
   uint64_t ThunkCallbackRet {};
@@ -411,6 +412,7 @@ struct JITPointers {
   uint64_t DispatcherLoopTopEnterEC {};
   uint64_t DispatcherLoopTopEnterECFillSRA {};
   uint64_t ExitFunctionLinker {};
+  uint64_t InlineCacheFiller {};
   uint64_t ThreadStopHandlerSpillSRA {};
   uint64_t ThreadPauseHandlerSpillSRA {};
   uint64_t ThreadDispatchSyscallHandler {};

@@ -80,9 +80,19 @@ Ref OpDispatchBuilder::GetPackedRFLAG(uint32_t FlagsMask) {
   static_assert(FEXCore::X86State::RFLAG_CF_RAW_LOC == 0);
   Ref Original = GetRFLAG(FEXCore::X86State::RFLAG_CF_RAW_LOC);
 
+  // RF, VM, AC, VIF, VIP and ID live in consecutive context bytes flags[16..21], each holding 0 or 1.
+  // Gather them with one 64-bit load instead of one byte load per flag.
+  static_assert(FEXCore::X86State::RFLAG_RF_LOC == 16 && FEXCore::X86State::RFLAG_ID_LOC == 21);
+  constexpr uint32_t HighFlagsMask = 0b111111U << FEXCore::X86State::RFLAG_RF_LOC;
+  const bool GatherHighFlags = (FlagsMask & HighFlagsMask) == HighFlagsMask;
+
   for (size_t i = 0; i < FlagOffsets.size(); ++i) {
     const auto FlagOffset = FlagOffsets[i];
     if (!((1U << FlagOffset) & FlagsMask)) {
+      continue;
+    }
+
+    if (GatherHighFlags && ((1U << FlagOffset) & HighFlagsMask)) {
       continue;
     }
 
@@ -102,6 +112,17 @@ Ref OpDispatchBuilder::GetPackedRFLAG(uint32_t FlagsMask) {
     }
 
     Original = _Orlshl(OpSize::i64Bit, Original, Flag, FlagOffset);
+  }
+
+  if (GatherHighFlags) {
+    // Keep bit 0 of each byte, then fold byte k's bit into bit k of byte 0.
+    // Bits 0..5 of the result are flags[16..21]; bits 6..7 hold flags[22..23] and are not inserted.
+    Ref High = _LoadContextGPR(OpSize::i64Bit, ARRAY_OFFSETOF(Core::CPUState, flags, FEXCore::X86State::RFLAG_RF_LOC));
+    High = _And(OpSize::i64Bit, High, _InlineConstant(0x0101'0101'0101'0101ULL));
+    High = _Orlshr(OpSize::i64Bit, High, High, 7);
+    High = _Orlshr(OpSize::i64Bit, High, High, 14);
+    High = _Orlshr(OpSize::i64Bit, High, High, 28);
+    Original = _Bfi(OpSize::i64Bit, 6, FEXCore::X86State::RFLAG_RF_LOC, Original, High);
   }
 
   // Raw PF value needs to have its bottom bit masked out and inverted. The

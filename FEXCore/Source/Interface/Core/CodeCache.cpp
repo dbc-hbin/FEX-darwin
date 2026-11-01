@@ -567,46 +567,83 @@ bool CodeCache::ApplyPackedCodeRelocations(uint64_t GuestEntry, std::span<std::b
                                            std::span<const DiskCache::BlobSmallRelocation> SmallRelocs,
                                            std::span<const DiskCache::BlobThunkRelocation> ThunkRelocs) {
   CPU::Arm64Emitter Emitter(&CTX, Code.data(), Code.size_bytes());
+  // Packed relocations are read from the on-disk cache. Validate every field that drives a write in all build types:
+  // a literal writes 8 bytes and a padded constant move writes four instructions.
+  constexpr size_t LiteralSize = sizeof(uint64_t);
+  constexpr size_t MoveSize = 4 * sizeof(uint32_t);
+  const auto Fits = [&](uint32_t Offset, size_t WriteSize) {
+    return WriteSize <= Code.size_bytes() && Offset <= Code.size_bytes() - WriteSize;
+  };
+  const auto ValidRegister = [](uint8_t RegisterIndex) {
+    return RegisterIndex < 32;
+  };
+  const auto ValidValueSize = [](uint8_t ValueSize) {
+    return ValueSize == 4 || ValueSize == 8;
+  };
   for (auto& Reloc : SmallRelocs) {
-    LOGMAN_THROW_A_FMT(Reloc.Offset < Code.size_bytes(), "Invalid relocation offset");
     Emitter.SetCursorOffset(Reloc.Offset);
     switch ((CPU::RelocationTypes)Reloc.Type) {
     case FEXCore::CPU::RelocationTypes::RELOC_NAMED_SYMBOL_LITERAL: {
+      if (!Fits(Reloc.Offset, LiteralSize)) {
+        return false;
+      }
       ApplySymbolLiteralRelocation(CTX, (CPU::RelocNamedSymbolLiteral::NamedSymbol)Reloc.Named.Symbol, GuestEntry, Emitter, false);
       break;
     }
     case FEXCore::CPU::RelocationTypes::RELOC_GUEST_RIP_LITERAL: {
+      if (!Fits(Reloc.Offset, LiteralSize)) {
+        return false;
+      }
       ApplyRIPLiteralRelocation(CTX, Reloc.RIPLiteral.GuestRIP, GuestEntry, Emitter);
       break;
     }
     case FEXCore::CPU::RelocationTypes::RELOC_GUEST_RIP_MOVE: {
+      if (!Fits(Reloc.Offset, MoveSize) || !ValidRegister(Reloc.RIPMove.RegisterIndex)) {
+        return false;
+      }
       ApplyRIPMoveRelocation(CTX, Reloc.RIPMove.GuestRIP, Reloc.RIPMove.RegisterIndex, GuestEntry, Emitter);
       break;
     }
     case FEXCore::CPU::RelocationTypes::RELOC_GUEST_PATCHABLE_DATA_MOVE: {
+      if (!Fits(Reloc.Offset, MoveSize) || !ValidRegister(Reloc.PatchableData.RegisterIndex) ||
+          !ValidValueSize(Reloc.PatchableData.ValueSize)) {
+        return false;
+      }
       ApplyPatchableDataRelocation(CTX, GuestEntry + Reloc.PatchableData.SiteOffset, Reloc.PatchableData.ValueSize,
                                    Reloc.PatchableData.RegisterIndex, Emitter);
       break;
     }
     case FEXCore::CPU::RelocationTypes::RELOC_GUEST_PATCHABLE_RIP_LITERAL: {
+      if (!Fits(Reloc.Offset, LiteralSize) || !ValidValueSize(Reloc.PatchableData.ValueSize)) {
+        return false;
+      }
       ApplyPatchableRIPLiteralRelocation(CTX, GuestEntry + Reloc.PatchableData.SiteOffset, Reloc.PatchableData.ValueSize, Emitter);
       break;
     }
     case FEXCore::CPU::RelocationTypes::RELOC_GUEST_PATCHABLE_RIP_MOVE: {
+      if (!Fits(Reloc.Offset, MoveSize) || !ValidRegister(Reloc.PatchableData.RegisterIndex) ||
+          !ValidValueSize(Reloc.PatchableData.ValueSize)) {
+        return false;
+      }
       ApplyPatchableRIPMoveRelocation(CTX, GuestEntry + Reloc.PatchableData.SiteOffset, Reloc.PatchableData.ValueSize,
                                       Reloc.PatchableData.RegisterIndex, Emitter);
       break;
     }
     case FEXCore::CPU::RelocationTypes::RELOC_GUEST_PATCHABLE_CRC_MOVE: {
+      if (!Fits(Reloc.Offset, MoveSize) || !ValidRegister(Reloc.PatchableData.RegisterIndex)) {
+        return false;
+      }
       ApplyPatchableCRCMoveRelocation(CTX, GuestEntry + Reloc.PatchableData.SiteOffset, Reloc.PatchableData.ValueSize,
                                       Reloc.PatchableData.RegisterIndex, Emitter);
       break;
     }
-    default: ERROR_AND_DIE_FMT("Unknown packed relocation type {}", ToUnderlying((CPU::RelocationTypes)Reloc.Type));
+    default: return false;
     }
   }
   for (auto& Reloc : ThunkRelocs) {
-    LOGMAN_THROW_A_FMT(Reloc.Offset < Code.size_bytes(), "Invalid relocation offset");
+    if (!Fits(Reloc.Offset, MoveSize) || !ValidRegister(Reloc.RegisterIndex)) {
+      return false;
+    }
     Emitter.SetCursorOffset(Reloc.Offset);
     if (!ApplyThunkMoveRelocation(CTX, (const IR::SHA256Sum*)Reloc.SymbolHash, Reloc.RegisterIndex, Emitter, false)) {
       return false;

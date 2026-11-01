@@ -313,8 +313,9 @@
         "HasSideEffects": true,
         "RAOverride": "2"
       },
-      "ExitFunction OpSize:#Size, GPR:$NewRIP, BranchHint:$Hint, GPR:$CallReturnAddress, SSA:$CallReturnBlock, i64:$PatchSiteAddress{0}, i64:$PatchSiteSize{0}": {
-        "Desc": ["Exits the current JIT function with a target RIP - optionally patchable from guest bytes for caching"
+      "ExitFunction OpSize:#Size, GPR:$NewRIP, BranchHint:$Hint, GPR:$CallReturnAddress, SSA:$CallReturnBlock, i64:$PatchSiteAddress{0}, i64:$PatchSiteSize{0}, i1:$InlineCache{false}": {
+        "Desc": ["Exits the current JIT function with a target RIP - optionally patchable from guest bytes for caching",
+                 "InlineCache: the target was loaded from a fixed memory slot, or is a register or [reg+disp] call; cache it in a per-callsite {guest, host} slot"
                 ],
         "Inline": ["Any"],
         "HasSideEffects": true,
@@ -661,6 +662,17 @@
           "ElementSize == OpSize::i32Bit",
           "RegisterSize != FEXCore::IR::OpSize::i256Bit && \"What does 256-bit mean in this context?\""
         ]
+      },
+      "VGatherLanes FPR:$IndexLow, FPR:$IndexHigh, GPR:$Base, GPR:$Segment, u8:$DestReg, u8:$MaskReg, OpSize:$DataSize, OpSize:$IndexSize, u8:$Lanes, u8:$ScaleShift, i1:$Address32, i1:$TSO, i1:$MaskAllOnesLow, i1:$MaskAllOnesHigh": {
+        "HasSideEffects": true,
+        "Desc": ["Split-AVX x64 VEX gather over normalized guest Dest/Mask registers after a full register cache flush.",
+                 "Each active lane loads, then writes guest Dest and clears its guest Mask lane in place: the static",
+                 "register for the low half, CPUState::avx_high for the high half. A faulting lane therefore leaves",
+                 "exact x86 partial state without splitting blocks. IndexHigh may be Invalid when no lane uses it.",
+                 "Address = (Base + (sext(Index) << ScaleShift)), truncated to 32 bits if Address32, plus Segment if valid.",
+                 "MaskAllOnesLow/High mean every mask lane in that half is known active, so its lanes skip the mask test;",
+                 "each lane still clears its mask lane after the load.",
+                 "Does not write NZCV."]
       },
       "FPR = VLoadVectorElement OpSize:#RegisterSize, OpSize:#ElementSize, FPR:$DstSrc, u8:$Index, GPR:$Addr": {
         "HasSideEffects": true,

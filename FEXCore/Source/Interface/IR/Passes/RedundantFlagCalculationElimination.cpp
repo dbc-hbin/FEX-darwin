@@ -104,20 +104,22 @@ struct BlockInfo {
 };
 
 struct ControlFlowGraph {
-  fextl::vector<BlockInfo> BlockMap;
+  fextl::vector<BlockInfo>& BlockMap;
   IRListView& IR;
 
   void Init(fextl::deque<uint32_t>& Worklist, uint32_t BlockCount) {
-    BlockMap.resize(BlockCount);
+    if (BlockMap.size() < BlockCount) {
+      BlockMap.resize(BlockCount);
+    }
 
     for (unsigned ID = 0; ID < BlockCount; ++ID) {
       // Add the block with conservative flags and already in the worklist.
-      auto Info = BlockInfo {{}, nullptr, FLAG_ALL, true};
+      auto& Info = BlockMap[ID];
+      Info.Predecessors.clear();
+      Info.Node = nullptr;
+      Info.Flags = FLAG_ALL;
+      Info.InWorklist = true;
 
-      // Add some initial capacity
-      Info.Predecessors.reserve(2);
-
-      BlockMap[ID] = std::move(Info);
       Worklist.push_back(ID);
     }
   }
@@ -160,6 +162,11 @@ private:
   CondClass X86ToArmFloatCond(CondClass X86);
   bool ProcessBlock(IREmitter* IREmit, IRListView& CurrentIR, Ref Block, ControlFlowGraph& CFG);
   void OptimizeParity(IREmitter* IREmit, IRListView& CurrentIR, ControlFlowGraph& CFG);
+
+  // BlockMap and Worklist are reused across compiles: freeing the worklist's 4 KiB deque block every compile
+  // empties its allocator page, which rpmalloc then decommits and recommits on the next compile.
+  fextl::vector<BlockInfo> BlockMap;
+  fextl::deque<uint32_t> Worklist;
 };
 
 unsigned DeadFlagCalculationEliminination::FlagsForCondClassType(CondClass Cond) {
@@ -684,10 +691,9 @@ void DeadFlagCalculationEliminination::Run(IREmitter* IREmit) {
   FEXCORE_PROFILE_SCOPED("PassManager::DFE");
 
   auto CurrentIR = IREmit->ViewIR();
-  fextl::deque<uint32_t> Worklist;
 
   // Initialize CFG
-  ControlFlowGraph CFG {.IR = CurrentIR};
+  ControlFlowGraph CFG {.BlockMap = BlockMap, .IR = CurrentIR};
   CFG.Init(Worklist, CurrentIR.GetHeader()->BlockCount);
 
   // Gather CFG

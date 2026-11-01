@@ -198,14 +198,14 @@ public:
     auto Cond = Set ? CondClass::TSTNZ : CondClass::TSTZ;
     return _CondJump(Src, InlineConst, InvalidNode, InvalidNode, Cond, OpSize::iInvalid, false);
   }
-  IRPair<IROp_ExitFunction> ExitFunction(Ref NewRIP, BranchHint Hint = BranchHint::None) {
+  IRPair<IROp_ExitFunction> ExitFunction(Ref NewRIP, BranchHint Hint = BranchHint::None, bool InlineCache = false) {
     FlushRegisterCache();
-    return _ExitFunction(GetOpSize(NewRIP), NewRIP, Hint, InvalidNode, InvalidNode);
+    return _ExitFunction(GetOpSize(NewRIP), NewRIP, Hint, InvalidNode, InvalidNode, 0, 0, InlineCache);
   }
   IRPair<IROp_ExitFunction> ExitFunction(Ref NewRIP, BranchHint Hint, Ref CallReturnAddress, Ref CallReturnBlock,
-                                         uint64_t PatchSiteAddress = 0, uint64_t PatchSiteSize = 0) {
+                                         uint64_t PatchSiteAddress = 0, uint64_t PatchSiteSize = 0, bool InlineCache = false) {
     FlushRegisterCache();
-    return _ExitFunction(GetOpSize(NewRIP), NewRIP, Hint, CallReturnAddress, CallReturnBlock, PatchSiteAddress, PatchSiteSize);
+    return _ExitFunction(GetOpSize(NewRIP), NewRIP, Hint, CallReturnAddress, CallReturnBlock, PatchSiteAddress, PatchSiteSize, InlineCache);
   }
   IRPair<IROp_Break> Break(BreakDefinition Reason, Ref RelocatedPC = nullptr) {
     FlushRegisterCache();
@@ -450,6 +450,8 @@ public:
   void IMULOp(OpcodeArgs);
   void StringMemOp(OpcodeArgs, bool Copy);
   void CMPSOp(OpcodeArgs);
+  void RepCompareOp(OpcodeArgs, bool Cmps);
+  Ref CrossesGuestPage(IR::OpSize Size, Ref Address, unsigned Bytes);
   void LODSOp(OpcodeArgs);
   void SCASOp(OpcodeArgs);
   void BSWAPOp(OpcodeArgs);
@@ -1585,6 +1587,20 @@ private:
   static bool IsOperandMem(const X86Tables::DecodedOperand& Operand, bool Load) {
     // Literals are immediates as sources but memory addresses as destinations.
     return !(Load && (Operand.IsLiteral() || Operand.IsLiteralRelocation() || Operand.IsLiteralPatchable())) && !Operand.IsGPR();
+  }
+
+  // Import-table style `call/jmp [rip+disp]` (64-bit) or `call/jmp [disp32]` (32-bit): the target comes from one fixed slot,
+  // so it is almost always monomorphic and benefits from a per-callsite inline cache.
+  [[nodiscard]]
+  static bool IsFixedSlotOperand(const X86Tables::DecodedOperand& Operand) {
+    return Operand.IsRIPRelative() || Operand.IsRIPRelativeRelocation();
+  }
+
+  // `call reg` and `call [reg+disp]` (vtable-style) calls. Only calls are cached: register jumps are usually switch
+  // tables or dispatchers with many targets. The cache stays on the slot's first target; other targets use the L1 lookup.
+  [[nodiscard]]
+  static bool IsRegisterCallOperand(const X86Tables::DecodedOperand& Operand) {
+    return Operand.IsGPR() || Operand.IsGPRIndirect() || Operand.IsGPRIndirectRelocation();
   }
 
   [[nodiscard]]

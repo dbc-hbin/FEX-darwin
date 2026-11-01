@@ -93,20 +93,33 @@
   ],
   "additional_upstream_backports": [
     "93def420615289035dcf0b767ef6da4be1692789",
-    "6788bcf264bc99c5686bb6eece3017eb2b5b1301"
+    "6788bcf264bc99c5686bb6eece3017eb2b5b1301",
+    "4dbb046d62c57639fd93d433bb64896df7332ff0",
+    "3a2b1c0b438fed5062bebff0c5f7c8e21879fe48",
+    "4e1ad46b136b516920420869a969110a8a11bb6b",
+    "b49837f0c3961194b35da2187e5f742982a0c716",
+    "68f4c5fbc48d4dc5c26b781b9f8b7aff8f7ab1d9",
+    "7b909d31e2ce3392fb8cbd9f50874f578eee8ff7",
+    "8e6060827ea698a6398fe2c3a5d436f9693b54e8",
+    "465395dede08bbcff03f1ef15de4e96f8ea4d12e",
+    "461b286a8ad964a6f0b264a2807cff91b5eb82b4",
+    "07abec317c255924445ced39d150b17844ae34c5",
+    "27cfd41bf9c6de68e02257164cf3e157496098a5",
+    "9f7913edb84f21381e36626e813228402dbd7bf1",
+    "01b344b4449f2d88ee927544f3805c1ee40f7b23"
   ],
   "sources": [
     {
       "path": "FEXCore/Source/Interface/Core/OpcodeDispatcher/X87.cpp",
-      "sha256": "31ce7dadfe17efae360621a13c767ce58ae570c0f5e04bf91d336dc2e59d3228"
+      "sha256": "410e3bd773c070587f6b716721874c9ebd5a3e3a64958f2db90914d3f2c869a7"
     },
     {
       "path": "Source/Windows/ARM64EC/Module.cpp",
-      "sha256": "f9adebf4bc2336fac104f6adb0f58dc3a11f1e84ef7d3bfe50f3d0af3533d24d"
+      "sha256": "9f23a0acb9abc6bc2117d90ff2bb750a60b739756fda11bcb58d9b579efd8f87"
     },
     {
       "path": "Source/Windows/ARM64EC/UserSharedData.h",
-      "sha256": "ac07c91a48019723ef39dff44da14575b50ef5bf1bf68fcc75cf29c7682be4ea"
+      "sha256": "87ebc81ae6f0ad6e8e9b87e2f6f208cb8b003fcbf3428cd479b9768abd824e60"
     },
     {
       "path": "FEXCore/include/FEXCore/Utils/AllocatorHooks.h",
@@ -122,19 +135,19 @@
     },
     {
       "path": "Source/Windows/Common/Allocator.cpp",
-      "sha256": "433df46fcecc819caaf7dd0d4521b2a985b9535f610710cf295fd7e19d4cada2"
+      "sha256": "0e9e150a67a0cd8b0e87d4751e250b9c9b4e74850de1365c62b540806b07deea"
     },
     {
       "path": "FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp",
-      "sha256": "127753f10a84f39f6fde1635d8f3fc5daf19a4c20be38184ca2883bb2e6384ba"
+      "sha256": "e7a2f7e5d7f4c09be52696649ed45a0925e523b4f58fe40e23f6e33f7c0241bb"
     },
     {
       "path": "FEXCore/Source/Interface/Core/JIT/JIT.cpp",
-      "sha256": "ae9c7e8ed676e0c575ba777d912ff0f34829785370c25d091e4cc5e0f1a2be66"
+      "sha256": "27232a92ea8d2b4ae43f197092007bcf3a5f30219b304bea6959a2cb1d31d67d"
     },
     {
       "path": "FEXCore/Source/Interface/Core/CodeCache.cpp",
-      "sha256": "ed64407e7375b4617f68b13edb9061d5a8fa9a2349bfc3a48e5cfd56403be652"
+      "sha256": "5c1d5843f959abaee1c48041c66fc0826f1c577929c7204b050de9dc73d06fe8"
     },
     {
       "path": "FEXCore/Source/Interface/Core/SharedCodeBufferManager.h",
@@ -146,11 +159,11 @@
     },
     {
       "path": "FEXCore/Source/Utils/ArchHelpers/Arm64.cpp",
-      "sha256": "065e071b4aa5800860df0dbacdc33e399797db97dc20b5e919a2a68bb07f7535"
+      "sha256": "11566ea49db6d7994e4f7bdf60e683dec614c3ca2c48577e51415650907db255"
     },
     {
       "path": "CMakeLists.txt",
-      "sha256": "b5a01bdfbac539d8c318b8c08db7eefb4081b710e7e9cba806390270a84ce010"
+      "sha256": "6fe36cb9e1b3aa6f37d835e487a5082c0f2fd4272be28e3b202e6eab86f3c55d"
     },
     {
       "path": "FEXCore/Scripts/config_generator.py",
@@ -170,67 +183,67 @@
     },
     {
       "path": "FEXCore/Source/Interface/Context/Context.h",
-      "sha256": "42dbab5b18340f4c1d788a07e2ecb718c59fb30654b8c385bcf7cd0af388bf34"
+      "sha256": "d733a6819627b7691b4a2941a47da73f4900cf856015f185c40c895348c33081"
     },
     {
       "path": "FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.cpp",
-      "sha256": "adffa703074cd21d0ca4daf0da9024704c234e870b613824bbd1e2ef9eec80df"
+      "sha256": "f8ca9b94d54b718efcaab6769ba0716550a9b0355383f1261e228cc45bc51fae"
     },
     {
       "path": "FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.h",
-      "sha256": "badd3f7881f3f96a773b0ed99e5775d19289d84bf6d62618360c2846107b6e7d"
+      "sha256": "16c09027922028f60778678885e238fac87279ecfd5cfc4219f431c4054c6964"
     },
     {
       "path": "FEXCore/Source/Interface/Core/Core.cpp",
-      "sha256": "b178bb45bf3e2027f55831fdcc8c5cecd966986f6e519609c43dd632d7a2f4fb"
+      "sha256": "3629dd4e62890941f940cdc3e6682d4831daa2ea97d515d666c53aae20f4e029"
     },
     {
       "path": "FEXCore/Source/Interface/Core/Frontend.cpp",
-      "sha256": "464c0346df67149b5ad28643048cb94cb1e3708e0c7cb43a416379026f9c43bf"
+      "sha256": "28f619fe8c76277e706487586afebe9dbbe855bea28b4420b0626b897a75c924"
     },
     {
       "path": "FEXCore/Source/Interface/Core/JIT/AtomicOps.cpp",
-      "sha256": "6bf7473378970e7da8dab14865be234fdeb9b28755ebd30eef16c4ffc8efd5b0"
+      "sha256": "5ecc93f3f31cc5ca46d6a5e24b13daf993e991313f9c1556edc41fce1d869c31"
     },
     {
       "path": "FEXCore/Source/Interface/Core/JIT/BranchOps.cpp",
-      "sha256": "19e63c08e9a921be0487483b1ab1f12ce0131b661091965a403cf52bd35f40ef"
+      "sha256": "10cee7f941b7c0ee1a28d2760021197aaec0f2c0935e81ec2a60b1bf29ed8d80"
     },
     {
       "path": "FEXCore/Source/Interface/Core/JIT/JITClass.h",
-      "sha256": "f0c96969b6f9dee8c1187ddb22ce61608f4a97f5c107b3a656d0f1c895cccb35"
+      "sha256": "4a70c310e26f7c143f15bf3d47b08b36f4392deaabffffbb47b725f44cb007fa"
     },
     {
       "path": "FEXCore/Source/Interface/Core/JIT/MemoryOps.cpp",
-      "sha256": "b679dc8117ba55840de94dfcd39ebf05dd10ea5ff2513b5e3fabb1afa76de2bc"
+      "sha256": "1a2a67872fd1e9e6ce4eb2051158343a3c4295cdeffb2a7a4e8da7dea41b351d"
     },
     {
       "path": "FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp",
-      "sha256": "089d7c7919ac299672ca8e70fbcb4538cf873d8a42500e96a08fdd2808ece757"
+      "sha256": "dfcda5f6632972f84b4dbaea53c50c612794c7c1a7816165792f5e35a0d90671"
     },
     {
       "path": "FEXCore/Source/Interface/IR/IR.json",
-      "sha256": "9bf4738af185666f25446332e866103b985228aa4eb5d593f5ed46cebec35f32"
+      "sha256": "e7f6a3f613e2d63ee7c1632a22d34fa5d4d9f1c8a6137f5149ed5887d3912e9e"
     },
     {
       "path": "FEXCore/Source/Interface/IR/IREmitter.h",
-      "sha256": "c571ae3b551292fbbd8e3c2a505be6ce009f3766bd3e6aa6988ba319ed689c6a"
+      "sha256": "d9108570b2f07d081e8738831dfd10cccd1f7316b6c8ecd90a2f078bd79610bb"
     },
     {
       "path": "FEXCore/Source/Interface/IR/Passes/x87StackOptimizationPass.cpp",
-      "sha256": "cfea065582bfca92bed3cc60361e813a753d320913d9643d8e47f771a4553128"
+      "sha256": "b9fc537212523a79993742c385062910283d69168df2dc7495ddc0a0a210d914"
     },
     {
       "path": "Source/Windows/WOW64/Module.cpp",
-      "sha256": "e979ef0caa8a06743b9768ac03f6942408a8ab56665aef6bd3b4c1b88566f245"
+      "sha256": "a06f2d01adfdb712492a5f904ac502d5ab93dda81828dbaaeda93629eea3b677"
     },
     {
       "path": "Source/Windows/Common/InvalidationTracker.h",
-      "sha256": "348f29201633fe6a6830debe6d381430613716cd54b2a804e026dca558fda5fb"
+      "sha256": "56d7a2a465c7d0760f48260fdf9eb67946edee7c234136465b621ded807fef74"
     },
     {
       "path": "Source/Windows/Common/InvalidationTracker.cpp",
-      "sha256": "a5bf38aaf2173bdeb76b286e29e19ffbbec83a47ea2402df9adbf7026cde9d57"
+      "sha256": "8f9d47759bc97147e26da086e269c8ce7f17d0bbdc2d3feede226e6101cf91b1"
     },
     {
       "path": "Source/Windows/Common/ImageTracker.h",
@@ -242,11 +255,11 @@
     },
     {
       "path": "FEXCore/Source/Interface/Core/DiskCache.cpp",
-      "sha256": "65d32f761bc4607be60af814d3b69193ae0e1a8e99b805f56a13fd4d1e47be5d"
+      "sha256": "3814a195de1d64f5dff80e1e02c62bba9354215b4bc9aba0ae540ea6e7c51158"
     },
     {
       "path": "Source/Windows/Common/CallRetStack.h",
-      "sha256": "ce99f5963c05a5cf4425a7cdac752e6bfcbd831de0dac88cafcb4fa2b3e93c8a"
+      "sha256": "1bbef1712f9a68a8d503052369fd286dc699b40ed29efc7eced4c8e4ea3cc310"
     },
     {
       "path": "FEXCore/Source/Interface/Core/CPUBackend.cpp",
@@ -270,11 +283,11 @@
     },
     {
       "path": "FEXCore/Source/Interface/Core/OpcodeDispatcher.h",
-      "sha256": "34165c8dd49f0256fc296385089a047bf51d13e21b106dca2aebda4645732d94"
+      "sha256": "85c95a317555998b7802d231ea477449cb2fde20f3d295dbb42ca6e6a9a447af"
     },
     {
       "path": "FEXCore/Source/Interface/Core/OpcodeDispatcher/Vector.cpp",
-      "sha256": "0fd97553a0dc7ad35ffc7ac2eb57c7a0e99bb90ee13b85d00bd28f9488d1d1e9"
+      "sha256": "e15ca0aaa24fd782781113d05520ae53af4440cf79278cb2de7d620590c7c4b9"
     },
     {
       "path": "FEXCore/Source/Interface/IR/IRDumper.cpp",
@@ -294,27 +307,27 @@
     },
     {
       "path": "FEXCore/include/FEXCore/Core/DiskCache.h",
-      "sha256": "cb92699613a8a42c7947a5bfe58289aab1f250ef6159b1e501a19b105989cc91"
+      "sha256": "78fe90cfe5f1b2c1aef9f4141ba218fecacca74918d4928a1f3e9635b70834f8"
     },
     {
       "path": "FEXCore/include/FEXCore/Core/HostFeatures.h",
-      "sha256": "0912528908cb5ba71998ce3f6161c12200153dd69aed42b5c444fee7eacf1286"
+      "sha256": "f94bad5852d008f268b33c9f7f4be44db7a138e69e7e58e88d075ae117bb9da5"
     },
     {
       "path": "FEXCore/Source/Utils/FileUtils.cpp",
-      "sha256": "ec3d8050f24e5e51d4eb93ee3cd56022e1cac3e3b2cbf198d2ee39d4b4a1d049"
+      "sha256": "211f5e7c0268f3f04478fc19dd00dd4378789eea9238a827ea78cdf0cbe33c76"
     },
     {
       "path": "FEXCore/include/FEXCore/Utils/FileUtils.h",
-      "sha256": "4a07bd676fa61765bbf5fc1d00c684e3be844bf09bef423bbd274127e813dc91"
+      "sha256": "c8be748410e3634f4214506e35c703025d8f044072a049c5c89d2c10c5e011aa"
     },
     {
       "path": "Source/Windows/Common/WinAPI/IO.cpp",
-      "sha256": "e211f887fb37fc930d25573f022d3133d1535309febd9f7e8b3612d3ab682849"
+      "sha256": "ae21ecad6cd63874bc9b468cdbb53a6116f2d810d17d7a5ed0a76656c528ee3a"
     }
   ],
   "cache": {
-    "format_version": "0xA612",
+    "format_version": "0xA617",
     "enabled_by_default": false,
     "memory_budget_default": 0,
     "main_file_cap_default": 1073741824,

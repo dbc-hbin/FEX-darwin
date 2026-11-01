@@ -16,6 +16,32 @@
 #include <type_traits>
 
 namespace FEXCore::Utils {
+#ifdef ARCHITECTURE_arm64
+/**
+ * @brief Monotonic clock read from the virtual counter.
+ *
+ * Used on every arm64 host. Buffers are reowned and disowned several times per compiled block, and under Wine
+ * steady_clock is a syscall (NtQueryPerformanceCounter) while the counter is a register read. Only used for
+ * coarse buffer aging and retirement.
+ */
+struct PoolClock {
+  using rep = int64_t;
+  using period = std::nano;
+  using duration = std::chrono::duration<rep, period>;
+  using time_point = std::chrono::time_point<PoolClock>;
+  static constexpr bool is_steady = true;
+
+  static time_point now() noexcept {
+    uint64_t Counter, Frequency;
+    __asm volatile("mrs %[Res], CNTVCT_EL0" : [Res] "=r"(Counter));
+    __asm("mrs %[Res], CNTFRQ_EL0" : [Res] "=r"(Frequency));
+    return time_point {duration {static_cast<rep>(static_cast<unsigned __int128>(Counter) * 1'000'000'000ULL / Frequency)}};
+  }
+};
+#else
+using PoolClock = std::chrono::steady_clock;
+#endif
+
 /**
  * @brief An intrusive thread pool allocator
  *
@@ -48,9 +74,9 @@ public:
    */
   using ContainerType = fextl::list<MemoryBuffer*>;
   /**
-   * @brief steady_clock to ensure long running applications don't hit any timeskip problems.
+   * @brief Monotonic clock to ensure long running applications don't hit any timeskip problems.
    */
-  using ClockType = std::chrono::steady_clock;
+  using ClockType = PoolClock;
   /**
    * @brief Atomic flag state for letting the client know if it owns the buffer
    */
@@ -574,7 +600,7 @@ public:
     // Disowning = cheap, unclaiming = expensive
     ThreadAllocator.DisownBuffer(Info);
 
-    auto Now = std::chrono::steady_clock::now();
+    auto Now = PoolClock::now();
     if ((Now - Previous) >= std::chrono::duration(std::chrono::milliseconds(PeriodMS))) {
       if (CountPer < PeriodFrequency) {
         // Only unclaim the buffer if our buffer usage isn't excessive in the last period
@@ -613,6 +639,6 @@ private:
 
   // Threshold counting
   uint64_t CountPer {};
-  std::chrono::steady_clock::time_point Previous;
+  PoolClock::time_point Previous;
 };
 } // namespace FEXCore::Utils

@@ -275,7 +275,11 @@ unset(CMAKE_REQUIRED_FLAGS)
 if (HAS_CLANG_PRESERVE_ALL)
   message(STATUS "Clang version ${CMAKE_CXX_COMPILER_VERSION}")
   set(CLANG_MINIMUM_VERSION 22.1)
-  if (MINGW AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS ${CLANG_MINIMUM_VERSION})
+  # Release clang (through at least 23.1.4) miscompiles preserve_all on Windows
+  # AArch64: callee saves land below SP, or locals overlap callee-save slots.
+  # Only enable it with a toolchain known to carry the frame-layout fix.
+  option(FEX_MINGW_PRESERVE_ALL "Use preserve_all with a fixed Windows AArch64 clang" OFF)
+  if (MINGW AND (NOT FEX_MINGW_PRESERVE_ALL OR CMAKE_CXX_COMPILER_VERSION VERSION_LESS ${CLANG_MINIMUM_VERSION}))
     message(STATUS "Ignoring broken clang::preserve_all support")
     set(HAS_CLANG_PRESERVE_ALL FALSE)
   else()

@@ -22,6 +22,7 @@ $end_info$
 #include <FEXCore/IR/IR.h>
 #include <FEXCore/Utils/EnumUtils.h>
 #include <FEXCore/Utils/LogManager.h>
+#include <FEXCore/Utils/TypeDefines.h>
 
 #include <FEXHeaderUtils/BitUtils.h>
 
@@ -517,13 +518,16 @@ void OpDispatchBuilder::CALLAbsoluteOp(OpcodeArgs) {
 
   // Store the RIP
   const uint64_t NextRIP = Op->PC + Op->InstSize;
-  ExitFunction(JMPPCOffset, BranchHint::Call, ConstantPC, [&]() {
-    auto CallReturnJumpTarget = JumpTargets.find(NextRIP);
-    if (CallReturnJumpTarget != JumpTargets.end() && CallReturnJumpTarget->second.IsEntryPoint) {
-      return CallReturnJumpTarget->second.BlockEntry;
-    }
-    return InvalidNode;
-  }());
+  ExitFunction(
+    JMPPCOffset, BranchHint::Call, ConstantPC,
+    [&]() {
+      auto CallReturnJumpTarget = JumpTargets.find(NextRIP);
+      if (CallReturnJumpTarget != JumpTargets.end() && CallReturnJumpTarget->second.IsEntryPoint) {
+        return CallReturnJumpTarget->second.BlockEntry;
+      }
+      return InvalidNode;
+    }(),
+    0, 0, IsFixedSlotOperand(Op->Src[0]) || IsRegisterCallOperand(Op->Src[0]));
 }
 
 std::optional<CondClass> OpDispatchBuilder::DecodeNZCVCondition(uint8_t OP) {
@@ -892,7 +896,7 @@ void OpDispatchBuilder::JUMPAbsoluteOp(OpcodeArgs) {
   auto RIPOffset = LoadSourceGPR(Op, Op->Src[0], Op->Flags);
 
   // Store the new RIP
-  ExitFunction(RIPOffset);
+  ExitFunction(RIPOffset, BranchHint::None, IsFixedSlotOperand(Op->Src[0]));
 }
 
 void OpDispatchBuilder::JUMPFARIndirectOp(OpcodeArgs) {
@@ -3347,38 +3351,127 @@ void OpDispatchBuilder::StringMemOp(OpcodeArgs, bool Copy) {
     return;
   }
 
-  const bool ChunkBytes = Is64BitMode && AddrSize == OpSize::i64Bit && Size == OpSize::i8Bit &&
-    !(Op->Flags & X86Tables::DecodeFlags::FLAG_SEGMENTS) && !CTX->IsMemcpyAtomicTSOEnabled();
+  // x86 qualifies only with 32-bit addresses; 0x67 16-bit forms and every segment prefix stay scalar.
+  const bool Chunk = !(Op->Flags & X86Tables::DecodeFlags::FLAG_SEGMENTS) && !CTX->IsMemcpyAtomicTSOEnabled() &&
+    AddrSize == (Is64BitMode ? OpSize::i64Bit : OpSize::i32Bit);
   CalculateDeferredFlags();
   ForeachDirection([&](int32_t PtrDir) {
-    if (ChunkBytes && PtrDir == 1) {
-      Ref Alignment = LoadGPRRegister(X86State::REG_RDI, AddrSize);
-      if (Copy) Alignment = _Or(OpSize::i64Bit, Alignment, LoadGPRRegister(X86State::REG_RSI, AddrSize));
-      auto Unaligned = CondJump(_And(OpSize::i64Bit, Alignment, Constant(7)));
+    if (Chunk && PtrDir == 1) {
+      // Forward REP runs whole chunks whose source and destination each lie in one 4KiB page: single scalar
+      // elements until RDI is 8-byte aligned or past a source page boundary, 8 bytes until RDI is 64-byte
+      // aligned, then 64 bytes. A chunk commits RSI/RDI/RCX only after its stores, so a fault restarts at the
+      // chunk's first element, which is also the scalar fault's element, access kind and address. Chunks never
+      // cross 4GiB, so x86 addresses only wrap at a chunk's end, where the 32-bit register update wraps too.
+      const auto A = ArithmeticSize;
+      const auto ElementShift = FEXCore::ilog2(IR::OpSizeToSize(Size));
+      auto NextBlock = [&](auto Jump) {
+        auto Block = CreateNewCodeBlockAfter(GetCurrentBlock());
+        SetFalseJumpTarget(Jump, Block);
+        SetCurrentCodeBlock(Block);
+        StartNewBlock();
+      };
+      auto CrossesPage = [&](Ref Address, unsigned Bytes) {
+        return CrossesGuestPage(A, Address, Bytes);
+      };
+      fextl::vector<IRPair<IROp_CondJump>> ToScalar, ToNarrow, ToSingle;
+      if (!Is64BitMode) {
+        // The scalar path adds the ES (and DS) bases; chunks require them to be zero.
+        Ref Bases = _LoadContextGPR(OpSize::i32Bit, offsetof(FEXCore::Core::CPUState, es_cached));
+        if (Copy) Bases = _Or(OpSize::i32Bit, Bases, _LoadContextGPR(OpSize::i32Bit, offsetof(FEXCore::Core::CPUState, ds_cached)));
+        ToScalar.push_back(CondJump(Bases));
+        NextBlock(ToScalar.back());
+      }
+      if (Size != OpSize::i8Bit) {
+        // Single elements could never align such an RDI.
+        ToScalar.push_back(CondJump(_And(A, LoadGPRRegister(X86State::REG_RDI, AddrSize), Constant(IR::OpSizeToSize(Size) - 1))));
+        NextBlock(ToScalar.back());
+      }
+      IRPair<IROp_CondJump> Far {};
+      if (Copy) {
+        // Loading a chunk before storing it is only exact if no store in the chunk feeds a load in it, that is
+        // unless 0 < RDI - RSI < chunk size. 8-byte chunks need a distance outside [1, 7]; it is loop invariant.
+        Far = CondJump(_Lshr(A, _Sub(A, LoadGPRRegister(X86State::REG_RDI, AddrSize), LoadGPRRegister(X86State::REG_RSI, AddrSize)),
+                                  Constant(3)));
+        NextBlock(Far);
+        ToScalar.push_back(CondJump(_Sub(A, LoadGPRRegister(X86State::REG_RDI, AddrSize), LoadGPRRegister(X86State::REG_RSI, AddrSize))));
+        NextBlock(ToScalar.back());
+      }
+      auto Begin = Jump();
       auto Header = CreateNewCodeBlockAfter(GetCurrentBlock());
-      SetFalseJumpTarget(Unaligned, Header);
+      SetJumpTarget(Begin, Header);
+      if (Copy) SetTrueJumpTarget(Far, Header);
       SetCurrentCodeBlock(Header);
       StartNewBlock();
-      auto Tail = CondJump(_Bfe(OpSize::i64Bit, 61, 3, LoadGPRRegister(X86State::REG_RCX, AddrSize)), CondClass::EQ);
-      auto Body = CreateNewCodeBlockAfter(Header);
-      SetFalseJumpTarget(Tail, Body);
-      SetCurrentCodeBlock(Body);
+      ToScalar.push_back(CondJump(_Lshr(A, LoadGPRRegister(X86State::REG_RCX, AddrSize), Constant(3 - ElementShift)), CondClass::EQ));
+      NextBlock(ToScalar.back());
+      ToNarrow.push_back(CondJump(_And(A, LoadGPRRegister(X86State::REG_RDI, AddrSize), Constant(63))));
+      NextBlock(ToNarrow.back());
+      ToNarrow.push_back(CondJump(_Lshr(A, LoadGPRRegister(X86State::REG_RCX, AddrSize), Constant(6 - ElementShift)), CondClass::EQ));
+      NextBlock(ToNarrow.back());
+      if (Copy) {
+        ToNarrow.push_back(
+          CondJump(_Lshr(A, _Sub(A, LoadGPRRegister(X86State::REG_RDI, AddrSize), LoadGPRRegister(X86State::REG_RSI, AddrSize)), Constant(6)),
+                   CondClass::EQ));
+        NextBlock(ToNarrow.back());
+        ToNarrow.push_back(CondJump(CrossesPage(LoadGPRRegister(X86State::REG_RSI, AddrSize), 64)));
+        NextBlock(ToNarrow.back());
+      }
+      auto Body = [&](unsigned Bytes) {
+        _GuestOpcode(Op->PC - Entry);
+        Ref Src = Copy ? LoadGPRRegister(X86State::REG_RSI, AddrSize) : Invalid();
+        Ref Dest = LoadGPRRegister(X86State::REG_RDI, AddrSize);
+        if (Bytes == 64) {
+          if (Copy) {
+            auto Low = LoadMemPair(RegClass::FPR, OpSize::i128Bit, Src, 0);
+            auto High = LoadMemPair(RegClass::FPR, OpSize::i128Bit, Src, 32);
+            _StoreMemPair(RegClass::FPR, OpSize::i128Bit, Low.Low, Low.High, Dest, 0);
+            _StoreMemPair(RegClass::FPR, OpSize::i128Bit, High.Low, High.High, Dest, 32);
+          } else {
+            Ref Value = _VDupFromGPR(OpSize::i128Bit, Size, LoadGPRRegister(X86State::REG_RAX));
+            _StoreMemPair(RegClass::FPR, OpSize::i128Bit, Value, Value, Dest, 0);
+            _StoreMemPair(RegClass::FPR, OpSize::i128Bit, Value, Value, Dest, 32);
+          }
+        } else {
+          Ref Value;
+          if (Copy) {
+            Value = _LoadMem(RegClass::GPR, OpSize::i64Bit, Src, Invalid(), OpSize::i8Bit, MemOffsetType::SXTX, 1);
+          } else if (Size == OpSize::i64Bit) {
+            Value = LoadGPRRegister(X86State::REG_RAX);
+          } else {
+            const unsigned Bits = IR::OpSizeToSize(Size) * 8;
+            Value = _Mul(OpSize::i64Bit, _Bfe(OpSize::i64Bit, Bits, 0, LoadGPRRegister(X86State::REG_RAX)),
+                         Constant(~0ULL / ((1ULL << Bits) - 1)));
+          }
+          // Load each 8-byte chunk after the preceding store, retaining scalar propagation at distance 8.
+          _StoreMem(RegClass::GPR, OpSize::i64Bit, Value, Dest, Invalid(), OpSize::i64Bit, MemOffsetType::SXTX, 1);
+        }
+        StoreOffset(X86State::REG_RDI, Add(A, Dest, Bytes));
+        if (Copy) StoreOffset(X86State::REG_RSI, Add(A, Src, Bytes));
+        StoreOffset(X86State::REG_RCX, Sub(A, LoadGPRRegister(X86State::REG_RCX, AddrSize), Bytes >> ElementShift));
+        Jump(Header);
+      };
+      Body(64);
+      auto Narrow = CreateNewCodeBlockAfter(GetCurrentBlock());
+      for (auto Jump : ToNarrow) SetTrueJumpTarget(Jump, Narrow);
+      SetCurrentCodeBlock(Narrow);
+      StartNewBlock();
+      // An 8-aligned RDI keeps the 8-byte store inside one page.
+      ToSingle.push_back(CondJump(_And(A, LoadGPRRegister(X86State::REG_RDI, AddrSize), Constant(7))));
+      if (Copy) {
+        NextBlock(ToSingle.back());
+        ToSingle.push_back(CondJump(CrossesPage(LoadGPRRegister(X86State::REG_RSI, AddrSize), 8)));
+      }
+      NextBlock(ToSingle.back());
+      Body(8);
+      auto Single = CreateNewCodeBlockAfter(GetCurrentBlock());
+      for (auto Jump : ToSingle) SetTrueJumpTarget(Jump, Single);
+      SetCurrentCodeBlock(Single);
       StartNewBlock();
       _GuestOpcode(Op->PC - Entry);
-      Ref Src = Copy ? LoadGPRRegister(X86State::REG_RSI, AddrSize) : Invalid();
-      Ref Dest = LoadGPRRegister(X86State::REG_RDI, AddrSize);
-      Ref Value = Copy ? _LoadMem(RegClass::GPR, OpSize::i64Bit, Src, Invalid(), OpSize::i64Bit, MemOffsetType::SXTX, 1)
-        : _Mul(OpSize::i64Bit, _Bfe(OpSize::i64Bit, 8, 0, LoadGPRRegister(X86State::REG_RAX)), Constant(0x0101010101010101ULL));
-      // Aligned 8-byte accesses cannot straddle a protection page or overlap within a chunk.
-      // Load each chunk after the preceding store, retaining scalar propagation at distance 8.
-      _StoreMem(RegClass::GPR, OpSize::i64Bit, Value, Dest, Invalid(), OpSize::i64Bit, MemOffsetType::SXTX, 1);
-      StoreOffset(X86State::REG_RDI, Add(OpSize::i64Bit, Dest, 8));
-      if (Copy) StoreOffset(X86State::REG_RSI, Add(OpSize::i64Bit, Src, 8));
-      StoreOffset(X86State::REG_RCX, Sub(OpSize::i64Bit, LoadGPRRegister(X86State::REG_RCX, AddrSize), 8));
+      Element(PtrDir);
       Jump(Header);
-      auto Scalar = CreateNewCodeBlockAfter(Body);
-      SetTrueJumpTarget(Unaligned, Scalar);
-      SetTrueJumpTarget(Tail, Scalar);
+      auto Scalar = CreateNewCodeBlockAfter(Single);
+      for (auto Jump : ToScalar) SetTrueJumpTarget(Jump, Scalar);
       SetCurrentCodeBlock(Scalar);
       StartNewBlock();
     }
@@ -3398,6 +3491,274 @@ void OpDispatchBuilder::StringMemOp(OpcodeArgs, bool Copy) {
     auto End = CreateNewCodeBlockAfter(Body);
     SetTrueJumpTarget(Empty, End);
     SetCurrentCodeBlock(End);
+    StartNewBlock();
+  });
+}
+
+Ref OpDispatchBuilder::CrossesGuestPage(OpSize Size, Ref Address, unsigned Bytes) {
+  // Nonzero iff [Address, Address + Bytes) spans two 4KiB guest pages.
+  return _Lshr(Size, _Xor(Size, Address, Add(Size, Address, Bytes - 1)), Constant(FEXCore::Utils::FEX_PAGE_SHIFT));
+}
+
+void OpDispatchBuilder::RepCompareOp(OpcodeArgs, bool Cmps) {
+  const auto Size = OpSizeFromSrc(Op);
+  const auto AddrSize = GetStringOpSize(Op);
+  const bool REPE = Op->Flags & X86Tables::DecodeFlags::FLAG_REP_PREFIX;
+  const unsigned ElementBytes = IR::OpSizeToSize(Size);
+
+  // One element: compare, set every flag, commit RCX/RDI/RSI, then stop on the REPE/REPNE condition.
+  // Each element's flags are final when the next element faults.
+  auto Element = [&](int32_t PtrDir) {
+    // The entry block reported the segment reads; telemetry here would clobber NZCV before a faulting load.
+    SegmentsNeedReadCheck = 0;
+    Ref Src_RDI = LoadGPRRegister(X86State::REG_RDI, AddrSize);
+    Ref Src_RSI = Cmps ? LoadGPRRegister(X86State::REG_RSI, AddrSize) : Invalid();
+    Ref Dest = AppendSegmentOffset(Src_RDI, 0, X86Tables::DecodeFlags::FLAG_ES_PREFIX, true);
+    if (ElementBytes > 1) CheckGuestMemSpan(Op, Dest, Constant(ElementBytes), X86Tables::DecodeFlags::FLAG_ES_PREFIX);
+    Ref Mem = _LoadMemGPRAutoTSO(Size, Dest, Size);
+    if (Cmps) {
+      Ref SrcAddress = AppendSegmentOffset(Src_RSI, Op->Flags, X86Tables::DecodeFlags::FLAG_DS_PREFIX);
+      if (ElementBytes > 1) CheckGuestMemSpan(Op, SrcAddress, Constant(ElementBytes));
+      Ref Src = _LoadMemGPRAutoTSO(Size, SrcAddress, Size);
+      CalculateFlags_SUB(Size, Src, Mem);
+    } else {
+      CalculateFlags_SUB(Size, LoadGPRRegister(X86State::REG_RAX, Size, 0, true), Mem);
+    }
+    CalculateDeferredFlags();
+
+    // The address size selects RCX or ECX as the count, like the index registers.
+    auto StoreIndex = [&](uint32_t Reg, Ref Value) {
+      if (Is64BitMode && AddrSize == OpSize::i32Bit) {
+        StoreGPRRegister(Reg, _Bfe(OpSize::i64Bit, 32, 0, Value));
+      } else {
+        StoreGPRRegister(Reg, Value, AddrSize);
+      }
+    };
+    StoreIndex(X86State::REG_RCX, Sub(AddrSize, LoadGPRRegister(X86State::REG_RCX, AddrSize), 1));
+    StoreIndex(X86State::REG_RDI, Add(AddrSize, Src_RDI, PtrDir * static_cast<int32_t>(ElementBytes)));
+    if (Cmps) StoreIndex(X86State::REG_RSI, Add(AddrSize, Src_RSI, PtrDir * static_cast<int32_t>(ElementBytes)));
+
+    return CondJumpNZCV(REPE ? CondClass::EQ : CondClass::NEQ);
+  };
+
+  // x86 qualifies only with 32-bit addresses; 0x67 forms and every segment prefix stay scalar.
+  const bool Fast = !(Op->Flags & X86Tables::DecodeFlags::FLAG_SEGMENTS) && !CTX->IsVectorAtomicTSOEnabled() &&
+                    AddrSize == (Is64BitMode ? OpSize::i64Bit : OpSize::i32Bit);
+  GetSegment(0, X86Tables::DecodeFlags::FLAG_ES_PREFIX, true);
+  if (Cmps) GetSegment(Op->Flags, X86Tables::DecodeFlags::FLAG_DS_PREFIX);
+  CalculateDeferredFlags();
+  ForeachDirection([&](int32_t PtrDir) {
+    auto Done = CreateNewCodeBlockAfter(GetCurrentBlock());
+    if (Fast && PtrDir == 1) {
+      // Forward scans run vector chunks and single-element probes that never cross a 4KiB page. Final, the scalar
+      // element above, runs for every stop candidate, the count's last element and the last element of each page
+      // the scan crosses (both pages for CMPS). A fault can only be the first touch of a page, so the guest flags
+      // are then the previous element's CMP, or the initial flags, as in the scalar loop. Progress is committed
+      // after a chunk's loads only. A chunk or probe that commits elements and loops back sets the flags of its last
+      // committed element from the values it loaded, because the backward branch can suspend the thread there.
+      const auto A = AddrSize;
+      const unsigned Sh = FEXCore::ilog2(ElementBytes);
+      auto Enter = [&](Ref Block) {
+        SetCurrentCodeBlock(Block);
+        StartNewBlock();
+      };
+      auto Fall = [&](Ref Cmp, CondClass Cond, Ref Target) {
+        auto Jump = CondJump(Cmp, Cond);
+        SetTrueJumpTarget(Jump, Target);
+        auto Block = CreateNewCodeBlockAfter(GetCurrentBlock());
+        SetFalseJumpTarget(Jump, Block);
+        Enter(Block);
+      };
+      auto RCX = [&] { return LoadGPRRegister(X86State::REG_RCX, A); };
+      auto RDI = [&] { return LoadGPRRegister(X86State::REG_RDI, A); };
+      auto RSI = [&] { return LoadGPRRegister(X86State::REG_RSI, A); };
+      auto CrossesPage = [&](Ref Address, unsigned Bytes) {
+        return CrossesGuestPage(A, Address, Bytes);
+      };
+      // RCX - 1 >> Shift is zero iff RCX <= 1 << Shift, for every nonzero RCX including ~0.
+      auto AtMost = [&](unsigned Shift) {
+        return _Lshr(A, Sub(A, RCX(), 1), Constant(Shift));
+      };
+      auto Commit = [&](Ref Count) {
+        Ref Bytes = Sh ? _Lshl(OpSize::i64Bit, Count, Constant(Sh)) : Count;
+        StoreGPRRegister(X86State::REG_RDI, Add(A, RDI(), Bytes));
+        if (Cmps) StoreGPRRegister(X86State::REG_RSI, Add(A, RSI(), Bytes));
+        StoreGPRRegister(X86State::REG_RCX, Sub(A, RCX(), Count));
+      };
+      // The element's CMP, the same flags Final computes. Other is the RSI element for CMPS, ignored for SCAS.
+      auto SetFlags = [&](Ref Memory, Ref Other) {
+        CalculateFlags_SUB(Size, Cmps ? Other : LoadGPRRegister(X86State::REG_RAX, Size, 0, true), Memory);
+        CalculateDeferredFlags();
+      };
+      // Mask with four bits per byte; nonzero bits mark stop candidates. SetLastFlags sets the flags of the chunk's
+      // last element; callers only do so where every element was committed or Final runs next.
+      auto ChunkMask = [&](unsigned Bytes, bool SetLastFlags) {
+        Ref Dest = RDI();
+        Ref Src = Cmps ? RSI() : Invalid();
+        Ref Needle = Cmps ? Invalid() : _VDupFromGPR(OpSize::i128Bit, Size, LoadGPRRegister(X86State::REG_RAX));
+        auto Equal = [&](Ref Memory, Ref Other) {
+          return _VCMPEQ(OpSize::i128Bit, Size, Memory, Other);
+        };
+        auto Combine = [&](Ref L, Ref R) {
+          return REPE ? _VAnd(OpSize::i128Bit, L, R) : _VOr(OpSize::i128Bit, L, R);
+        };
+        Ref Vector;
+        Ref LastDest, LastSrc;
+        if (Bytes == 64) {
+          auto D0 = LoadMemPair(RegClass::FPR, OpSize::i128Bit, Dest, 0);
+          auto D1 = LoadMemPair(RegClass::FPR, OpSize::i128Bit, Dest, 32);
+          RefPair S0 {Needle, Needle}, S1 {Needle, Needle};
+          if (Cmps) {
+            S0 = LoadMemPair(RegClass::FPR, OpSize::i128Bit, Src, 0);
+            S1 = LoadMemPair(RegClass::FPR, OpSize::i128Bit, Src, 32);
+          }
+          Vector = Combine(Combine(Equal(D0.Low, S0.Low), Equal(D0.High, S0.High)), Combine(Equal(D1.Low, S1.Low), Equal(D1.High, S1.High)));
+          LastDest = D1.High;
+          LastSrc = S1.High;
+        } else {
+          Ref D = _LoadMem(RegClass::FPR, OpSize::i128Bit, Dest, Invalid(), OpSize::i8Bit, MemOffsetType::SXTX, 1);
+          Ref S = Cmps ? _LoadMem(RegClass::FPR, OpSize::i128Bit, Src, Invalid(), OpSize::i8Bit, MemOffsetType::SXTX, 1) : Needle;
+          Vector = Equal(D, S);
+          LastDest = D;
+          LastSrc = S;
+        }
+        Ref Mask = _VExtractToGPR(OpSize::i128Bit, OpSize::i64Bit, _VUShrNI(OpSize::i128Bit, OpSize::i16Bit, Vector, 4), 0);
+        // Order these plain loads before every later load, as the scalar loop's TSO loads are.
+        _Fence(FenceType::Load);
+        if (SetLastFlags) {
+          const uint8_t Last = 16 / ElementBytes - 1;
+          SetFlags(_VExtractToGPR(OpSize::i128Bit, Size, LastDest, Last), Cmps ? _VExtractToGPR(OpSize::i128Bit, Size, LastSrc, Last) : Invalid());
+        }
+        return REPE ? _Not(OpSize::i64Bit, Mask) : Mask;
+      };
+      auto Index = [&](Ref Mask) {
+        return _Lshr(OpSize::i64Bit, _FindTrailingZeroes(OpSize::i64Bit, Mask), Constant(2 + Sh));
+      };
+      // Bit 63, in the 16-byte window's last element, is set iff that element ends an RDI (or RSI) page.
+      auto PageLast = [&] {
+        auto Ends = [&](Ref Pointer) {
+          return Sub(OpSize::i64Bit, _And(A, Add(A, Pointer, 16), Constant(FEXCore::Utils::FEX_PAGE_SIZE - 1)), 1);
+        };
+        Ref Last = Ends(RDI());
+        if (Cmps) Last = _Or(OpSize::i64Bit, Last, Ends(RSI()));
+        return _And(OpSize::i64Bit, Last, Constant(1ULL << 63));
+      };
+
+      auto Header = CreateNewCodeBlockAfter(GetCurrentBlock());
+      auto Short = CreateNewCodeBlockAfter(Header);
+      auto Wide = CreateNewCodeBlockAfter(Short);
+      auto Narrow = CreateNewCodeBlockAfter(Wide);
+      auto Step = CreateNewCodeBlockAfter(Narrow);
+      auto Final = CreateNewCodeBlockAfter(Step);
+      // x64 byte scans have no runtime guard, so no scalar loop.
+      const bool Guarded = !Is64BitMode || ElementBytes > 1;
+      auto Scalar = Guarded ? CreateNewCodeBlockAfter(Final) : Final;
+
+      if (!Is64BitMode) {
+        // The scalar path adds the ES (and DS) bases; chunks require them to be zero.
+        Ref Bases = _LoadContextGPR(OpSize::i32Bit, offsetof(FEXCore::Core::CPUState, es_cached));
+        if (Cmps) Bases = _Or(OpSize::i32Bit, Bases, _LoadContextGPR(OpSize::i32Bit, offsetof(FEXCore::Core::CPUState, ds_cached)));
+        Fall(Bases, CondClass::NEQ, Scalar);
+      }
+      if (ElementBytes > 1) {
+        // Elements of a misaligned pointer can straddle pages, which chunks never split.
+        Ref Pointers = Cmps ? _Or(A, RDI(), RSI()) : RDI();
+        Fall(_And(A, Pointers, Constant(ElementBytes - 1)), CondClass::NEQ, Scalar);
+      }
+      Jump(Header);
+
+      Enter(Header);
+      Fall(RCX(), CondClass::EQ, Done);
+      Fall(AtMost(4 - Sh), CondClass::EQ, Short);
+      Jump(Wide);
+
+      // 64 bytes, leaving the count's last element and the page's last 64 bytes to the narrower blocks.
+      Enter(Wide);
+      Fall(AtMost(6 - Sh), CondClass::EQ, Narrow);
+      Fall(CrossesPage(RDI(), 65), CondClass::NEQ, Narrow);
+      if (Cmps) Fall(CrossesPage(RSI(), 65), CondClass::NEQ, Narrow);
+      _GuestOpcode(Op->PC - Entry);
+      // A chunk with a candidate goes to Narrow, which commits and sets flags again before it can loop back.
+      Fall(ChunkMask(64, true), CondClass::NEQ, Narrow);
+      Commit(Constant(64 >> Sh));
+      Jump(Wide);
+
+      // 16 bytes: commits up to the first candidate, or up to the page's last element, then runs Final there.
+      // Without either it commits all 16 bytes and loops back with the last element's flags.
+      Enter(Narrow);
+      Fall(AtMost(4 - Sh), CondClass::EQ, Header);
+      Fall(CrossesPage(RDI(), 16), CondClass::NEQ, Step);
+      if (Cmps) Fall(CrossesPage(RSI(), 16), CondClass::NEQ, Step);
+      _GuestOpcode(Op->PC - Entry);
+      {
+        Ref Mask = _Or(OpSize::i64Bit, ChunkMask(16, true), PageLast());
+        // An empty mask counts all 16 bytes.
+        Commit(Index(Mask));
+        auto Hit = CondJump(Mask, CondClass::NEQ);
+        SetTrueJumpTarget(Hit, Final);
+        SetFalseJumpTarget(Hit, Narrow);
+      }
+
+      // 2 to 16 bytes' worth of elements in one page-local 16-byte probe, stopping at the first candidate or the
+      // count's last element; a page's last element can only be at or past the latter.
+      Enter(Short);
+      Fall(Sub(A, RCX(), 1), CondClass::EQ, Final);
+      Fall(CrossesPage(RDI(), 16), CondClass::NEQ, Step);
+      if (Cmps) Fall(CrossesPage(RSI(), 16), CondClass::NEQ, Step);
+      _GuestOpcode(Op->PC - Entry);
+      {
+        Ref Bound = _Lshl(OpSize::i64Bit, Constant(1), _Lshl(OpSize::i64Bit, Sub(OpSize::i64Bit, RCX(), 1), Constant(2 + Sh)));
+        Commit(Index(_Or(OpSize::i64Bit, ChunkMask(16, false), Bound)));
+        Jump(Final);
+      }
+
+      // One element for page ends; the count's and each page's last element go to Final.
+      Enter(Step);
+      Fall(Sub(A, RCX(), 1), CondClass::EQ, Final);
+      Fall(CrossesPage(RDI(), 2 * ElementBytes), CondClass::NEQ, Final);
+      if (Cmps) Fall(CrossesPage(RSI(), 2 * ElementBytes), CondClass::NEQ, Final);
+      _GuestOpcode(Op->PC - Entry);
+      {
+        Ref Mem = _LoadMemGPRAutoTSO(Size, RDI(), Size);
+        Ref Other = Cmps ? _LoadMemGPRAutoTSO(Size, RSI(), Size) : LoadGPRRegister(X86State::REG_RAX);
+        Ref Difference = _Xor(OpSize::i64Bit, Mem, Other);
+        if (ElementBytes < 8) Difference = _Bfe(OpSize::i64Bit, ElementBytes * 8, 0, Difference);
+        SetFlags(Mem, Other);
+        Fall(Difference, REPE ? CondClass::NEQ : CondClass::EQ, Final);
+        Commit(Constant(1));
+        Jump(Header);
+      }
+
+      Enter(Final);
+      _GuestOpcode(Op->PC - Entry);
+      auto Continue = Element(PtrDir);
+      SetTrueJumpTarget(Continue, Header);
+      SetFalseJumpTarget(Continue, Done);
+
+      if (!Guarded) {
+        SetCurrentCodeBlock(Done);
+        StartNewBlock();
+        return;
+      }
+      SetCurrentCodeBlock(Scalar);
+      StartNewBlock();
+    }
+    auto Begin = Jump();
+    auto Header = CreateNewCodeBlockAfter(GetCurrentBlock());
+    SetJumpTarget(Begin, Header);
+    SetCurrentCodeBlock(Header);
+    StartNewBlock();
+    auto Empty = CondJump(LoadGPRRegister(X86State::REG_RCX, AddrSize), CondClass::EQ);
+    SetTrueJumpTarget(Empty, Done);
+    auto Body = CreateNewCodeBlockAfter(Header);
+    SetFalseJumpTarget(Empty, Body);
+    SetCurrentCodeBlock(Body);
+    StartNewBlock();
+    _GuestOpcode(Op->PC - Entry);
+    auto Continue = Element(PtrDir);
+    SetTrueJumpTarget(Continue, Header);
+    SetFalseJumpTarget(Continue, Done);
+    SetCurrentCodeBlock(Done);
     StartNewBlock();
   });
 }
@@ -3425,7 +3786,9 @@ void OpDispatchBuilder::CMPSOp(OpcodeArgs) {
     Ref Dest_RSI = AppendSegmentOffset(Src_RSI, Op->Flags, X86Tables::DecodeFlags::FLAG_DS_PREFIX);
     Ref Dest_RDI = AppendSegmentOffset(Src_RDI, 0, X86Tables::DecodeFlags::FLAG_ES_PREFIX, true);
 
+    if (Size != OpSize::i8Bit) CheckGuestMemSpan(Op, Dest_RDI, Constant(IR::OpSizeToSize(Size)), X86Tables::DecodeFlags::FLAG_ES_PREFIX);
     auto Src1 = _LoadMemGPRAutoTSO(Size, Dest_RDI, Size);
+    if (Size != OpSize::i8Bit) CheckGuestMemSpan(Op, Dest_RSI, Constant(IR::OpSizeToSize(Size)));
     auto Src2 = _LoadMemGPRAutoTSO(Size, Dest_RSI, Size);
 
     CalculateFlags_SUB(OpSizeFromSrc(Op), Src2, Src1);
@@ -3446,101 +3809,7 @@ void OpDispatchBuilder::CMPSOp(OpcodeArgs) {
       StoreGPRRegister(X86State::REG_RSI, Dest_RSI, AddrSize);
     }
   } else {
-    // Calculate flags early.
-    CalculateDeferredFlags();
-
-    bool REPE = Op->Flags & FEXCore::X86Tables::DecodeFlags::FLAG_REP_PREFIX;
-
-    // If rcx = 0, skip the whole loop.
-    Ref Counter = LoadGPRRegister(X86State::REG_RCX);
-    auto OuterJump = CondJump(Counter, CondClass::EQ);
-
-    auto BeforeLoop = CreateNewCodeBlockAfter(GetCurrentBlock());
-    SetFalseJumpTarget(OuterJump, BeforeLoop);
-    SetCurrentCodeBlock(BeforeLoop);
-    StartNewBlock();
-
-    ForeachDirection([this, Op, Size, AddrSize, REPE](int32_t PtrDir) {
-      IRPair<IROp_CondJump> InnerJump;
-      auto JumpIntoLoop = Jump();
-
-      // Setup for the loop
-      auto LoopHeader = CreateNewCodeBlockAfter(GetCurrentBlock());
-      SetCurrentCodeBlock(LoopHeader);
-      StartNewBlock();
-      SetJumpTarget(JumpIntoLoop, LoopHeader);
-
-      // Working loop
-      {
-        Ref Src_RSI = LoadGPRRegister(X86State::REG_RSI, AddrSize);
-        Ref Src_RDI = LoadGPRRegister(X86State::REG_RDI, AddrSize);
-
-        Ref Dest_RSI = AppendSegmentOffset(Src_RSI, Op->Flags, X86Tables::DecodeFlags::FLAG_DS_PREFIX);
-        Ref Dest_RDI = AppendSegmentOffset(Src_RDI, 0, X86Tables::DecodeFlags::FLAG_ES_PREFIX, true);
-
-        auto Src1 = _LoadMemGPRAutoTSO(Size, Dest_RDI, Size);
-        auto Src2 = _LoadMemGPR(Size, Dest_RSI, Size);
-
-        // We'll calculate PF/AF after the loop, so use them as temporaries here.
-        StoreRegister(Core::CPUState::PF_AS_GREG, false, Src1);
-        StoreRegister(Core::CPUState::AF_AS_GREG, false, Src2);
-
-        Ref TailCounter = LoadGPRRegister(X86State::REG_RCX);
-
-        // Decrement counter
-        TailCounter = SubWithFlags(OpSize::i64Bit, TailCounter, 1);
-
-        // Store the counter since we don't have phis
-        StoreGPRRegister(X86State::REG_RCX, TailCounter);
-
-        Dest_RDI = Add(AddrSize, Src_RDI, PtrDir * static_cast<int32_t>(IR::OpSizeToSize(Size)));
-        if (Is64BitMode && AddrSize == OpSize::i32Bit) {
-          Dest_RDI = _Bfe(OpSize::i64Bit, 32, 0, Dest_RDI);
-          StoreGPRRegister(X86State::REG_RDI, Dest_RDI);
-        } else {
-          StoreGPRRegister(X86State::REG_RDI, Dest_RDI, AddrSize);
-        }
-
-        Dest_RSI = Add(AddrSize, Src_RSI, PtrDir * static_cast<int32_t>(IR::OpSizeToSize(Size)));
-        if (Is64BitMode && AddrSize == OpSize::i32Bit) {
-          Dest_RSI = _Bfe(OpSize::i64Bit, 32, 0, Dest_RSI);
-          StoreGPRRegister(X86State::REG_RSI, Dest_RSI);
-        } else {
-          StoreGPRRegister(X86State::REG_RSI, Dest_RSI, AddrSize);
-        }
-
-        // If TailCounter != 0, compare sources.
-        // If TailCounter == 0, set ZF iff that would break.
-        _CondSubNZCV(OpSize::i64Bit, Src2, Src1, CondClass::NEQ, REPE ? 0 : (1 << 2) /* Z */);
-        CachedNZCV = nullptr;
-        NZCVDirty = false;
-        InnerJump = CondJumpNZCV(REPE ? CondClass::EQ : CondClass::NEQ);
-
-        // Jump back to the start if we have more work to do
-        SetTrueJumpTarget(InnerJump, LoopHeader);
-      }
-
-      // Make sure to start a new block after ending this one
-      auto LoopEnd = CreateNewCodeBlockAfter(GetCurrentBlock());
-      SetFalseJumpTarget(InnerJump, LoopEnd);
-      SetCurrentCodeBlock(LoopEnd);
-      StartNewBlock();
-    });
-
-    // Make sure to start a new block after ending this one
-    {
-      // Grab the sources from the last iteration so we can set flags.
-      auto Src1 = LoadGPR(Core::CPUState::PF_AS_GREG);
-      auto Src2 = LoadGPR(Core::CPUState::AF_AS_GREG);
-      CalculateFlags_SUB(OpSizeFromSrc(Op), Src2, Src1);
-    }
-    auto Jump_ = Jump();
-
-    auto Exit = CreateNewCodeBlockAfter(GetCurrentBlock());
-    SetJumpTarget(Jump_, Exit);
-    SetTrueJumpTarget(OuterJump, Exit);
-    SetCurrentCodeBlock(Exit);
-    StartNewBlock();
+    RepCompareOp(Op, true);
   }
 }
 
@@ -3558,8 +3827,9 @@ void OpDispatchBuilder::LODSOp(OpcodeArgs) {
 
   if (!Repeat) {
     Ref Src_RSI = LoadGPRRegister(X86State::REG_RSI, AddrSize);
-    Ref Dest_RSI = AppendSegmentOffset(Src_RSI, 0, X86Tables::DecodeFlags::FLAG_DS_PREFIX, true);
+    Ref Dest_RSI = AppendSegmentOffset(Src_RSI, Op->Flags, X86Tables::DecodeFlags::FLAG_DS_PREFIX);
 
+    if (Size != OpSize::i8Bit) CheckGuestMemSpan(Op, Dest_RSI, Constant(IR::OpSizeToSize(Size)));
     auto Src = _LoadMemGPRAutoTSO(Size, Dest_RSI, Size);
 
     StoreGPRResultWithZExtSemantics(X86State::REG_RAX, Src, Size);
@@ -3590,7 +3860,8 @@ void OpDispatchBuilder::LODSOp(OpcodeArgs) {
       SetCurrentCodeBlock(LoopStart);
       StartNewBlock();
 
-      Ref Counter = LoadGPRRegister(X86State::REG_RCX);
+      // The address size selects RCX or ECX as the count.
+      Ref Counter = LoadGPRRegister(X86State::REG_RCX, AddrSize);
 
       // Can we end the block?
 
@@ -3605,29 +3876,23 @@ void OpDispatchBuilder::LODSOp(OpcodeArgs) {
       // Working loop
       {
         Ref Src_RSI = LoadGPRRegister(X86State::REG_RSI, AddrSize);
-        Ref Dest_RSI = AppendSegmentOffset(Src_RSI, 0, X86Tables::DecodeFlags::FLAG_DS_PREFIX, true);
+        Ref Dest_RSI = AppendSegmentOffset(Src_RSI, Op->Flags, X86Tables::DecodeFlags::FLAG_DS_PREFIX);
 
+        if (Size != OpSize::i8Bit) CheckGuestMemSpan(Op, Dest_RSI, Constant(IR::OpSizeToSize(Size)));
         auto Src = _LoadMemGPRAutoTSO(Size, Dest_RSI, Size);
 
         StoreGPRResultWithZExtSemantics(X86State::REG_RAX, Src, Size);
 
-        Ref TailCounter = LoadGPRRegister(X86State::REG_RCX);
-        Ref TailDest_RSI = LoadGPRRegister(X86State::REG_RSI);
-
-        // Decrement counter
-        TailCounter = Sub(OpSize::i64Bit, TailCounter, 1);
-
+        auto StoreIndex = [&](uint32_t Reg, Ref Value) {
+          if (Is64BitMode && AddrSize == OpSize::i32Bit) {
+            StoreGPRRegister(Reg, _Bfe(OpSize::i64Bit, 32, 0, Value));
+          } else {
+            StoreGPRRegister(Reg, Value, AddrSize);
+          }
+        };
         // Store the counter since we don't have phis
-        StoreGPRRegister(X86State::REG_RCX, TailCounter);
-
-        // Offset the pointer
-        TailDest_RSI = Add(AddrSize, TailDest_RSI, PtrDir * static_cast<int32_t>(IR::OpSizeToSize(Size)));
-        if (Is64BitMode && AddrSize == OpSize::i32Bit) {
-          TailDest_RSI = _Bfe(OpSize::i64Bit, 32, 0, TailDest_RSI);
-          StoreGPRRegister(X86State::REG_RSI, TailDest_RSI);
-        } else {
-          StoreGPRRegister(X86State::REG_RSI, TailDest_RSI, AddrSize);
-        }
+        StoreIndex(X86State::REG_RCX, Sub(AddrSize, LoadGPRRegister(X86State::REG_RCX, AddrSize), 1));
+        StoreIndex(X86State::REG_RSI, Add(AddrSize, Src_RSI, PtrDir * static_cast<int32_t>(IR::OpSizeToSize(Size))));
 
         // Jump back to the start, we have more work to do
         Jump(LoopStart);
@@ -3657,6 +3922,7 @@ void OpDispatchBuilder::SCASOp(OpcodeArgs) {
     Ref Dest_RDI = AppendSegmentOffset(Src_RDI, 0, X86Tables::DecodeFlags::FLAG_ES_PREFIX, true);
 
     auto Src1 = LoadGPRRegister(X86State::REG_RAX, Size, 0, true);
+    if (Size != OpSize::i8Bit) CheckGuestMemSpan(Op, Dest_RDI, Constant(IR::OpSizeToSize(Size)), X86Tables::DecodeFlags::FLAG_ES_PREFIX);
     auto Src2 = _LoadMemGPRAutoTSO(Size, Dest_RDI, Size);
 
     CalculateFlags_SUB(OpSizeFromSrc(Op), Src1, Src2);
@@ -3669,76 +3935,7 @@ void OpDispatchBuilder::SCASOp(OpcodeArgs) {
       StoreGPRRegister(X86State::REG_RDI, TailDest_RDI, AddrSize);
     }
   } else {
-    // Calculate flags early. because end of block
-    CalculateDeferredFlags();
-
-    ForeachDirection([this, Op, Size, AddrSize](int32_t Dir) {
-      bool REPE = Op->Flags & FEXCore::X86Tables::DecodeFlags::FLAG_REP_PREFIX;
-
-      auto JumpStart = Jump();
-      // Make sure to start a new block after ending this one
-      auto LoopStart = CreateNewCodeBlockAfter(GetCurrentBlock());
-      SetJumpTarget(JumpStart, LoopStart);
-      SetCurrentCodeBlock(LoopStart);
-      StartNewBlock();
-
-      Ref Counter = LoadGPRRegister(X86State::REG_RCX);
-
-      // Can we end the block?
-      // We leave if RCX = 0
-      auto CondJump_ = CondJump(Counter, CondClass::EQ);
-      IRPair<IROp_CondJump> InternalCondJump;
-
-      auto LoopTail = CreateNewCodeBlockAfter(LoopStart);
-      SetFalseJumpTarget(CondJump_, LoopTail);
-      SetCurrentCodeBlock(LoopTail);
-      StartNewBlock();
-
-      // Working loop
-      {
-        Ref Src_RDI = LoadGPRRegister(X86State::REG_RDI, AddrSize);
-        Ref Dest_RDI = AppendSegmentOffset(Src_RDI, 0, X86Tables::DecodeFlags::FLAG_ES_PREFIX, true);
-
-        auto Src1 = LoadGPRRegister(X86State::REG_RAX, Size, 0, true);
-        auto Src2 = _LoadMemGPRAutoTSO(Size, Dest_RDI, Size);
-
-        CalculateFlags_SUB(OpSizeFromSrc(Op), Src1, Src2);
-
-        // Calculate flags early.
-        CalculateDeferredFlags();
-
-        Ref TailCounter = LoadGPRRegister(X86State::REG_RCX);
-        Ref Src_RDI_Tail = LoadGPRRegister(X86State::REG_RDI, AddrSize);
-
-        // Decrement counter
-        TailCounter = Sub(OpSize::i64Bit, TailCounter, 1);
-
-        // Store the counter since we don't have phis
-        StoreGPRRegister(X86State::REG_RCX, TailCounter);
-
-        Ref TailDest_RDI = Add(AddrSize, Src_RDI_Tail, Dir * static_cast<int32_t>(IR::OpSizeToSize(Size)));
-        if (Is64BitMode && AddrSize == OpSize::i32Bit) {
-          TailDest_RDI = _Bfe(OpSize::i64Bit, 32, 0, TailDest_RDI);
-          StoreGPRRegister(X86State::REG_RDI, TailDest_RDI);
-        } else {
-          StoreGPRRegister(X86State::REG_RDI, TailDest_RDI, AddrSize);
-        }
-
-        CalculateDeferredFlags();
-        InternalCondJump = CondJumpNZCV(REPE ? CondClass::EQ : CondClass::NEQ);
-
-        // Jump back to the start if we have more work to do
-        SetTrueJumpTarget(InternalCondJump, LoopStart);
-      }
-      // Make sure to start a new block after ending this one
-      auto LoopEnd = CreateNewCodeBlockAfter(LoopTail);
-      SetTrueJumpTarget(CondJump_, LoopEnd);
-
-      SetFalseJumpTarget(InternalCondJump, LoopEnd);
-
-      SetCurrentCodeBlock(LoopEnd);
-      StartNewBlock();
-    });
+    RepCompareOp(Op, false);
   }
 }
 
@@ -4549,10 +4746,12 @@ void OpDispatchBuilder::CheckGuestMemSpan(const X86Tables::DecodedOp& Op, Ref Ba
   if (!Is64BitMode) {
     if (MMXState == MMXState_X87) _SyncStackToSlow();
     FlushRegisterCache();
+    // A stack-segment access reports #SS; compare the whole segment field, since ES (0b001) shares a bit with SS (0b011).
+    const auto Segment = (SegmentFlags ? SegmentFlags : Op->Flags) & X86Tables::DecodeFlags::FLAG_SEGMENTS;
     _CheckGuestMemSpan(Base, Bytes, GetRelocatedPC(Op, -Op->InstSize),
                       {.ErrorRegister = 0, .Signal = SIGSEGV,
-                       .TrapNumber = static_cast<uint8_t>(((SegmentFlags ? SegmentFlags : Op->Flags) & X86Tables::DecodeFlags::FLAG_SS_PREFIX)
-                                                           ? X86State::X86_TRAPNO_SS : X86State::X86_TRAPNO_GP),
+                       .TrapNumber = static_cast<uint8_t>(Segment == X86Tables::DecodeFlags::FLAG_SS_PREFIX ? X86State::X86_TRAPNO_SS
+                                                                                                             : X86State::X86_TRAPNO_GP),
                        .si_code = 2}); // SEGV_ACCERR: memory limit, not a privileged instruction.
   }
 #endif
@@ -5157,7 +5356,6 @@ void OpDispatchBuilder::SerializeOp(OpcodeArgs) {
   _Fence(FenceType::Inst);
   _Fence(FenceType::Store);
 }
-
 void OpDispatchBuilder::UMonitorOrCLRSSBSY(OpcodeArgs) {
   if (DestIsMem(Op) || !CTX->HostFeatures.SupportsWFXT) {
     // CLRSSBSY

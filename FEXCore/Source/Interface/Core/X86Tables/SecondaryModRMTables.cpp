@@ -67,6 +67,7 @@ constexpr std::array<X86InstInfo, MAX_SECOND_MODRM_TABLE_SIZE> SecondModRMTableO
     {((3 << 3) | 5), 1, X86InstInfo{"",         TYPE_INVALID, FLAGS_NONE, 0}},
     {((3 << 3) | 6), 1, X86InstInfo{"",         TYPE_INVALID, FLAGS_NONE, 0}},
     {((3 << 3) | 7), 1, X86InstInfo{"",         TYPE_INVALID, FLAGS_NONE, 0}},
+
   };
 
   GenerateTable(Table.data(), SecondaryModRMExtensionOpTable, std::size(SecondaryModRMExtensionOpTable));

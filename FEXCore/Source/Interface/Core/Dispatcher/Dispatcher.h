@@ -85,6 +85,7 @@ private:
   uint64_t ThreadDispatchCPUIDHandler {};
   uint64_t ThreadDispatchRemoveCodeEntry {};
   uint64_t ExitFunctionLinkerAddress {};
+  uint64_t InlineCacheFillerAddress {};
   uint64_t SignalHandlerReturnAddress {};
   uint64_t SignalHandlerReturnAddressRT {};
   uint64_t GuestSignal_SIGILL {};

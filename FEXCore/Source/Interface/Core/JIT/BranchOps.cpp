@@ -196,39 +196,96 @@ DEF_OP(ExitFunction) {
     auto RipReg = GetReg(Op->NewRIP);
 
     if (Op->Hint == IR::BranchHint::Return) {
-      // First try to pop from the call-ret stack, otherwise follow the normal path (but ending in a ret)
+      // First try to pop from the call-ret stack, otherwise follow the normal path (but ending in a ret).
+      // The hit returns straight away, so the predicted path has no taken branch before the `ret`.
+      ARMEmitter::ForwardLabel CallRetMiss;
       ldp<ARMEmitter::IndexType::POST>(TMP1, TMP2, REG_CALLRET_SP, 0x10);
       sub(TMP1, TMP1, RipReg.X());
-      (void)cbz(ARMEmitter::Size::i64Bit, TMP1, &SkipFullLookup);
+      (void)cbnz(ARMEmitter::Size::i64Bit, TMP1, &CallRetMiss);
+      ret(TMP2);
+      (void)Bind(&CallRetMiss);
+    } else if (Op->InlineCache && !CTX->GetCodeCache().IsGeneratingCache && Op->Hint == IR::BranchHint::Call) {
+      // Call inline cache: the hit runs straight through (guard, push, bl) with no taken branch, and the miss path is
+      // emitted out of line by the inline cache loop at the end of CompileCode. Slot layout and patching are
+      // described on the jump path below.
+      //   adr  TMP4, Slot
+      //   ldp  TMP1, TMP2, [TMP4]
+      //   sub  TMP3, TMP1, Rip
+      //   cbnz TMP3, Miss          ; out of line
+      //   cbz  TMP1, Miss          ; an empty or delinked slot holds guest target 0, which must not match RIP 0
+      //   <push>
+      //   Site: bl Trampoline / bl HostTarget
+      //   CallReturn:
+      // Note: sub+cbz/cbnz used to preserve flags.
+      auto& Slot = PendingInlineCacheSlots.emplace_back();
+      Slot.Call = true;
+      Slot.RipReg = RipReg.Idx();
+      Slot.HasReturnBlock = !Op->CallReturnBlock.IsInvalid();
+      Slot.CallReturnAddressReg = Slot.HasReturnBlock ? GetReg(Op->CallReturnAddress).Idx() : 0;
+      adr_OrRestart(TMP4, &Slot.Label);
+      ldp<ARMEmitter::IndexType::OFFSET>(TMP1, TMP2, TMP4, 0);
+      sub(TMP3, TMP1, RipReg.X());
+      cbnz_OrRestart(ARMEmitter::Size::i64Bit, TMP3, &Slot.Miss);
+      cbz_OrRestart(ARMEmitter::Size::i64Bit, TMP1, &Slot.Miss);
+
+      ARMEmitter::ForwardLabel l_CallReturn;
+      if (Slot.HasReturnBlock) {
+        PendingCallReturnTargetLabel = &CallReturnTargets.try_emplace(Op->CallReturnBlock.ID()).first->second;
+      }
+      EmitCallRetPush(Slot.HasReturnBlock, ARMEmitter::XRegister(Slot.CallReturnAddressReg), &l_CallReturn);
+      Slot.SiteAddress = GetCursorAddress<uint64_t>();
+      bl_OrRestart(&Slot.Trampoline);
+      (void)Bind(&l_CallReturn);
+      (void)Bind(&Slot.CallReturn);
+      return;
+    } else if (Op->InlineCache && !CTX->GetCodeCache().IsGeneratingCache) {
+      // Slots are skipped when generating a code cache, which serializes the whole code buffer after slots were filled.
+      // Per-callsite inline cache: a 32-byte {GuestTarget, HostTarget, SiteOffset | Call, PinnedGuest} slot in the block tail.
+      // An empty slot (GuestTarget == 0) is filled by InlineCacheFill, which registers the slot as a block link so
+      // invalidating the target clears it. A slot holding a different target falls back to the L1 lookup.
+      // A hit ends at a dedicated site. InlineCacheFill patches it to a direct `b/bl HostTarget` when in range and the
+      // target is the slot's first (pinned) target, which keeps monomorphic sites out of the indirect predictor; the
+      // delinker restores it. Both forms are B, BL or NOP so they can be modified while other threads execute them.
+      // Calls take the branch above. Note: sub+cbz/cbnz used to preserve flags.
+      //   adr TMP4, Slot
+      //   ldp TMP1, TMP2, [TMP4]
+      //   sub TMP3, TMP1, Rip
+      //   cbnz TMP3, Miss
+      //   cbz TMP1, Miss      ; an empty or delinked slot holds guest target 0, which must not match RIP 0
+      //   Site: nop / b HostTarget
+      //         br TMP2
+      //   Miss: <filler or L1 lookup>
+      ARMEmitter::ForwardLabel L1Lookup;
+      ARMEmitter::ForwardLabel Miss;
+      auto& Slot = PendingInlineCacheSlots.emplace_back();
+      Slot.Call = false;
+      adr_OrRestart(TMP4, &Slot.Label);
+      ldp<ARMEmitter::IndexType::OFFSET>(TMP1, TMP2, TMP4, 0);
+      sub(TMP3, TMP1, RipReg.X());
+      (void)cbnz(ARMEmitter::Size::i64Bit, TMP3, &Miss);
+      (void)cbz(ARMEmitter::Size::i64Bit, TMP1, &Miss);
+      Slot.SiteAddress = GetCursorAddress<uint64_t>();
+      nop();
+      br(TMP2);
+      (void)Bind(&Miss);
+      (void)cbnz(ARMEmitter::Size::i64Bit, TMP1, &L1Lookup);
+      // Filler expects the target in State.rip and the slot in TMP4.
+      str(RipReg.X(), STATE, offsetof(FEXCore::Core::CpuStateFrame, State.rip));
+      ldr(TMP2, STATE, offsetof(FEXCore::Core::CpuStateFrame, Pointers.InlineCacheFiller));
+      (void)b(&SkipFullLookup);
+      (void)Bind(&L1Lookup);
     }
 
-    // L1 Cache
-    ldp<ARMEmitter::IndexType::OFFSET>(TMP1, TMP2, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.L1Pointer));
-
-    // Calculate (tmp1 + ((ripreg & L1_ENTRIES_MASK) << 4)) for the address
-    // L1Mask is pre-shifted.
-    and_(ARMEmitter::Size::i64Bit, TMP2, TMP2, RipReg, ARMEmitter::ShiftType::LSL, FEXCore::ilog2(sizeof(LookupCache::LookupCacheEntry)));
-    add(TMP1, TMP1, TMP2);
-
-    ldp<ARMEmitter::IndexType::OFFSET>(TMP2, TMP1, TMP1, 0);
-
-    // Note: sub+cbnz used over cmp+br to preserve flags.
-    sub(TMP1, TMP1, RipReg.X());
-    (void)cbz(ARMEmitter::Size::i64Bit, TMP1, &SkipFullLookup);
-    ldr(TMP2, STATE, offsetof(FEXCore::Core::CpuStateFrame, Pointers.DispatcherLoopTop));
-    str(RipReg.X(), STATE, offsetof(FEXCore::Core::CpuStateFrame, State.rip));
+    EmitL1Lookup(RipReg.X(), &SkipFullLookup);
 
     (void)Bind(&SkipFullLookup);
     if (Op->Hint == IR::BranchHint::Call) {
       ARMEmitter::ForwardLabel l_CallReturn;
-      if (!Op->CallReturnBlock.IsInvalid()) {
-        auto CallReturnAddressReg = GetReg(Op->CallReturnAddress).X();
+      const bool HasReturnBlock = !Op->CallReturnBlock.IsInvalid();
+      if (HasReturnBlock) {
         PendingCallReturnTargetLabel = &CallReturnTargets.try_emplace(Op->CallReturnBlock.ID()).first->second;
-        (void)adr(TMP1, &l_CallReturn);
-        stp<ARMEmitter::IndexType::PRE>(CallReturnAddressReg, TMP1, REG_CALLRET_SP, -0x10);
-      } else {
-        stp<ARMEmitter::IndexType::PRE>(ARMEmitter::XReg::zr, ARMEmitter::XReg::zr, REG_CALLRET_SP, -0x10);
       }
+      EmitCallRetPush(HasReturnBlock, HasReturnBlock ? GetReg(Op->CallReturnAddress).X() : ARMEmitter::XReg::zr, &l_CallReturn);
       blr(TMP2);
       (void)Bind(&l_CallReturn);
     } else if (Op->Hint == IR::BranchHint::Return) {

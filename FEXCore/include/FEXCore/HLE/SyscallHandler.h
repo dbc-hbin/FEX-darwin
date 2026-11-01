@@ -34,6 +34,11 @@ public:
 
   virtual void MarkGuestExecutableRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) {}
   virtual void InvalidateGuestCodeRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) {}
+  // Clears every call-ret stack entry of the thread, which may be running concurrently.
+  // Returns false if the frontend doesn't manage the call-ret stack and the whole stack should be discarded instead.
+  virtual bool InvalidateCallRetStack(FEXCore::Core::InternalThreadState* Thread) {
+    return false;
+  }
   virtual void MarkOvercommitRange(uint64_t Start, uint64_t Length) {}
   virtual void UnmarkOvercommitRange(uint64_t Start, uint64_t Length) {}
   virtual ExecutableRangeInfo QueryGuestExecutableRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Address) = 0;

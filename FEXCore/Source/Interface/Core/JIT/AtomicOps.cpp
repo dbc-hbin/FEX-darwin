@@ -31,70 +31,31 @@ DEF_OP(CASPair) {
   auto MemSrc = GetGuestMemReg(Op->Addr);
 
   const auto EmitSize = IROp->ElementSize == IR::OpSize::i64Bit ? ARMEmitter::Size::i64Bit : ARMEmitter::Size::i32Bit;
-  if (CTX->HostFeatures.SupportsAtomics) {
-    // RA has heuristics to try to pair sources, but we need to handle the cases
-    // where they fail. We do so by moving to temporaries. Note we use 64-bit
-    // moves here even for 32-bit cmpxchg, for the Firestorm register renamer.
-    if (Desired1.Idx() != (Desired0.Idx() + 1) || Desired0.Idx() & 1) {
-      mov(ARMEmitter::Size::i64Bit, TMP1, Desired0);
-      mov(ARMEmitter::Size::i64Bit, TMP2, Desired1);
-      Desired0 = TMP1;
-      Desired1 = TMP2;
-    }
 
-    auto CaspalDst0 = Dst0;
-    auto CaspalDst1 = Dst1;
-    if (CaspalDst1.Idx() != (CaspalDst0.Idx() + 1) || CaspalDst0.Idx() & 1) {
-      CaspalDst0 = TMP3;
-      CaspalDst1 = TMP4;
-    }
-
-    // We can't clobber the source, these moves are inherently required due to
-    // ISA limitations. But by making them 64-bit, Firestorm can rename.
-    mov(ARMEmitter::Size::i64Bit, CaspalDst0, Expected0);
-    mov(ARMEmitter::Size::i64Bit, CaspalDst1, Expected1);
-    caspal(EmitSize, CaspalDst0, CaspalDst1, Desired0, Desired1, MemSrc);
-
-    if (CaspalDst0 != Dst0) {
-      mov(ARMEmitter::Size::i64Bit, Dst0, CaspalDst0);
-      mov(ARMEmitter::Size::i64Bit, Dst1, CaspalDst1);
-    }
-  } else {
-    // Save NZCV so we don't have to mark this op as clobbering NZCV (the
-    // SupportsAtomics does not clobber atomics and this !SupportsAtomics path
-    // is so slow it's not worth the complexity of splitting the IR op.). We
-    // clobber NZCV inside the hot loop and we can't replace cmp/ccmp/b.ne with
-    // something NZCV-preserving without requiring an extra instruction.
-    mrs(TMP1, ARMEmitter::SystemRegister::NZCV);
-
-    ARMEmitter::BackwardLabel LoopTop;
-    ARMEmitter::ForwardLabel LoopNotExpected;
-    ARMEmitter::ForwardLabel LoopExpected;
-    (void)Bind(&LoopTop);
-
-    // This instruction sequence must be synced with HandleCASPAL_Armv8.
-    ldaxp(EmitSize, TMP2, TMP3, MemSrc);
-    cmp(EmitSize, TMP2, Expected0);
-    ccmp(EmitSize, TMP3, Expected1, ARMEmitter::StatusFlags::None, ARMEmitter::Condition::CC_EQ);
-    (void)b(ARMEmitter::Condition::CC_NE, &LoopNotExpected);
-    stlxp(EmitSize, TMP2, Desired0, Desired1, MemSrc);
-    (void)cbnz(EmitSize, TMP2, &LoopTop);
-    mov(EmitSize, Dst0, Expected0);
-    mov(EmitSize, Dst1, Expected1);
-
-    (void)b(&LoopExpected);
-
-    (void)Bind(&LoopNotExpected);
-    mov(EmitSize, Dst0, TMP2.R());
-    mov(EmitSize, Dst1, TMP3.R());
-    // exclusive monitor needs to be cleared here
-    // Might have hit the case where ldaxr was hit but stlxr wasn't
-    clrex();
-    (void)Bind(&LoopExpected);
-
-    // Restore
-    msr(ARMEmitter::SystemRegister::NZCV, TMP1);
-  }
+  // LL/SC on every host, including LSE ones: under contention caspal costs about 3x more than this loop on
+  // Apple cores. The loop always stores, writing the observed value back on mismatch, as x86 locked CMPXCHG
+  // does; that keeps the line exclusive. The trailing dmb ish makes it a full barrier. Comparing with
+  // eor/orr/cbnz leaves NZCV untouched, so a fault on the store still exposes the exact guest flags.
+  // This instruction sequence must be synced with HandleCASPair_LLSC.
+  ARMEmitter::BackwardLabel LoopTop;
+  ARMEmitter::ForwardLabel LoopNotExpected;
+  ARMEmitter::ForwardLabel LoopDone;
+  (void)Bind(&LoopTop);
+  ldxp(EmitSize, TMP2, TMP3, MemSrc);
+  eor(EmitSize, TMP4, TMP2, Expected0);
+  eor(EmitSize, TMP1, TMP3, Expected1);
+  orr(EmitSize, TMP4, TMP4, TMP1);
+  (void)cbnz(EmitSize, TMP4, &LoopNotExpected);
+  stlxp(EmitSize, TMP4, Desired0, Desired1, MemSrc);
+  (void)cbnz(ARMEmitter::Size::i32Bit, TMP4, &LoopTop);
+  (void)b(&LoopDone);
+  (void)Bind(&LoopNotExpected);
+  stlxp(EmitSize, TMP4, TMP2, TMP3, MemSrc);
+  (void)cbnz(ARMEmitter::Size::i32Bit, TMP4, &LoopTop);
+  (void)Bind(&LoopDone);
+  dmb(ARMEmitter::BarrierScope::ISH);
+  mov(EmitSize, Dst0, TMP2.R());
+  mov(EmitSize, Dst1, TMP3.R());
 }
 
 DEF_OP(CAS) {
@@ -110,40 +71,30 @@ DEF_OP(CAS) {
   auto MemSrc = GetGuestMemReg(Op->Addr);
   auto Dst = GetReg(Node);
 
-  if (CTX->HostFeatures.SupportsAtomics) {
-    if (Expected == Dst && Dst != MemSrc && Dst != Desired) {
-      casal(SubEmitSize, Dst, Desired, MemSrc);
-    } else {
-      mov(EmitSize, TMP2, Expected);
-      casal(SubEmitSize, TMP2, Desired, MemSrc);
-      mov(EmitSize, Dst, TMP2.R());
-    }
+  // LL/SC on every host, including LSE ones; see CASPair for why. sub/cbnz leaves NZCV untouched.
+  // This instruction sequence must be synced with HandleCAS_LLSC.
+  ARMEmitter::BackwardLabel LoopTop;
+  ARMEmitter::ForwardLabel LoopNotExpected;
+  ARMEmitter::ForwardLabel LoopDone;
+  (void)Bind(&LoopTop);
+  ldxr(SubEmitSize, TMP2, MemSrc);
+  if (IROp->Size == IR::OpSize::i8Bit) {
+    sub(EmitSize, TMP3, TMP2, Expected, ARMEmitter::ExtendedType::UXTB, 0);
+  } else if (IROp->Size == IR::OpSize::i16Bit) {
+    sub(EmitSize, TMP3, TMP2, Expected, ARMEmitter::ExtendedType::UXTH, 0);
   } else {
-    ARMEmitter::BackwardLabel LoopTop;
-    ARMEmitter::ForwardLabel LoopNotExpected;
-    ARMEmitter::ForwardLabel LoopExpected;
-    (void)Bind(&LoopTop);
-    ldaxr(SubEmitSize, TMP2, MemSrc);
-    if (IROp->Size == IR::OpSize::i8Bit) {
-      cmp(EmitSize, TMP2, Expected, ARMEmitter::ExtendedType::UXTB, 0);
-    } else if (IROp->Size == IR::OpSize::i16Bit) {
-      cmp(EmitSize, TMP2, Expected, ARMEmitter::ExtendedType::UXTH, 0);
-    } else {
-      cmp(EmitSize, TMP2, Expected);
-    }
-    (void)b(ARMEmitter::Condition::CC_NE, &LoopNotExpected);
-    stlxr(SubEmitSize, TMP3, Desired, MemSrc);
-    (void)cbnz(EmitSize, TMP3, &LoopTop);
-    mov(EmitSize, Dst, Expected);
-    (void)b(&LoopExpected);
-
-    (void)Bind(&LoopNotExpected);
-    mov(EmitSize, Dst, TMP2.R());
-    // exclusive monitor needs to be cleared here
-    // Might have hit the case where ldaxr was hit but stlxr wasn't
-    clrex();
-    (void)Bind(&LoopExpected);
+    sub(EmitSize, TMP3, TMP2, Expected);
   }
+  (void)cbnz(EmitSize, TMP3, &LoopNotExpected);
+  stlxr(SubEmitSize, TMP3, Desired, MemSrc);
+  (void)cbnz(ARMEmitter::Size::i32Bit, TMP3, &LoopTop);
+  (void)b(&LoopDone);
+  (void)Bind(&LoopNotExpected);
+  stlxr(SubEmitSize, TMP3, TMP2, MemSrc);
+  (void)cbnz(ARMEmitter::Size::i32Bit, TMP3, &LoopTop);
+  (void)Bind(&LoopDone);
+  dmb(ARMEmitter::BarrierScope::ISH);
+  mov(EmitSize, Dst, TMP2.R());
 }
 
 DEF_OP(AtomicSwap) {

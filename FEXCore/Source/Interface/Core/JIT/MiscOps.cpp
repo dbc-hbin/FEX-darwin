@@ -154,7 +154,8 @@ DEF_OP(SetRoundingMode) {
   // and extract
   lsr(ARMEmitter::Size::i32Bit, TMP2, TMP2, 30);
 
-  mrs(TMP1, ARMEmitter::SystemRegister::FPCR);
+  mrs(TMP3, ARMEmitter::SystemRegister::FPCR);
+  mov(ARMEmitter::Size::i64Bit, TMP1, TMP3);
 
   // vixl simulator doesn't support anything beyond ties-to-even rounding
   if (CTX->Config.DisableVixlIndirectCalls) [[likely]] {
@@ -171,8 +172,13 @@ DEF_OP(SetRoundingMode) {
     bfxil(ARMEmitter::Size::i64Bit, TMP1, MXCSR, 6, 1);
   }
 
-  // Now save the new FPCR
+  // Now save the new FPCR, skipping the write when nothing changed: a same-value FPCR write still costs
+  // several times more than this flag-neutral compare.
+  ARMEmitter::ForwardLabel Unchanged;
+  eor(ARMEmitter::Size::i64Bit, TMP2, TMP1, TMP3);
+  (void)cbz(ARMEmitter::Size::i64Bit, TMP2, &Unchanged);
   msr(ARMEmitter::SystemRegister::FPCR, TMP1);
+  (void)Bind(&Unchanged);
 }
 
 DEF_OP(PushRoundingMode) {
@@ -199,13 +205,25 @@ DEF_OP(PushRoundingMode) {
     orr(ARMEmitter::Size::i64Bit, TMP1, TMP1, (Op->RoundMode == 2 ? 1 : 2) << 22);
   }
 
-  // Now save the new FPCR
+  // Now save the new FPCR, unless the requested mode is already active.
+  ARMEmitter::ForwardLabel Unchanged;
+  eor(ARMEmitter::Size::i64Bit, TMP2, TMP1, Dest);
+  (void)cbz(ARMEmitter::Size::i64Bit, TMP2, &Unchanged);
   msr(ARMEmitter::SystemRegister::FPCR, TMP1);
+  (void)Bind(&Unchanged);
 }
 
 DEF_OP(PopRoundingMode) {
   auto Op = IROp->C<IR::IROp_PopRoundingMode>();
-  msr(ARMEmitter::SystemRegister::FPCR, GetReg(Op->FPCR));
+  auto FPCR = GetReg(Op->FPCR);
+
+  // Skip the restore when PushRoundingMode did not change FPCR.
+  ARMEmitter::ForwardLabel Unchanged;
+  mrs(TMP1, ARMEmitter::SystemRegister::FPCR);
+  eor(ARMEmitter::Size::i64Bit, TMP1, TMP1, FPCR);
+  (void)cbz(ARMEmitter::Size::i64Bit, TMP1, &Unchanged);
+  msr(ARMEmitter::SystemRegister::FPCR, FPCR);
+  (void)Bind(&Unchanged);
 }
 
 DEF_OP(Print) {
@@ -372,7 +390,9 @@ DEF_OP(RDRAND) {
 }
 
 DEF_OP(Yield) {
-  yield();
+  // YIELD is a nop on Apple cores. Throttle polling without waiting for an event
+  // that PAUSE, unlike an exclusive-load spin loop, has no way to arrange.
+  isb();
 }
 
 DEF_OP(MonoBackpatcherWrite) {

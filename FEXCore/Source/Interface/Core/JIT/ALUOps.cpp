@@ -756,7 +756,88 @@ DEF_OP(PDep) {
       bdep(ARMEmitter::SubRegSize::i64Bit, VTMP1.Z(), VTMP1.Z(), VTMP2.Z());
       umov<ARMEmitter::SubRegSize::i64Bit>(Dest, VTMP1, 0);
     }
-  } else {
+    return;
+  }
+
+  ARMEmitter::ForwardLabel Loop;
+  ARMEmitter::ForwardLabel Done;
+
+  if (CTX->HostFeatures.SupportsPMULL_128Bit && CTX->HostFeatures.SupportsCSSC) {
+    // Branchless expand from Hacker's Delight 7-5. The mask half is the PEXT compress rounds
+    // (prefix-XOR via carry-less multiply with all-ones), recording the moved-bit mask of each
+    // round; the value is then expanded by replaying those masks in reverse with left shifts.
+    // The recorded masks do not fit in the scratch registers, so they go to a small host stack
+    // frame. It costs a constant ~75 instructions, so masks with few set bits still take the
+    // loop below. In guest measurements on M5 Pro the two break even at about 13 set bits for
+    // 64-bit and 11 for 32-bit.
+    // Only non-flag-setting instructions are used, so NZCV is untouched.
+    const uint32_t LoopMaxPopCount = EmitSize == ARMEmitter::Size::i32Bit ? 11 : 13;
+    const auto MoveKeep = TMP1.R(); // mk, then the expanded value once the mask rounds are done
+    const auto MaskCur = TMP2.R();
+    const auto MoveVal = TMP3.R();
+    const auto Temp = TMP4.R();
+    const auto Prefix = VTMP1;
+    const auto AllOnes = VTMP2;
+    const int Rounds = EmitSize == ARMEmitter::Size::i32Bit ? 5 : 6;
+    constexpr uint32_t FrameSize = 48;
+
+    cnt(EmitSize, TMP1, OrigMask);
+    sub(ARMEmitter::Size::i64Bit, TMP1, TMP1, LoopMaxPopCount);
+    (void)tbnz(TMP1, 63, &Loop);
+
+    sub(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::rsp, ARMEmitter::Reg::rsp, FrameSize);
+    movi(ARMEmitter::SubRegSize::i64Bit, AllOnes.Q(), ~0ULL);
+    mvn(EmitSize, MoveKeep, OrigMask);
+    lsl(EmitSize, MoveKeep, MoveKeep, 1);
+    mov(EmitSize, MaskCur, OrigMask);
+
+    for (int Round = 0; Round < Rounds; ++Round) {
+      const int Shift = 1 << Round;
+      // A 32-bit move zero-extends, and the upper half of the product is discarded by the
+      // 32-bit operations that follow.
+      if (EmitSize == ARMEmitter::Size::i32Bit) {
+        fmov(ARMEmitter::Size::i32Bit, Prefix.S(), MoveKeep.W());
+      } else {
+        fmov(ARMEmitter::Size::i64Bit, Prefix.D(), MoveKeep.X());
+      }
+      pmull(ARMEmitter::SubRegSize::i128Bit, Prefix.D(), Prefix.D(), AllOnes.D());
+      if (EmitSize == ARMEmitter::Size::i32Bit) {
+        fmov(ARMEmitter::Size::i32Bit, MoveVal.W(), Prefix.S());
+      } else {
+        fmov(ARMEmitter::Size::i64Bit, MoveVal.X(), Prefix.D());
+      }
+      if (Round != Rounds - 1) {
+        bic(EmitSize, MoveKeep, MoveKeep, MoveVal);
+      }
+      and_(EmitSize, MoveVal, MoveVal, MaskCur);
+      if (Round != Rounds - 1) {
+        eor(EmitSize, MaskCur, MaskCur, MoveVal);
+        orr(EmitSize, MaskCur, MaskCur, MoveVal, ARMEmitter::ShiftType::LSR, Shift);
+        str(MoveVal.X(), ARMEmitter::Reg::rsp, Round * 8);
+      }
+    }
+
+    // Expand, last round first. The last round's moved-bit mask is still in MoveVal.
+    const auto Value = MoveKeep;
+    mov(ARMEmitter::Size::i64Bit, Value, OrigInput);
+    for (int Round = Rounds - 1; Round >= 0; --Round) {
+      const int Shift = 1 << Round;
+      if (Round != Rounds - 1) {
+        ldr(MoveVal.X(), ARMEmitter::Reg::rsp, Round * 8);
+      }
+      lsl(EmitSize, Temp, Value, Shift);
+      bic(EmitSize, Value, Value, MoveVal);
+      and_(EmitSize, Temp, Temp, MoveVal);
+      orr(EmitSize, Value, Value, Temp);
+    }
+    add(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::rsp, ARMEmitter::Reg::rsp, FrameSize);
+    // Dest may alias the input or mask, so it is written last.
+    and_(EmitSize, Dest, Value, OrigMask);
+    (void)b(&Done);
+    (void)Bind(&Loop);
+  }
+
+  {
     // PDep implementation follows the ideas from
     // http://0x80.pl/articles/pdep-soft-emu.html ... Basically, iterate the *set*
     // bits only, which will be faster than the naive implementation as long as
@@ -777,7 +858,6 @@ DEF_OP(PDep) {
     const auto T1 = TMP4.R();
 
     ARMEmitter::BackwardLabel NextBit;
-    ARMEmitter::ForwardLabel Done;
 
     // First, copy the input/mask, since we'll be clobbering. Copy as 64-bit to
     // make this 0-uop on Firestorm.
@@ -832,14 +912,73 @@ DEF_OP(PExt) {
       bext(ARMEmitter::SubRegSize::i64Bit, VTMP1.Z(), VTMP1.Z(), VTMP2.Z());
       umov<ARMEmitter::SubRegSize::i64Bit>(Dest, VTMP1, 0);
     }
-  } else {
+    return;
+  }
+
+  ARMEmitter::ForwardLabel Loop;
+  ARMEmitter::ForwardLabel Done;
+  const bool Branchless = CTX->HostFeatures.SupportsPMULL_128Bit && CTX->HostFeatures.SupportsCSSC;
+
+  if (Branchless) {
+    // Branchless compress from Hacker's Delight 7-4, with the prefix-XOR of each round computed
+    // by a carry-less multiply with all-ones. Each round moves every selected bit right by
+    // 1, 2, 4, ... positions according to the parity of the zero mask bits below it.
+    // It costs a constant ~60 instructions, so masks with few set bits still take the loop
+    // below. In guest measurements on M5 Pro the two break even at about 10 set bits for
+    // 64-bit and 8 for 32-bit.
+    // Only non-flag-setting instructions are used, so NZCV is untouched.
+    const uint32_t LoopMaxPopCount = EmitSize == ARMEmitter::Size::i32Bit ? 8 : 10;
+    const auto MoveKeep = TMP1.R();  // mk: bits whose zero-count parity is still pending
+    const auto MaskCur = TMP2.R();   // m, compressed alongside the value
+    const auto MoveVal = TMP3.R();   // mv
+    const auto Prefix = VTMP1;
+    const auto AllOnes = VTMP2;
+    const auto RegSize = EmitSize == ARMEmitter::Size::i32Bit ? 32 : 64;
+
+    cnt(EmitSize, TMP1, Mask);
+    sub(ARMEmitter::Size::i64Bit, TMP1, TMP1, LoopMaxPopCount);
+    (void)tbnz(TMP1, 63, &Loop);
+
+    movi(ARMEmitter::SubRegSize::i64Bit, AllOnes.Q(), ~0ULL);
+    mvn(EmitSize, MoveKeep, Mask);
+    lsl(EmitSize, MoveKeep, MoveKeep, 1);
+    mov(EmitSize, MaskCur, Mask);
+    // Dest may alias Input or Mask, so it is written only after both are consumed.
+    and_(EmitSize, Dest, Input, Mask);
+
+    for (int Shift = 1; Shift < RegSize; Shift <<= 1) {
+      // mp = prefix_xor(mk). A 32-bit move zero-extends, and the upper half of the product
+      // is discarded by the 32-bit operations that follow.
+      if (EmitSize == ARMEmitter::Size::i32Bit) {
+        fmov(ARMEmitter::Size::i32Bit, Prefix.S(), MoveKeep.W());
+      } else {
+        fmov(ARMEmitter::Size::i64Bit, Prefix.D(), MoveKeep.X());
+      }
+      pmull(ARMEmitter::SubRegSize::i128Bit, Prefix.D(), Prefix.D(), AllOnes.D());
+      if (EmitSize == ARMEmitter::Size::i32Bit) {
+        fmov(ARMEmitter::Size::i32Bit, MoveVal.W(), Prefix.S());
+      } else {
+        fmov(ARMEmitter::Size::i64Bit, MoveVal.X(), Prefix.D());
+      }
+      bic(EmitSize, MoveKeep, MoveKeep, MoveVal);
+      and_(EmitSize, MoveVal, MoveVal, MaskCur);
+      eor(EmitSize, MaskCur, MaskCur, MoveVal);
+      orr(EmitSize, MaskCur, MaskCur, MoveVal, ARMEmitter::ShiftType::LSR, Shift);
+      and_(EmitSize, MoveVal, Dest, MoveVal);
+      eor(EmitSize, Dest, Dest, MoveVal);
+      orr(EmitSize, Dest, Dest, MoveVal, ARMEmitter::ShiftType::LSR, Shift);
+    }
+    (void)b(&Done);
+    (void)Bind(&Loop);
+  }
+
+  {
     const auto MaskReg = TMP1;
     const auto BitReg = TMP2;
     const auto ValueReg = TMP3;
 
     ARMEmitter::ForwardLabel EarlyExit;
     ARMEmitter::BackwardLabel NextBit;
-    ARMEmitter::ForwardLabel Done;
 
     (void)cbz(EmitSize, Mask, &EarlyExit);
     mov(EmitSize, MaskReg, Mask);
@@ -1214,7 +1353,7 @@ DEF_OP(UDiv) {
     // TODO: #DE
     (void)cbz(EmitSize, Divisor, &Only64Bit);
 
-    // Long divide
+    // Long divide. Quotient and Remainder never alias the sources, and nothing here can fault.
     {
       mrs(TMP1, ARMEmitter::SystemRegister::NZCV);
       str(TMP1.W(), STATE.R(), offsetof(FEXCore::Core::CpuStateFrame, State.flags[X86State::RFLAG_NZCV_LOC]));

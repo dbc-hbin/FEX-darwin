@@ -254,7 +254,6 @@ no_peephole:
   Ref Src = LoadSourceFPR(Op, Op->Src[0], Op->Flags);
   // Hardcoded to XMM0
   auto XMM0 = LoadXMMRegister(0);
-
   auto ABCD = shuffle_abcd(Dest, Src);
   auto EFGH = shuffle_efgh(Dest, Src);
 

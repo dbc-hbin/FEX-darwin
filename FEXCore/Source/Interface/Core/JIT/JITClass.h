@@ -109,10 +109,25 @@ private:
     uint8_t PatchSiteSize = 0;
   };
   fextl::vector<PendingJumpThunk> PendingJumpThunks;
+  // 32-byte {GuestTarget, HostTarget, SiteInfo, PinnedGuest} inline cache slots placed in the block tail, see ExitFunction.
+  struct PendingInlineCacheSlot {
+    ARMEmitter::ForwardLabel Label;
+    ARMEmitter::ForwardLabel Trampoline; // Calls only: `br TMP2`, the target of the unpatched hit site.
+    uint64_t SiteAddress;
+    bool Call;
+    // Calls only: the miss path is emitted out of line in the block tail so a hit runs straight through to the site.
+    ARMEmitter::ForwardLabel Miss;
+    uint32_t RipReg;
+    uint32_t CallReturnAddressReg;
+    bool HasReturnBlock;
+    ARMEmitter::BackwardLabel CallReturn; // After the hit site, where the miss path rejoins.
+  };
+  fextl::vector<PendingInlineCacheSlot> PendingInlineCacheSlots;
 
   Utils::PoolBufferWithTimedRetirement<uint8_t*, 5000, 500> TempCodeBufferAllocator;
 
   static uint64_t ExitFunctionLink(FEXCore::Core::CpuStateFrame* Frame, FEXCore::Context::ExitFunctionLinkData* Record);
+  static uint64_t InlineCacheFill(FEXCore::Core::CpuStateFrame* Frame, uint64_t* Slot);
 
   [[nodiscard]]
   ARMEmitter::Register GetReg(IR::PhysicalRegister Reg) const {
@@ -418,6 +433,21 @@ private:
     uint32_t End;
   };
 
+  // Pushes a call-ret stack entry {guest return address, HostReturn}, or an empty entry when the call has no return
+  // block. Must match the `ldp` pop in ExitFunction's Return path.
+  void EmitCallRetPush(bool HasReturnBlock, ARMEmitter::XRegister GuestReturn, ARMEmitter::ForwardLabel* HostReturn) {
+    if (HasReturnBlock) {
+      (void)adr(TMP1, HostReturn);
+      stp<ARMEmitter::IndexType::PRE>(GuestReturn, TMP1, REG_CALLRET_SP, -0x10);
+    } else {
+      stp<ARMEmitter::IndexType::PRE>(ARMEmitter::XReg::zr, ARMEmitter::XReg::zr, REG_CALLRET_SP, -0x10);
+    }
+  }
+
+  // L1 lookup of Rip: leaves the host target in TMP2 and branches to Found, or falls through with TMP2 set to the
+  // dispatcher and State.rip set to Rip. Uses TMP1-TMP3; sub+cbz preserves flags.
+  void EmitL1Lookup(ARMEmitter::XRegister Rip, ARMEmitter::ForwardLabel* Found);
+
   void EmitLinkedBranch(uint64_t GuestRIP, bool Call, uint64_t PatchSiteAddress = 0, uint8_t PatchSiteSize = 0) {
     PendingJumpThunks.push_back({GetCursorAddress<uint64_t>(), GuestRIP, {}, PatchSiteAddress, PatchSiteSize});
     auto& Thunk = PendingJumpThunks.back();
@@ -709,6 +739,7 @@ private:
                   ARMEmitter::Register Divisor);
 
   void EmitSuspendInterruptCheck();
+  void EmitSuspendCheckedBackwardBranch(ARMEmitter::BiDirectionalLabel* Target);
 
   void EmitEntryPoint(ARMEmitter::BackwardLabel& HeaderLabel, bool CheckTF);
 
