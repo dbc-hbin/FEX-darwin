@@ -243,7 +243,11 @@ check_cxx_source_compiles(
   HAS_CLANG_PRESERVE_ALL)
 unset(CMAKE_REQUIRED_FLAGS)
 if (HAS_CLANG_PRESERVE_ALL)
-  if (MINGW)
+  # Release clang (through at least 23.1.4) miscompiles preserve_all on Windows
+  # AArch64: callee saves land below SP, or locals overlap callee-save slots.
+  # Only enable it with a toolchain known to carry the frame-layout fix.
+  option(FEX_MINGW_PRESERVE_ALL "Use preserve_all with a fixed Windows AArch64 clang" OFF)
+  if (MINGW AND NOT FEX_MINGW_PRESERVE_ALL)
     message(STATUS "Ignoring broken clang::preserve_all support")
     set(HAS_CLANG_PRESERVE_ALL FALSE)
   else()

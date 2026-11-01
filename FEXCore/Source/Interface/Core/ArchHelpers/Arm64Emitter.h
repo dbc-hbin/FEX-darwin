@@ -172,6 +172,10 @@ protected:
     // with certain canned values that accelerate some operations. Will (obviously)
     // not load predicates, even if set to true, on host systems that do not support SVE.
     bool SetPredRegs {};
+
+    // Whether or not to set the guest AFP bits (NEP, AH and optionally FIZ) in FPCR.
+    // Only skippable when the matching spill also left FPCR untouched.
+    bool SetAFP {true};
   };
   void FillSpecialRegs(ARMEmitter::Register TmpReg, ARMEmitter::Register TmpReg2, const FillSpecialRegsOptions& Options);
 
@@ -184,6 +188,8 @@ protected:
     uint32_t FPRSpillMask {~0U};
     bool FPRs {true};
     bool NZCV {true};
+    // Clear the guest AFP bits in FPCR. Only skippable when the callee executes no FP arithmetic.
+    bool FPCR {true};
   };
 
   struct FillStaticRegOptions final {
@@ -193,6 +199,8 @@ protected:
     uint32_t FPRFillMask {~0U};
     bool FPRs {true};
     bool NZCV {true};
+    // Must match the FPCR option of the paired spill.
+    bool FPCR {true};
   };
 
   void SpillStaticRegs(ARMEmitter::Register TmpReg, SpillStaticRegOptions Options);
@@ -240,26 +248,27 @@ protected:
   // Callee Saved:
   // - X9-X15, X19-X29, X31
   // - Low 128-bits of v8-v31
-  size_t SpillForPreserveAllABICall(ARMEmitter::Register TmpReg, bool FPRs = true);
-  void FillForPreserveAllABICall(bool FPRs = true);
+  size_t SpillForPreserveAllABICall(ARMEmitter::Register TmpReg, bool FPRs = true, bool FPCR = true);
+  void FillForPreserveAllABICall(bool FPRs = true, bool FPCR = true);
 
-  size_t SpillForABICall(bool SupportsPreserveAllABI, ARMEmitter::Register TmpReg, bool FPRs = true) {
+  size_t SpillForABICall(bool SupportsPreserveAllABI, ARMEmitter::Register TmpReg, bool FPRs = true, bool FPCR = true) {
     if (SupportsPreserveAllABI) {
-      return SpillForPreserveAllABICall(TmpReg, FPRs);
+      return SpillForPreserveAllABICall(TmpReg, FPRs, FPCR);
     } else {
       SpillStaticRegs(TmpReg, {
                                 .FPRs = FPRs,
+                                .FPCR = FPCR,
                               });
       return PushDynamicRegs(TmpReg);
     }
   }
 
-  void FillForABICall(bool SupportsPreserveAllABI, bool FPRs = true) {
+  void FillForABICall(bool SupportsPreserveAllABI, bool FPRs = true, bool FPCR = true) {
     if (SupportsPreserveAllABI) {
-      FillForPreserveAllABICall(FPRs);
+      FillForPreserveAllABICall(FPRs, FPCR);
     } else {
       PopDynamicRegs();
-      FillStaticRegs({.FPRs = FPRs});
+      FillStaticRegs({.FPRs = FPRs, .FPCR = FPCR});
     }
   }
 

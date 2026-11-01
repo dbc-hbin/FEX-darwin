@@ -430,6 +430,16 @@ public:
 
   void ReplaceNodeArgument(Ref Node, uint8_t Arg, Ref NewArg);
 
+  // Nodes are bump-allocated, so two counts bracket every node emitted in between,
+  // including nodes that were later unlinked.
+  size_t GetAllocatedNodeCount() const {
+    return DualListData.ListSize() / sizeof(OrderedNode);
+  }
+  IROps GetAllocatedNodeOp(size_t Index) const {
+    const auto* Node = reinterpret_cast<const OrderedNode*>(DualListData.ListBegin()) + Index;
+    return Node->Op(DualListData.DataBegin())->Op;
+  }
+
   void Remove(Ref Node);
   void RemovePostRA(Ref Node);
 

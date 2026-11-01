@@ -175,17 +175,68 @@ void OpDispatchBuilder::SHA256RNDS2Op(OpcodeArgs) {
     return _VRev64(OpSize::i128Bit, OpSize::i32Bit, Tmp);
   };
 
+  // ARM64 SHA256H/SHA256H2 run four rounds; x86 SHA256RNDS2 runs two. Lanes 2-3 of the
+  // ARM64 output hold the state after rounds 1-2, which only consume key lanes 0-1, so the
+  // full xmm0 can be passed as the key. Lanes 0-1 then hold rounds 3-4 using key lanes 2-3.
+  //
+  // That lets us fold the OpenSSL/Intel idiom:
+  //   sha256rnds2 X, Y
+  //   pshufd xmm0, xmm0, 0xe (or psrldq xmm0, 8)
+  //   sha256rnds2 Y, X
+  // The second instruction is exactly rounds 3-4 of the first instruction's ARM64 result when,
+  // within the same IR block:
+  //   - the second Src (X) is the first Dest and still holds the first result,
+  //   - the second Dest (Y) is the first Src and was not written since,
+  //   - xmm0 was written exactly once since, by an 8-byte VExtr of the previous xmm0.
+  // A per-instruction SRA flush means operands are reloaded, so this tracks register writes
+  // instead of SSA identity. All tracking is reset by full register-cache flushes.
+  const bool DestIsXMM = Op->Dest.IsGPR() && Op->Dest.Data.GPR.GPR >= X86State::REG_XMM_0 && Op->Dest.Data.GPR.GPR <= X86State::REG_XMM_15;
+  const bool SrcIsXMM =
+    Op->Src[0].IsGPR() && Op->Src[0].Data.GPR.GPR >= X86State::REG_XMM_0 && Op->Src[0].Data.GPR.GPR <= X86State::REG_XMM_15;
+  const uint8_t DestReg = DestIsXMM ? Op->Dest.Data.GPR.GPR - X86State::REG_XMM_0 : 0;
+  const uint8_t SrcReg = SrcIsXMM ? Op->Src[0].Data.GPR.GPR - X86State::REG_XMM_0 : 0;
+  auto& Pending = RegCache.SHA256Rounds;
+
+  if (Pending.A && Pending.Block == GetCurrentBlock() && DestIsXMM && SrcIsXMM && SrcReg == Pending.DestReg && DestReg == Pending.SrcReg &&
+      RegCache.WriteCount[FPR0Index + SrcReg] == Pending.DestCount && RegCache.WriteCount[FPR0Index + DestReg] == Pending.SrcCount &&
+      RegCache.WriteCount[FPR0Index] == Pending.KeyCount + 1) {
+    const auto* KeyShift = GetOpHeader(WrapNode(RegCache.LastDef[FPR0Index]));
+    if (KeyShift->Op == IR::OP_VEXTR && KeyShift->Size == OpSize::i128Bit) {
+      const auto* Extr = KeyShift->C<IR::IROp_VExtr>();
+      const auto* Upper = GetOpHeader(Extr->VectorUpper);
+      if (Extr->Index * IR::OpSizeToSize(KeyShift->ElementSize) == 8 && Upper->Op == IR::OP_LOADREGISTER &&
+          Upper->C<IR::IROp_LoadRegister>()->Class == RegClass::FPR && Upper->C<IR::IROp_LoadRegister>()->Reg == 0) {
+        Ref A = Pending.A;
+        Ref B = Pending.B;
+        Pending.A = nullptr;
+        StoreResult_WithAVXInsert(VectorOpType::SSE, RegClass::FPR, Op, shuffle_efgh(A, B));
+        return;
+      }
+    }
+  }
+
   auto ABCD = shuffle_abcd(Dest, Src);
   auto EFGH = shuffle_efgh(Dest, Src);
 
-  // x86 uses only the bottom 64-bits of the key, so duplicate to match ARM64 semantics.
-  auto Key = _VDupElement(OpSize::i128Bit, OpSize::i64Bit, XMM0, 0);
-
-  auto A = _VSha256H(ABCD, EFGH, Key);
-  auto B = _VSha256H2(EFGH, ABCD, Key);
+  auto A = _VSha256H(ABCD, EFGH, XMM0);
+  auto B = _VSha256H2(EFGH, ABCD, XMM0);
   auto Result = shuffle_abcd(A, B);
 
   StoreResult_WithAVXInsert(VectorOpType::SSE, RegClass::FPR, Op, Result);
+
+  // Record this instruction as a possible first half. Aliased operands or xmm0 operands
+  // would make the second half's inputs differ from what the fold assumes.
+  Pending.A = nullptr;
+  if (DestIsXMM && SrcIsXMM && DestReg != SrcReg && DestReg != 0 && SrcReg != 0) {
+    Pending.A = A;
+    Pending.B = B;
+    Pending.Block = GetCurrentBlock();
+    Pending.DestReg = DestReg;
+    Pending.SrcReg = SrcReg;
+    Pending.DestCount = RegCache.WriteCount[FPR0Index + DestReg];
+    Pending.SrcCount = RegCache.WriteCount[FPR0Index + SrcReg];
+    Pending.KeyCount = RegCache.WriteCount[FPR0Index];
+  }
 }
 
 void OpDispatchBuilder::AESImcOp(OpcodeArgs, bool IsAVX) {

@@ -8,18 +8,38 @@ upstream FEX notices are retained in [LICENSE.upstream](LICENSE.upstream).
 ## Darwin patches
 
 - Shared-data reads: emulate relocated `KUSER_SHARED_DATA` loads, including REP-copy writeback.
-- JIT write scopes: restore nested Darwin JIT write-protection state.
+- JIT write scopes: restore nested Darwin JIT write-protection state, toggled inline from the commpage after a startup self-test against Wine's unix call.
 - Native JIT allocation: use Wine's Darwin executable-memory allocator and 16KB PE alignment.
 - WoW64 guest window: translate 32-bit guest addresses; core adapted from [willfaust/FEX PR #2](https://github.com/willfaust/FEX/pull/2) (MIT).
 - WoW64 integration: preserve guest pointer identity, fault-safe PUSH state and whole-process code invalidation.
 - Call/return guards: use 16KB guard pages on Darwin.
 - Fault/context correctness: retain REP/gather progress, honor XRSTOR requests and preserve extended state through paired Wine APC/thread-context paths.
+- String instructions: honor address-sized REP counts and LODS source-segment overrides, reject multi-byte WoW64 operands crossing the 4GiB guest window, and distinguish ES access violations from SS stack faults.
 
 Selected upstream backports add thread-termination fixes, PCMPXSTRX lowering and disk-cache optimizations.
 Local cache fixes cover address translation, locking, size limits, retry after failure/eviction and Unicode cleanup.
 Disk caching is opt-in; the memory LRU defaults to 0 bytes and the main-file cap to 1GiB, excluding the index.
 Original patches, upstream commit IDs and extraction hashes are in [Darwin/provenance.json](Darwin/provenance.json).
 The patches are already integrated; do not apply them again.
+
+## Current validation
+
+The current integrated tree passes 56 native ARM64 Wine runs, with loaded emulator DLL hashes
+checked against the build. REP coverage includes 31,247 x64 and 26,053 x86 cases in each of
+the default, memcpy-TSO and vector-TSO modes. The guest-window boundary probe passes 37 cases
+in both x87 precision modes. Regression fixtures and detailed run artifacts remain local.
+
+The string fixes were checked against the previous DLL: x64 address-size-overridden
+SCAS, CMPS and LODS incorrectly accessed memory with ECX zero and RCX's upper half nonzero;
+the corrected DLL performs no access. Positive-count x64 addr32 SCAS/CMPS is not directly
+covered because this Wine environment cannot allocate below 4GiB; GS LODS covers
+positive-count addr32 execution. The new 4GiB boundary cases check exception metadata,
+registers and memory, but do not establish fault-time flags or restart behavior.
+These probes are not a new game-compatibility or performance acceptance run.
+
+Translated-code cache namespace `0xA617` prevents reuse of code generated before these
+correctness fixes. Independent review found no actionable defect in the bounded string
+fixes; it does not constitute a fresh audit of every earlier optimization.
 
 ## Build and verify
 

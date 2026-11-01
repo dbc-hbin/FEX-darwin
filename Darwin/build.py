@@ -76,6 +76,9 @@ def main() -> int:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--llvm-mingw", type=Path, default=Path("/opt/llvm-mingw-20260616-ucrt-macos-universal"))
     parser.add_argument("--jobs", type=int, default=8)
+    parser.add_argument("--preserve-all", action="store_true",
+                        help="enable preserve_all fallbacks; requires a clang with the Windows AArch64 "
+                             "callee-save frame-layout fix (stock llvm-mingw miscompiles it)")
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[1]
     output, source, compiler = args.output.resolve(), root, args.llvm_mingw.resolve()
@@ -161,6 +164,7 @@ def main() -> int:
                  "-DCMAKE_SHARED_LINKER_FLAGS=-Wl,--section-alignment=16384",
                  "-DENABLE_JEMALLOC_GLIBC_ALLOC=False", "-DTUNE_CPU=none", "-DENABLE_CCACHE=False",
                  "-DENABLE_GUEST_WINDOW=" + ("True" if variant == "wow64" else "False"),
+                 "-DFEX_MINGW_PRESERVE_ALL=" + ("True" if args.preserve_all else "False"),
                  "-DPython_EXECUTABLE=" + sys.executable], variant + "-configure")
             run(["cmake", "--build", str(build), "--target", target, "--parallel", str(args.jobs)], variant + "-build")
             original = build / "Bin" / ("lib" + target + ".dll")

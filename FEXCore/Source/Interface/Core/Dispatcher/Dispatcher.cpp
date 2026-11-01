@@ -222,11 +222,13 @@ void Dispatcher::EmitDispatcher() {
       // If we've made it here then we have a real compiled block
       {
         // update L1 cache
-        ldp<ARMEmitter::IndexType::OFFSET>(TMP1, TMP2, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.L1Pointer));
-
-        // Calculate (tmp1 + ((ripreg & L1_ENTRIES_MASK) << 4)) for the address
-        // L1Mask is pre-shifted.
-        and_(ARMEmitter::Size::i64Bit, TMP2, TMP2, RipReg.R(), ARMEmitter::ShiftType::LSL, FEXCore::ilog2(sizeof(LookupCache::LookupCacheEntry)));
+        // Calculate (L1Pointer + (LookupCache::L1Index(ripreg) << 4)) for the address
+        // L1Mask is pre-shifted, so the scaled hashed index is ((ripreg ^ (ripreg << 4)) & L1Mask).
+        // TMP4 holds the host code, so no scratch remains for a paired load here.
+        ldr(TMP1, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.L1Mask));
+        eor(ARMEmitter::Size::i64Bit, TMP2, RipReg.R(), RipReg.R(), ARMEmitter::ShiftType::LSL, LookupCache::L1_HASH_SHIFT);
+        and_(ARMEmitter::Size::i64Bit, TMP2, TMP2, TMP1);
+        ldr(TMP1, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.L1Pointer));
         add(TMP1, TMP1, TMP2);
 
         stp<ARMEmitter::IndexType::OFFSET>(TMP4, RipReg, TMP1);
@@ -291,6 +293,33 @@ void Dispatcher::EmitDispatcher() {
       mov(ARMEmitter::XReg::x1, ARMEmitter::XReg::lr);
 
       ldr(ARMEmitter::XReg::x2, STATE_PTR(CpuStateFrame, Pointers.ExitFunctionLink));
+      if (!CTX->Config.DisableVixlIndirectCalls) [[unlikely]] {
+        GenerateIndirectRuntimeCall<uintptr_t, void*, void*>(ARMEmitter::Reg::r2);
+      } else {
+        blr(ARMEmitter::Reg::r2);
+      }
+
+      if (!TMP_ABIARGS) {
+        mov(TMP1, ARMEmitter::XReg::x0);
+      }
+
+      FillStaticRegs();
+    });
+
+    br(TMP1);
+  }
+
+  {
+    // Entered like a block entry from an indirect branch whose per-callsite inline cache slot is empty.
+    // State.rip holds the target, TMP4 the slot. Returns to the target's host code or the dispatcher.
+    InlineCacheFillerAddress = GetCursorAddress<uint64_t>();
+    EmitSignalGuardedRegion([&]() {
+      SpillStaticRegs(TMP1);
+
+      mov(ARMEmitter::XReg::x0, STATE);
+      mov(ARMEmitter::XReg::x1, TMP4);
+
+      ldr(ARMEmitter::XReg::x2, STATE_PTR(CpuStateFrame, Pointers.InlineCacheFill));
       if (!CTX->Config.DisableVixlIndirectCalls) [[unlikely]] {
         GenerateIndirectRuntimeCall<uintptr_t, void*, void*>(ARMEmitter::Reg::r2);
       } else {
@@ -434,6 +463,26 @@ void Dispatcher::EmitDispatcher() {
   }
 
   {
+    // Faultless synchronous signal.
+    // Some games abuse SIGILL/SIGTRAP/SIGSEGV heavily and the fault overhead is visible.
+    // Instead of double faulting, clean up state and jump to the frontend to handle this.
+    // `FEXCore::Core::CpuStateFrame::SynchronousFaultData` needs to be setup at this point.
+    GuestSignal_SynchronousFault = GetCursorAddress<uint64_t>();
+
+    SpillStaticRegs(TMP1);
+
+    ldr(ARMEmitter::XReg::x0, &l_CTX);
+    mov(ARMEmitter::XReg::x1, STATE);
+    ldr(ARMEmitter::XReg::x2, STATE_PTR(CpuStateFrame, Pointers.SynchronousExceptionHandler));
+
+    if (!CTX->Config.DisableVixlIndirectCalls) [[unlikely]] {
+      GenerateIndirectRuntimeCall<void, void*, void*>(ARMEmitter::Reg::r2);
+    } else {
+      br(ARMEmitter::Reg::r2);
+    }
+  }
+
+  {
     ThreadPauseHandlerAddressSpillSRA = GetCursorAddress<uint64_t>();
     SpillStaticRegs(TMP1);
 
@@ -507,44 +556,6 @@ void Dispatcher::EmitDispatcher() {
     // Now go back to the regular dispatcher loop
     (void)b(&LoopTop);
   }
-
-  auto EmitLongALUOpHandler = [&](auto R, auto Offset) {
-    auto Address = GetCursorAddress<uint64_t>();
-
-    PushDynamicRegs(TMP4);
-    SpillStaticRegs(TMP4);
-
-    if (!TMP_ABIARGS) {
-      mov(ARMEmitter::XReg::x0, TMP1);
-      mov(ARMEmitter::XReg::x1, TMP2);
-      mov(ARMEmitter::XReg::x2, TMP3);
-    }
-
-    ldr(ARMEmitter::XReg::x3, R, Offset);
-    if (!CTX->Config.DisableVixlIndirectCalls) [[unlikely]] {
-      GenerateIndirectRuntimeCall<__uint128_t, uint64_t, uint64_t, uint64_t>(ARMEmitter::Reg::r3);
-    } else {
-      blr(ARMEmitter::Reg::r3);
-    }
-
-    // Result is now in x0, x1
-    if (!TMP_ABIARGS) {
-      mov(TMP1, ARMEmitter::XReg::x0);
-      mov(TMP2, ARMEmitter::XReg::x1);
-    }
-
-    FillStaticRegs();
-
-    // Fix the stack and any values that were stepped on
-    PopDynamicRegs();
-
-    // Go back to our code block
-    ret();
-    return Address;
-  };
-
-  LUDIVHandlerAddress = EmitLongALUOpHandler(STATE_PTR(CpuStateFrame, Pointers.LUDIV));
-  LDIVHandlerAddress = EmitLongALUOpHandler(STATE_PTR(CpuStateFrame, Pointers.LDIV));
 
   EmitF64Sin();
   EmitF64Cos();
@@ -2194,12 +2205,16 @@ uint64_t Dispatcher::GenerateABICall(FallbackABI ABI) {
   constexpr static auto VABI1 = ARMEmitter::VReg::v0;
   constexpr static auto VABI2 = ARMEmitter::VReg::v1;
 
+  // Only the F64 handlers call host libm. The F80 handlers use integer-only SoftFloat/cephes and the string compare
+  // handlers use integer SIMD, so they can run with the guest AFP bits still set in FPCR and skip both FPCR writes.
+  const bool FPCR = ABI == FABI_F64_F64_PTR || ABI == FABI_F64_F64_F64_PTR || ABI == FABI_F64x2_F64_PTR;
+
   auto FillF80x2Result = [&]() {
     if (!TMP_ABIARGS) {
       mov(VTMP1.Q(), VABI1.Q());
       mov(VTMP2.Q(), VABI2.Q());
     }
-    FillForABICall(CTX->HostFeatures.SupportsPreserveAllABI, true);
+    FillForABICall(CTX->HostFeatures.SupportsPreserveAllABI, true, FPCR);
   };
 
   auto FillF64x2Result = [&]() {
@@ -2207,49 +2222,49 @@ uint64_t Dispatcher::GenerateABICall(FallbackABI ABI) {
       fmov(VTMP1.D(), VABI1.D());
       fmov(VTMP2.D(), VABI2.D());
     }
-    FillForABICall(CTX->HostFeatures.SupportsPreserveAllABI, true);
+    FillForABICall(CTX->HostFeatures.SupportsPreserveAllABI, true, FPCR);
   };
 
   auto FillF80Result = [&]() {
     if (VTMP1 != VABI1) {
       mov(VTMP1.Q(), VABI1.Q());
     }
-    FillForABICall(CTX->HostFeatures.SupportsPreserveAllABI, true);
+    FillForABICall(CTX->HostFeatures.SupportsPreserveAllABI, true, FPCR);
   };
 
   auto FillF64Result = [&]() {
     if (!TMP_ABIARGS) {
       fmov(VTMP1.D(), VABI1.D());
     }
-    FillForABICall(CTX->HostFeatures.SupportsPreserveAllABI, true);
+    FillForABICall(CTX->HostFeatures.SupportsPreserveAllABI, true, FPCR);
   };
 
   auto FillF32Result = [&]() {
     if (!TMP_ABIARGS) {
       fmov(VTMP1.S(), VABI1.S());
     }
-    FillForABICall(CTX->HostFeatures.SupportsPreserveAllABI, true);
+    FillForABICall(CTX->HostFeatures.SupportsPreserveAllABI, true, FPCR);
   };
 
   auto FillI64Result = [&]() {
     if (!TMP_ABIARGS) {
       mov(TMP1, ARMEmitter::XReg::x0);
     }
-    FillForABICall(CTX->HostFeatures.SupportsPreserveAllABI, true);
+    FillForABICall(CTX->HostFeatures.SupportsPreserveAllABI, true, FPCR);
   };
 
   auto FillI32Result = [&]() {
     if (!TMP_ABIARGS) {
       mov(TMP1.W(), ARMEmitter::WReg::w0);
     }
-    FillForABICall(CTX->HostFeatures.SupportsPreserveAllABI, true);
+    FillForABICall(CTX->HostFeatures.SupportsPreserveAllABI, true, FPCR);
   };
 
   auto FillI16Result = [&]() {
     if (!TMP_ABIARGS) {
       mov(TMP1, ARMEmitter::XReg::x0);
     }
-    FillForABICall(CTX->HostFeatures.SupportsPreserveAllABI, true);
+    FillForABICall(CTX->HostFeatures.SupportsPreserveAllABI, true, FPCR);
   };
 
   switch (ABI) {
@@ -2287,7 +2302,7 @@ uint64_t Dispatcher::GenerateABICall(FallbackABI ABI) {
     // tmp4 (x4/x13): FallbackHandler
     // x30: return
     // vtmp1 (v0/v16): source
-    SpillForABICall(CTX->HostFeatures.SupportsPreserveAllABI, TMP3, true);
+    SpillForABICall(CTX->HostFeatures.SupportsPreserveAllABI, TMP3, true, FPCR);
 
     ldrh(ARMEmitter::WReg::w0, STATE, offsetof(FEXCore::Core::CPUState, FCW));
     if (!TMP_ABIARGS) {
@@ -2308,7 +2323,7 @@ uint64_t Dispatcher::GenerateABICall(FallbackABI ABI) {
     // tmp4 (x4/x13): FallbackHandler
     // x30: return
     // vtmp1 (v0/v16): source
-    SpillForABICall(CTX->HostFeatures.SupportsPreserveAllABI, TMP3, true);
+    SpillForABICall(CTX->HostFeatures.SupportsPreserveAllABI, TMP3, true, FPCR);
 
     ldrh(ARMEmitter::WReg::w0, STATE, offsetof(FEXCore::Core::CPUState, FCW));
     if (!TMP_ABIARGS) {
@@ -2329,7 +2344,7 @@ uint64_t Dispatcher::GenerateABICall(FallbackABI ABI) {
     // tmp4 (x4/x13): FallbackHandler
     // x30: return
     // vtmp1 (v0/v16): vector source
-    SpillForABICall(CTX->HostFeatures.SupportsPreserveAllABI, TMP3, true);
+    SpillForABICall(CTX->HostFeatures.SupportsPreserveAllABI, TMP3, true, FPCR);
 
     if (!TMP_ABIARGS) {
       fmov(VABI1.D(), VTMP1.D());
@@ -2350,7 +2365,7 @@ uint64_t Dispatcher::GenerateABICall(FallbackABI ABI) {
     // x30: return
     // vtmp1 (v0/v16): vector source 1
     // vtmp2 (v1/v17): vector source 2
-    SpillForABICall(CTX->HostFeatures.SupportsPreserveAllABI, TMP3, true);
+    SpillForABICall(CTX->HostFeatures.SupportsPreserveAllABI, TMP3, true, FPCR);
 
     if (!TMP_ABIARGS) {
       fmov(VABI1.D(), VTMP1.D());
@@ -2371,7 +2386,7 @@ uint64_t Dispatcher::GenerateABICall(FallbackABI ABI) {
     // tmp4 (x4/x13): FallbackHandler
     // x30: return
     // vtmp1 (v0/v16): source
-    SpillForABICall(CTX->HostFeatures.SupportsPreserveAllABI, TMP3, true);
+    SpillForABICall(CTX->HostFeatures.SupportsPreserveAllABI, TMP3, true, FPCR);
 
     ldrh(ARMEmitter::WReg::w0, STATE, offsetof(FEXCore::Core::CPUState, FCW));
     if (!TMP_ABIARGS) {
@@ -2392,7 +2407,7 @@ uint64_t Dispatcher::GenerateABICall(FallbackABI ABI) {
     // tmp4 (x4/x13): FallbackHandler
     // x30: return
     // vtmp1 (v0/v16): source
-    SpillForABICall(CTX->HostFeatures.SupportsPreserveAllABI, TMP3, true);
+    SpillForABICall(CTX->HostFeatures.SupportsPreserveAllABI, TMP3, true, FPCR);
 
     ldrh(ARMEmitter::WReg::w0, STATE, offsetof(FEXCore::Core::CPUState, FCW));
     if (!TMP_ABIARGS) {
@@ -2413,7 +2428,7 @@ uint64_t Dispatcher::GenerateABICall(FallbackABI ABI) {
     // tmp4 (x4/x13): FallbackHandler
     // x30: return
     // vtmp1 (v0/v16): source
-    SpillForABICall(CTX->HostFeatures.SupportsPreserveAllABI, TMP3, true);
+    SpillForABICall(CTX->HostFeatures.SupportsPreserveAllABI, TMP3, true, FPCR);
 
     ldrh(ARMEmitter::WReg::w0, STATE, offsetof(FEXCore::Core::CPUState, FCW));
     if (!TMP_ABIARGS) {
@@ -2435,7 +2450,7 @@ uint64_t Dispatcher::GenerateABICall(FallbackABI ABI) {
     // x30: return
     // vtmp1 (v0/v16): vector source 1
     // vtmp2 (v1/v17): vector source 2
-    SpillForABICall(CTX->HostFeatures.SupportsPreserveAllABI, TMP3, true);
+    SpillForABICall(CTX->HostFeatures.SupportsPreserveAllABI, TMP3, true, FPCR);
 
     ldrh(ARMEmitter::WReg::w0, STATE, offsetof(FEXCore::Core::CPUState, FCW));
     if (!TMP_ABIARGS) {
@@ -2457,7 +2472,7 @@ uint64_t Dispatcher::GenerateABICall(FallbackABI ABI) {
     // tmp4 (x4/x13): FallbackHandler
     // x30: return
     // vtmp1 (v0/v16): vector source 1
-    SpillForABICall(CTX->HostFeatures.SupportsPreserveAllABI, TMP3, true);
+    SpillForABICall(CTX->HostFeatures.SupportsPreserveAllABI, TMP3, true, FPCR);
 
     ldrh(ARMEmitter::WReg::w0, STATE, offsetof(FEXCore::Core::CPUState, FCW));
     mov(ARMEmitter::XReg::x1, STATE);
@@ -2479,7 +2494,7 @@ uint64_t Dispatcher::GenerateABICall(FallbackABI ABI) {
     // x30: return
     // vtmp1 (v0/v16): vector source 1
     // vtmp2 (v1/v17): vector source 2
-    SpillForABICall(CTX->HostFeatures.SupportsPreserveAllABI, TMP3, true);
+    SpillForABICall(CTX->HostFeatures.SupportsPreserveAllABI, TMP3, true, FPCR);
 
     ldrh(ARMEmitter::WReg::w0, STATE, offsetof(FEXCore::Core::CPUState, FCW));
     if (!TMP_ABIARGS) {
@@ -2503,7 +2518,7 @@ uint64_t Dispatcher::GenerateABICall(FallbackABI ABI) {
     // vtmp1 (v0/v16): vector source 1
     // vtmp2 (v1/v16): vector source 2
 
-    SpillForABICall(CTX->HostFeatures.SupportsPreserveAllABI, TMP3, true);
+    SpillForABICall(CTX->HostFeatures.SupportsPreserveAllABI, TMP3, true, FPCR);
 
     ldrh(ARMEmitter::WReg::w0, STATE, offsetof(FEXCore::Core::CPUState, FCW));
     mov(ARMEmitter::XReg::x1, STATE);
@@ -2526,7 +2541,7 @@ uint64_t Dispatcher::GenerateABICall(FallbackABI ABI) {
     // vtmp1 (v0/v16): vector source 1
     // vtmp2 (v1/v16): vector source 2
 
-    SpillForABICall(CTX->HostFeatures.SupportsPreserveAllABI, TMP3, true);
+    SpillForABICall(CTX->HostFeatures.SupportsPreserveAllABI, TMP3, true, FPCR);
 
     mov(ARMEmitter::XReg::x0, STATE);
     if (!TMP_ABIARGS) {
@@ -2551,7 +2566,7 @@ uint64_t Dispatcher::GenerateABICall(FallbackABI ABI) {
     // tmp2 (x1/x11): source 2
     // tmp3 (x2/x12): source 3
 
-    const size_t OriginalSPOffset = SpillForABICall(CTX->HostFeatures.SupportsPreserveAllABI, TMP4, true);
+    const size_t OriginalSPOffset = SpillForABICall(CTX->HostFeatures.SupportsPreserveAllABI, TMP4, true, FPCR);
 
     // Load the Fallback handler pointer from the stack.
     ldr(FallbackPointerReg, ARMEmitter::XReg::rsp, OriginalSPOffset);
@@ -2579,7 +2594,7 @@ uint64_t Dispatcher::GenerateABICall(FallbackABI ABI) {
     // vtmp1 (v0/v16): vector source 1
     // vtmp2 (v1/v17): vector source 2
     // tmp1 (x0/x10): source 1
-    SpillForABICall(CTX->HostFeatures.SupportsPreserveAllABI, TMP3, true);
+    SpillForABICall(CTX->HostFeatures.SupportsPreserveAllABI, TMP3, true, FPCR);
 
     if (!TMP_ABIARGS) {
       mov(VABI1.Q(), VTMP1.Q());
@@ -2619,15 +2634,15 @@ void Dispatcher::InitThreadPointers(FEXCore::Core::InternalThreadState* Thread) 
     Ptrs.DispatcherLoopTopEnterEC = AbsoluteLoopTopAddressEnterEC;
     Ptrs.DispatcherLoopTopEnterECFillSRA = AbsoluteLoopTopAddressEnterECFillSRA;
     Ptrs.ExitFunctionLinker = ExitFunctionLinkerAddress;
+    Ptrs.InlineCacheFiller = InlineCacheFillerAddress;
     Ptrs.ThreadStopHandlerSpillSRA = ThreadStopHandlerAddressSpillSRA;
     Ptrs.ThreadPauseHandlerSpillSRA = ThreadPauseHandlerAddressSpillSRA;
     Ptrs.GuestSignal_SIGILL = GuestSignal_SIGILL;
     Ptrs.GuestSignal_SIGTRAP = GuestSignal_SIGTRAP;
     Ptrs.GuestSignal_SIGSEGV = GuestSignal_SIGSEGV;
+    Ptrs.GuestSignal_SynchronousFault = GuestSignal_SynchronousFault;
     Ptrs.SignalReturnHandler = SignalHandlerReturnAddress;
     Ptrs.SignalReturnHandlerRT = SignalHandlerReturnAddressRT;
-    Ptrs.LUDIVHandler = LUDIVHandlerAddress;
-    Ptrs.LDIVHandler = LDIVHandlerAddress;
     Ptrs.F64SinHandler = F64SinHandlerAddress;
     Ptrs.F64CosHandler = F64CosHandlerAddress;
     Ptrs.F64TanHandler = F64TanHandlerAddress;

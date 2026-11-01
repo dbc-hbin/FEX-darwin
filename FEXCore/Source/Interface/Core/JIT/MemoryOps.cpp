@@ -1493,6 +1493,82 @@ DEF_OP(VLoadVectorElement) {
   }
 }
 
+DEF_OP(VGatherLanes) {
+  const auto Op = IROp->C<IR::IROp_VGatherLanes>();
+  LOGMAN_THROW_A_FMT(!HostSupportsAVX256 && !GuestBase, "VGatherLanes is the split-AVX 64-bit lowering");
+  const auto DataBytes = IR::OpSizeToSize(Op->DataSize);
+  const auto IndexBytes = IR::OpSizeToSize(Op->IndexSize);
+  const auto Dest = StaticFPRegisters[Op->DestReg];
+  const auto Mask = StaticFPRegisters[Op->MaskReg];
+  const auto DestHigh = offsetof(FEXCore::Core::CPUState, avx_high) + Op->DestReg * 16;
+  const auto MaskHigh = offsetof(FEXCore::Core::CPUState, avx_high) + Op->MaskReg * 16;
+  const auto SubSize = DataBytes == 8 ? ARMEmitter::SubRegSize::i64Bit : ARMEmitter::SubRegSize::i32Bit;
+  const auto Addr = TMP1;
+  const auto Value = TMP2;
+
+  for (unsigned Lane = 0; Lane < Op->Lanes; ++Lane) {
+    const bool DataHigh = Lane * DataBytes >= 16;
+    const unsigned DataLane = Lane % (16 / DataBytes);
+    const unsigned DataOffset = DataLane * DataBytes;
+
+    // The guest mask was normalized to all-ones/zero per lane; only its sign bit matters.
+    // A half known to be all ones has every lane active, but each lane still clears its mask
+    // lane below so a fault leaves completed lanes cleared.
+    ARMEmitter::ForwardLabel Skip;
+    if (!(DataHigh ? Op->MaskAllOnesHigh : Op->MaskAllOnesLow)) {
+      if (DataHigh) {
+        ldr(SubSize, Value, STATE, MaskHigh + DataOffset);
+      } else if (DataBytes == 8) {
+        umov<ARMEmitter::SubRegSize::i64Bit>(Value, Mask, DataLane);
+      } else {
+        umov<ARMEmitter::SubRegSize::i32Bit>(Value, Mask, DataLane);
+      }
+      (void)tbz(Value, DataBytes * 8 - 1, &Skip);
+    }
+
+    const auto Index = GetVReg(Lane * IndexBytes >= 16 ? Op->IndexHigh : Op->IndexLow);
+    const unsigned IndexLane = Lane % (16 / IndexBytes);
+    if (IndexBytes == 8) {
+      umov<ARMEmitter::SubRegSize::i64Bit>(Addr, Index, IndexLane);
+    } else {
+      smov<ARMEmitter::SubRegSize::i32Bit>(Addr, Index, IndexLane);
+    }
+    if (!Op->Base.IsInvalid()) {
+      add(ARMEmitter::Size::i64Bit, Addr, GetReg(Op->Base), Addr, ARMEmitter::ShiftType::LSL, Op->ScaleShift);
+    } else if (Op->ScaleShift) {
+      lsl(ARMEmitter::Size::i64Bit, Addr, Addr, Op->ScaleShift);
+    }
+    if (Op->Address32) {
+      mov(ARMEmitter::Size::i32Bit, Addr, Addr);
+    }
+    if (!Op->Segment.IsInvalid()) {
+      add(ARMEmitter::Size::i64Bit, Addr, Addr, GetReg(Op->Segment));
+    }
+
+    // A fault here leaves earlier lanes committed and this lane untouched.
+    if (Op->TSO) {
+      if (CTX->HostFeatures.SupportsRCPC) {
+        DataBytes == 8 ? ldapr(Value, Addr) : ldapr(Value.W(), Addr);
+      } else {
+        DataBytes == 8 ? ldar(Value, Addr) : ldar(Value.W(), Addr);
+      }
+      // Half-barrier once back-patched.
+      nop();
+    } else {
+      ldr(SubSize, Value, Addr, 0);
+    }
+
+    if (DataHigh) {
+      str(SubSize, Value, STATE, DestHigh + DataOffset);
+      str(SubSize, ARMEmitter::Reg::zr, STATE, MaskHigh + DataOffset);
+    } else {
+      ins(SubSize, Dest, DataLane, Value);
+      ins(SubSize, Mask, DataLane, ARMEmitter::Reg::zr);
+    }
+    (void)Bind(&Skip);
+  }
+}
+
 DEF_OP(VStoreVectorElement) {
   const auto Op = IROp->C<IR::IROp_VStoreVectorElement>();
   const auto OpSize = IROp->Size;
@@ -1593,7 +1669,8 @@ DEF_OP(Push) {
     case 8: str(Src.X(), HostAddr); break;
     default: LOGMAN_MSG_A_FMT("Unhandled {} size: {}", __func__, ValueSize); break;
     }
-    mov(ARMEmitter::Size::i32Bit, Dst, TMP3);
+    // TMP3 came from a 32-bit sub, so its upper half is zero; the 64-bit form is eligible for move elimination.
+    mov(ARMEmitter::Size::i64Bit, Dst, TMP3);
     return;
   }
 
@@ -1692,7 +1769,8 @@ DEF_OP(PushTwo) {
     case 8: stp<ARMEmitter::IndexType::OFFSET>(Src1.X(), Src2.X(), HostAddr, 0); break;
     default: LOGMAN_MSG_A_FMT("Unhandled {} size: {}", __func__, ValueSize); break;
     }
-    mov(ARMEmitter::Size::i32Bit, Dst, TMP3);
+    // TMP3 came from a 32-bit sub, so its upper half is zero; the 64-bit form is eligible for move elimination.
+    mov(ARMEmitter::Size::i64Bit, Dst, TMP3);
     return;
   }
 

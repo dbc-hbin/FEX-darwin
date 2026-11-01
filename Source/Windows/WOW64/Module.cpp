@@ -118,6 +118,11 @@ struct TLS {
 
 struct FrontendThreadData {
   bool InLockedRWXRead {};
+  // Set while this thread runs another process's queued memory notifications, whose Before and After callbacks may
+  // arrive in different batches.
+  bool InCrossProcessWork {};
+  FEX::Windows::InvalidationTracker::PendingMemoryChange PendingMemoryChange {};
+  FEX::Windows::CallRetStack::State CallRetStack;
 };
 
 class WowSyscallHandler;
@@ -163,6 +168,21 @@ TLS GetTLS() {
 
 FrontendThreadData* GetFrontendThreadData(FEXCore::Core::InternalThreadState* Thread) {
   return static_cast<FrontendThreadData*>(Thread->FrontendPtr);
+}
+
+// Returns the Before/After state of the current thread's memory notification, or null for cross-process work and
+// threads that have not been initialized yet.
+FEX::Windows::InvalidationTracker::PendingMemoryChange* GetPendingMemoryChange() {
+  auto* Thread = GetTLS().ThreadState();
+  auto* Data = Thread ? GetFrontendThreadData(Thread) : nullptr;
+  return !Data || Data->InCrossProcessWork ? nullptr : &Data->PendingMemoryChange;
+}
+
+void ProcessCrossProcessWork() {
+  auto* Data = GetFrontendThreadData(GetTLS().ThreadState());
+  Data->InCrossProcessWork = true;
+  Wow64ProcessPendingCrossProcessItems();
+  Data->InCrossProcessWork = false;
 }
 
 uint64_t GetWowTEB(void* TEB) {
@@ -484,7 +504,7 @@ public:
 
       const auto TLS = GetTLS();
       Context::UnlockJITContext(TLS);
-      Wow64ProcessPendingCrossProcessItems();
+      ProcessCrossProcessWork();
       ReturnRAX = static_cast<uint64_t>(Wow64SystemServiceEx(static_cast<UINT>(EntryRAX), static_cast<UINT*>(GuestPtr(ReturnRSP + 4))));
       Context::LockJITContext(TLS);
       Frame->State.gregs[FEXCore::X86State::REG_RAX] = ReturnRAX;
@@ -512,6 +532,11 @@ public:
     InvalidationTracker->InvalidateAlignedInterval(GuestBase + Start, Length, false);
   }
 
+  bool InvalidateCallRetStack(FEXCore::Core::InternalThreadState* Thread) override {
+    FEX::Windows::CallRetStack::Invalidate(Thread, GetFrontendThreadData(Thread)->CallRetStack);
+    return true;
+  }
+
   void MarkOvercommitRange(uint64_t Start, uint64_t Length) override {
     OvercommitTracker->MarkRange(Start, Length);
   }
@@ -527,7 +552,7 @@ public:
   }
 
   void PreCompile() override {
-    Wow64ProcessPendingCrossProcessItems();
+    ProcessCrossProcessWork();
   }
 };
 
@@ -621,7 +646,8 @@ void BTCpuProcessTerm(HANDLE Handle, BOOL After, ULONG Status) {}
 
 void BTCpuThreadInit() {
   static constexpr size_t DefaultWow64CS {4};
-  std::scoped_lock Lock(ThreadCreationMutex);
+  // Only the Threads map needs the lock. Creating the thread state allocates memory, and its notifications must not
+  // wait behind other threads' executable changes for the whole of thread creation.
   FEX::Windows::InitCRTThread();
   auto* Thread = CTX->CreateThread();
 
@@ -643,14 +669,14 @@ void BTCpuThreadInit() {
   Frame->State.cs_idx = DefaultWow64CS << 3;
   Frame->State.cs_cached = FEXCore::Core::CPUState::CalculateGDTBase(GDT);
 
-  FEX::Windows::CallRetStack::InitializeThread(Thread);
+  Thread->FrontendPtr = new FrontendThreadData();
+  FEX::Windows::CallRetStack::InitializeThread(Thread, GetFrontendThreadData(Thread)->CallRetStack);
 
   const auto TLS = GetTLS();
   TLS.ThreadState() = Thread;
   TLS.ControlWord().fetch_or(ControlBits::WOW_CPU_AREA_DIRTY, std::memory_order::relaxed);
 
-  Thread->FrontendPtr = new FrontendThreadData();
-
+  std::scoped_lock Lock(ThreadCreationMutex);
   auto ThreadTID = GetCurrentThreadId();
   Threads.emplace(ThreadTID, Thread);
   if (StatAllocHandler) {
@@ -904,7 +930,7 @@ bool BTCpuResetToConsistentStateImpl(EXCEPTION_POINTERS* Ptrs) {
   if (Exception->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
     const auto FaultAddress = static_cast<uint64_t>(Exception->ExceptionInformation[1]);
 
-    if (FEX::Windows::CallRetStack::HandleAccessViolation(Thread, FaultAddress, Context->X25)) {
+    if (FEX::Windows::CallRetStack::HandleAccessViolation(Thread, GetFrontendThreadData(Thread)->CallRetStack, FaultAddress, Context->X25)) {
       return true;
     }
 
@@ -999,36 +1025,38 @@ void BTCpuNotifyMemoryDirty(void* Address, SIZE_T Size) {
 }
 
 void BTCpuNotifyMemoryAlloc(void* Address, SIZE_T Size, ULONG Type, ULONG Prot, BOOL After, ULONG Status) {
+  // MEM_RESET(_UNDO) ignores the passed permissions
+  const bool Reset = Type & (MEM_RESET | MEM_RESET_UNDO);
+  const ULONG EffectiveProt = Reset ? PAGE_NOACCESS : Prot;
+  const auto Base = reinterpret_cast<uint64_t>(Address);
   if (!After) {
-    ThreadCreationMutex.lock();
+    InvalidationTracker->BeginMemoryChange(ThreadCreationMutex, GetPendingMemoryChange(), Base, Size, EffectiveProt);
   } else {
-    // MEM_RESET(_UNDO) ignores the passed permissions
-    if (!Status && !(Type & (MEM_RESET | MEM_RESET_UNDO))) {
-      InvalidationTracker->HandleMemoryProtectionNotification(reinterpret_cast<uint64_t>(Address), static_cast<uint64_t>(Size), Prot);
-    }
-    ThreadCreationMutex.unlock();
+    InvalidationTracker->EndMemoryChange(ThreadCreationMutex, GetPendingMemoryChange(), Base, Size, EffectiveProt, !Status, [&] {
+      if (!Reset) {
+        InvalidationTracker->HandleMemoryProtectionNotification(Base, Size, Prot);
+      }
+    });
   }
 }
 
 void BTCpuNotifyMemoryProtect(void* Address, SIZE_T Size, ULONG NewProt, BOOL After, ULONG Status) {
+  const auto Base = reinterpret_cast<uint64_t>(Address);
   if (!After) {
-    ThreadCreationMutex.lock();
+    InvalidationTracker->BeginMemoryChange(ThreadCreationMutex, GetPendingMemoryChange(), Base, Size, NewProt);
   } else {
-    if (!Status) {
-      InvalidationTracker->HandleMemoryProtectionNotification(reinterpret_cast<uint64_t>(Address), static_cast<uint64_t>(Size), NewProt);
-    }
-    ThreadCreationMutex.unlock();
+    InvalidationTracker->EndMemoryChange(ThreadCreationMutex, GetPendingMemoryChange(), Base, Size, NewProt, !Status,
+                                         [&] { InvalidationTracker->HandleMemoryProtectionNotification(Base, Size, NewProt); });
   }
 }
 
 void BTCpuNotifyMemoryFree(void* Address, SIZE_T Size, ULONG FreeType, BOOL After, ULONG Status) {
+  const auto Base = reinterpret_cast<uint64_t>(Address);
   if (!After) {
-    ThreadCreationMutex.lock();
+    InvalidationTracker->BeginMemoryChange(ThreadCreationMutex, GetPendingMemoryChange(), Base, Size, PAGE_NOACCESS);
   } else {
-    if (!Status) {
-      InvalidationTracker->InvalidateAlignedInterval(reinterpret_cast<uint64_t>(Address), static_cast<uint64_t>(Size), true);
-    }
-    ThreadCreationMutex.unlock();
+    InvalidationTracker->EndMemoryChange(ThreadCreationMutex, GetPendingMemoryChange(), Base, Size, PAGE_NOACCESS, !Status,
+                                         [&] { InvalidationTracker->InvalidateAlignedInterval(Base, Size, true); });
   }
 }
 
@@ -1040,13 +1068,9 @@ NTSTATUS BTCpuNotifyMapViewOfSection(void* Unk1, void* Address, void* Unk2, SIZE
 
 void BTCpuNotifyUnmapViewOfSection(void* Address, BOOL After, ULONG Status) {
   if (!After) {
-    ThreadCreationMutex.lock();
-    auto [Start, Size] = InvalidationTracker->InvalidateContainingSection(reinterpret_cast<uint64_t>(Address), true);
-    if (Size) {
-      HandleImageUnmap(Start, Size);
-    }
+    InvalidationTracker->BeginUnmap(ThreadCreationMutex, GetPendingMemoryChange(), reinterpret_cast<uint64_t>(Address), HandleImageUnmap);
   } else {
-    ThreadCreationMutex.unlock();
+    InvalidationTracker->EndUnmap(ThreadCreationMutex, GetPendingMemoryChange(), !Status);
   }
 }
 

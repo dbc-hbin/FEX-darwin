@@ -32,6 +32,9 @@ namespace {
     // when freeing registers.
     Ref RegToSSA[32];
     uint32_t SRAEpoch[32];
+    // Bit R is set once a Pop has been allowed to update the SRA register R in
+    // place ahead of the store currently recorded in RegToSSA[R].
+    uint32_t SRAPopClaimed;
   };
 
   IR::RegClass GetRegClassFromNode(const IR::IROp_Header* IROp) {
@@ -501,7 +504,10 @@ bool ConstrainedRAPass::TryPostRAMerge(Ref LastNode, Ref CodeNode, IROp_Header* 
   } else if (IROp->Op == OP_POP) {
     auto SP = PhysicalRegister(IROp->Args[0]);
 
-    if (LastOp->Op == OP_POP && LastOp->Size == IROp->Size && IROp->Size >= OpSize::i32Bit && SP == PhysicalRegister(LastOp->Args[0])) {
+    // Two pops that each advance the SRA stack pointer in place belong to separate guest instructions;
+    // an `ldp` faulting on the second load would report the first one, so only merge pops through a temporary.
+    if (LastOp->Op == OP_POP && LastOp->Size == IROp->Size && IROp->Size >= OpSize::i32Bit && SP == PhysicalRegister(LastOp->Args[0]) &&
+        SP.AsRegClass() != RegClass::GPRFixed) {
       IREmit->SetWriteCursorBefore(LastNode);
       IREmit->_PopTwo(IROp->Size, IROp->Args[0], LastOp->Args[1], IROp->Args[1]);
       IREmit->RemovePostRA(CodeNode);
@@ -591,6 +597,7 @@ void ConstrainedRAPass::Run(IREmitter* IREmit_) {
     // At the start of each block, all registers are available.
     for (auto& Class : Classes) {
       Class.Available = (1u << Class.Count) - 1;
+      Class.SRAPopClaimed = 0;
     }
 
     auto BlockIROp = BlockHeader->CW<IR::IROp_CodeBlock>();
@@ -616,6 +623,7 @@ void ConstrainedRAPass::Run(IREmitter* IREmit_) {
           PreferredReg[IR->GetID(Node).Value] = Reg;
           GetClass(Reg)->RegToSSA[Reg.Reg] = CodeNode;
           GetClass(Reg)->SRAEpoch[Reg.Reg] = Epoch;
+          GetClass(Reg)->SRAPopClaimed &= ~(1u << Reg.Reg);
         }
 
         // Coalescing an SRA store is equivalent to hoisting the store,
@@ -640,7 +648,38 @@ void ConstrainedRAPass::Run(IREmitter* IREmit_) {
         // or guest boundary. Plain loads are not marked HasSideEffects in IR.
         // Increment after checking this node: a faulting load may still write
         // its own destination directly, since a failed load does not commit it.
-        if ((IR::HasSideEffects(IROp->Op) && !DecodeSRANode(IROp, CodeNode)) ||
+        //
+        // Likewise a faulting Pop leaves its in/out address unchanged: the
+        // post-indexed writeback (or the guest-window add after the load) is
+        // not committed. So when the address is the SRA register's own value
+        // (an RMWHandle of a LoadRegister of that register, so the handle is a
+        // no-op) and this Pop is the only fault point before that value's SRA
+        // store, the Pop may advance the SRA register in place. Only one Pop
+        // may claim this per store, so a later Pop in the same span can never
+        // see a partially advanced SP.
+        if (IROp->Op == OP_POP) {
+          auto Addr = IROp->Args[0];
+          Addr.ClearKill();
+          const auto AddrNode = IR->GetNode(Addr);
+          const auto AddrOp = IR->GetOp<IROp_Header>(AddrNode);
+          if (auto Reg = PreferredReg[Addr.ID().Value]; !Reg.IsInvalid() && AddrOp->Op == OP_RMWHANDLE) {
+            auto Source = AddrOp->Args[0];
+            Source.ClearKill();
+            const auto SourceNode = IR->GetNode(Source);
+            const auto SourceOp = IR->GetOp<IROp_Header>(SourceNode);
+            auto Class = GetClass(Reg);
+            auto Store = Class->RegToSSA[Reg.Reg];
+            if (SourceOp->Op == OP_LOADREGISTER && DecodeSRAReg(SourceOp, SourceNode) == Reg &&
+                AddrNode == DecodeSRANode(IR->GetOp<IROp_Header>(Store), Store) && Class->SRAEpoch[Reg.Reg] == Epoch &&
+                !(Class->SRAPopClaimed & (1u << Reg.Reg))) {
+              Class->SRAEpoch[Reg.Reg] = Epoch + 1;
+              Class->SRAPopClaimed |= 1u << Reg.Reg;
+            }
+          }
+        }
+
+        // CarryInvert only flips host NZCV.C, so it is neither a fault point nor a guest boundary.
+        if ((IR::HasSideEffects(IROp->Op) && !DecodeSRANode(IROp, CodeNode) && IROp->Op != OP_CARRYINVERT) ||
             IROp->Op == OP_LOADMEM || IROp->Op == OP_LOADMEMTSO || IROp->Op == OP_LOADMEMX87SVEOPTPREDICATE ||
             IROp->Op == OP_VLOADVECTORMASKED || IROp->Op == OP_VLOADVECTORGATHERMASKED ||
             IROp->Op == OP_VLOADVECTORGATHERMASKEDQPS || IROp->Op == OP_VLOADVECTORELEMENT || IROp->Op == OP_VBROADCASTFROMMEM) {

@@ -89,6 +89,9 @@ FEXCore::HostFeatures CPUFeatures::FetchHostFeatures(bool IsWine, FEXCore::HostF
     // AVX is unsupported for WOW64
     HostFeatures.SupportsAVX = false;
   }
+
+  // ARM64EC raises synchronous guest exceptions from the dispatcher without a host fault.
+  HostFeatures.SupportsFaultFreeSynchronousFaults = HostType == FEXCore::HostFeatures::HostTypeEnum::Arm64ec;
   return HostFeatures;
 }
 

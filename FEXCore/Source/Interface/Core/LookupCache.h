@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 #pragma once
 #include "Interface/Context/Context.h"
+#include <FEXCore/Utils/JitWriteScope.h>
 #include <FEXCore/Utils/LogManager.h>
 #include <FEXCore/Utils/SHMStats.h>
 #include <FEXCore/Utils/WritePriorityMutex.h>
@@ -13,6 +14,7 @@
 #include <FEXCore/fextl/memory_resource.h>
 
 #include <cstdint>
+#include <ranges>
 #include <span>
 #include <stddef.h>
 #include <utility>
@@ -131,6 +133,12 @@ struct GuestToHostMap {
     auto lower = CodePages.lower_bound(Start >> 12);
     auto upper = CodePages.upper_bound((Start + Length - 1) >> 12);
 
+    // Delinkers patch JIT code. Toggle the thread's write mode once for the range rather than once per link.
+    std::optional<FEXCore::Allocator::JitWriteScope> Writable;
+    if (lower != upper) {
+      Writable.emplace();
+    }
+
     for (auto it = lower; it != upper; it++) {
       for (const auto& Entry : it->second) {
         Erase(Entry, lk);
@@ -178,7 +186,7 @@ public:
 
   uintptr_t FindBlock(FEXCore::Core::InternalThreadState* Thread, uint64_t Address) {
     // Try L1, no lock needed
-    auto& L1Entry = reinterpret_cast<LookupCacheEntry*>(L1Pointer)[Address & L1PointerMask];
+    auto& L1Entry = reinterpret_cast<LookupCacheEntry*>(L1Pointer)[L1Index(Address)];
     if (L1Entry.GuestCode == Address) {
       return L1Entry.HostCode;
     }
@@ -236,12 +244,13 @@ public:
     // Keeping track not L1 misses, but specifically L2/L3 hits.
     ++L2L3CacheHits;
 
-    const auto CurrentTime = std::chrono::system_clock::now();
+    // The virtual counter avoids a host clock call on every L1 miss; under Wine that call leaves the JIT thread.
+    const auto CurrentTime = FEXCore::SHMStats::GetCycleCounter();
     const auto Period = CurrentTime - LastPeriod;
-    if (Period >= SamplePeriod) {
-      // If larger than the sample period then check if we need to increase L1 cache size.
-      const double AveragePerSecond = static_cast<double>(L2L3CacheHits) /
-                                      static_cast<double>(std::chrono::duration_cast<std::chrono::milliseconds>(Period).count()) * 1000.0;
+    const auto CounterFrequency = FEXCore::Utils::SpinWaitLock::CycleCounterFrequency;
+    if (Period >= CounterFrequency) {
+      // If larger than the one second sample period then check if we need to increase L1 cache size.
+      const double AveragePerSecond = static_cast<double>(L2L3CacheHits) * static_cast<double>(CounterFrequency) / static_cast<double>(Period);
 
       if (AveragePerSecond >= DynamicL1CacheIncreaseCountHeuristic()) {
         if (CurrentL1Entries < MAX_L1_ENTRIES) {
@@ -293,24 +302,28 @@ public:
     return Shared->AddBlockExecutableRange(Addresses, Start, Length, lk);
   }
 
-  // Adds to Guest -> Host code mapping
-  void AddBlockMapping(FEXCore::Core::InternalThreadState* Thread, uint64_t Address, std::span<const uint64_t> CodePages, void* HostCode) {
+  // Adds Guest -> Host code mappings for every entry point of one compiled block under a single write lock.
+  // Each element of EntryPoints is a (guest address, host code) pair.
+  void AddBlockMappings(FEXCore::Core::InternalThreadState* Thread, const std::ranges::input_range auto& EntryPoints,
+                        std::span<const uint64_t> CodePages) {
     std::optional<FEXCore::SHMStats::AccumulationBlock<uint64_t>> LockTime(
       Thread->ThreadStats ? &Thread->ThreadStats->AccumulatedCacheWriteLockTime : nullptr);
     auto lk = Shared->AcquireWriteLock();
     LockTime.reset();
 
-    const auto& Entry = Shared->AddBlockMapping(Address, CodePages, HostCode, lk);
+    for (const auto& [Address, HostCode] : EntryPoints) {
+      const auto& Entry = Shared->AddBlockMapping(Address, CodePages, HostCode, lk);
 
-    // There is no need to update L1 or L2, they will get updated on first lookup
-    // However, adding to L1 here increases performance
-    CacheBlockMapping(Address, Entry, true, lk);
+      // There is no need to update L1 or L2, they will get updated on first lookup
+      // However, adding to L1 here increases performance
+      CacheBlockMapping(Address, Entry, true, lk);
+    }
   }
 
   // Invalidates L1/L2 for a given guest block
   void InvalidateCache(uint64_t Address, const LookupCacheWriteLockToken& lk) {
     // Do L1
-    auto& L1Entry = reinterpret_cast<LookupCacheEntry*>(L1Pointer)[Address & L1PointerMask];
+    auto& L1Entry = reinterpret_cast<LookupCacheEntry*>(L1Pointer)[L1Index(Address)];
     if (L1Entry.GuestCode == Address) {
       L1Entry.GuestCode = 0;
       // Leave L1Entry.HostCode as is, so that concurrent lookups won't read a null pointer
@@ -367,6 +380,15 @@ public:
   uintptr_t GetL1Pointer() const {
     return L1Pointer;
   }
+  // L1 slots are indexed by a hash of the guest address so 16-byte aligned targets don't all alias into
+  // the slots with zero low bits. The JIT computes the same index pre-scaled by the entry size as
+  // ((Address ^ (Address << L1_HASH_SHIFT)) & ScaledMask), which equals (L1Index(Address) << 4).
+  constexpr static uint64_t L1_HASH_SHIFT = 4;
+  static_assert(L1_HASH_SHIFT == FEXCore::ilog2(sizeof(LookupCacheEntry)), "Scaled JIT L1 hash relies on this");
+  uint64_t L1Index(uint64_t Address) const {
+    return (Address ^ (Address >> L1_HASH_SHIFT)) & L1PointerMask;
+  }
+
   uintptr_t GetScaledL1PointerMask() const {
     return L1PointerMask << FEXCore::ilog2(sizeof(LookupCache::LookupCacheEntry));
   }
@@ -390,7 +412,7 @@ public:
 
 private:
   void AddL1Entry(uint64_t GuestAddress, uint64_t HostCode) {
-    auto& L1Entry = reinterpret_cast<LookupCacheEntry*>(L1Pointer)[GuestAddress & L1PointerMask];
+    auto& L1Entry = reinterpret_cast<LookupCacheEntry*>(L1Pointer)[L1Index(GuestAddress)];
     L1Entry.GuestCode = GuestAddress;
     L1Entry.HostCode = HostCode;
   }
@@ -453,11 +475,14 @@ private:
   // Maps from a page index to all blocks in the page that have at some point been fetched into L1/L2
   fextl::map<uint64_t, fextl::robin_set<uint64_t>> CachedCodePages;
 
-  uintptr_t PagePointer;
-  uintptr_t PageMemory;
+  // L2 (PagePointer and PageMemory) followed by L1. Without L2, PagePointer and PageMemory stay zero.
+  uintptr_t CacheBase;
+  uintptr_t PagePointer {};
+  uintptr_t PageMemory {};
   uintptr_t L1Pointer;
   uintptr_t L1PointerMask;
 
+  size_t L2CacheSize;
   size_t TotalCacheSize;
 
   // Start with 8k entries in L1 to give 128KB of L1 cache to each thread.
@@ -476,8 +501,7 @@ private:
 
   size_t CurrentL1Entries = MIN_L1_ENTRIES;
   uint64_t L2L3CacheHits {};
-  std::chrono::time_point<std::chrono::system_clock> LastPeriod {};
-  constexpr static std::chrono::seconds SamplePeriod {1};
+  uint64_t LastPeriod {};
   FEX_CONFIG_OPT(DynamicL1CacheIncreaseCountHeuristic, DYNAMICL1CACHEINCREASECOUNTHEURISTIC);
   FEX_CONFIG_OPT(DynamicL1CacheDecreaseCountHeuristic, DYNAMICL1CACHEDECREASECOUNTHEURISTIC);
 

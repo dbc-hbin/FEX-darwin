@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
 
+#include <FEXCore/Utils/JitWriteScope.h>
 #include <FEXCore/Utils/LogManager.h>
 #include <FEXCore/Utils/TypeDefines.h>
 #include <FEXCore/Utils/SignalScopeGuards.h>
@@ -17,6 +18,9 @@ InvalidationTracker::InvalidationTracker(FEXCore::Context::Context& CTX, const s
   , GuestBase {GuestBase} {
   FEX_CONFIG_OPT(SMCChecks, SMCCHECKS);
   SMCDetectionDisabled = (SMCChecks == FEXCore::Config::CONFIG_SMC_NONE);
+  // The frontend CRC-validates every instruction with bytes in an RWX interval in this mode (see Decoder::DecodeLoop),
+  // so write-trapping those intervals only adds fault round trips.
+  WritableCodeValidated = FEXCore::Allocator::VirtualJitWriteProtect && SMCChecks == FEXCore::Config::CONFIG_SMC_MTRACK;
 
   MEMORY_BASIC_INFORMATION Info;
   uint64_t Address = GuestBase;
@@ -169,14 +173,15 @@ void InvalidationTracker::HandleImageMap(std::string_view Name, uint64_t Address
   }
 }
 
-InvalidationTracker::InvalidateContainingSectionResult InvalidationTracker::InvalidateContainingSection(uint64_t Address, bool Free) {
+InvalidationTracker::ContainingSection InvalidationTracker::QueryContainingSection(uint64_t Address) {
   MEMORY_BASIC_INFORMATION Info;
   if (NtQueryVirtualMemory(NtCurrentProcess(), reinterpret_cast<void*>(Address), MemoryBasicInformation, &Info, sizeof(Info), nullptr)) {
-    return {Address, 0};
+    return {Address, 0, false};
   }
 
   const auto SectionBase = reinterpret_cast<uint64_t>(Info.AllocationBase);
   auto SectionSize = reinterpret_cast<uint64_t>(Info.BaseAddress) + Info.RegionSize - SectionBase;
+  const bool Image = Info.Type == MEM_IMAGE;
 
   while (!NtQueryVirtualMemory(NtCurrentProcess(), reinterpret_cast<void*>(SectionBase + SectionSize), MemoryBasicInformation, &Info,
                                sizeof(Info), nullptr) &&
@@ -184,6 +189,11 @@ InvalidationTracker::InvalidateContainingSectionResult InvalidationTracker::Inva
     SectionSize += Info.RegionSize;
   }
 
+  return {SectionBase, SectionSize, Image};
+}
+
+void InvalidationTracker::InvalidateSection(const ContainingSection& Section, bool Free) {
+  const auto [SectionBase, SectionSize, Image] = Section;
   InvalidateIntervalInternal(SectionBase, SectionSize);
 
   if (Free) {
@@ -191,8 +201,6 @@ InvalidationTracker::InvalidateContainingSectionResult InvalidationTracker::Inva
     XIntervals.Remove({SectionBase, SectionBase + SectionSize});
     RWXIntervals.Remove({SectionBase, SectionBase + SectionSize});
   }
-
-  return {SectionBase, SectionSize};
 }
 
 void InvalidationTracker::InvalidateAlignedInterval(uint64_t Address, uint64_t Size, bool Free) {
@@ -203,6 +211,16 @@ void InvalidationTracker::InvalidateAlignedInterval(uint64_t Address, uint64_t S
 
   const auto AlignedBase = Address & FEXCore::Utils::FEX_PAGE_MASK;
   const auto AlignedSize = std::max(Size, (Address - AlignedBase + Size + FEXCore::Utils::FEX_PAGE_SIZE - 1) & FEXCore::Utils::FEX_PAGE_MASK);
+
+  // Code is only decoded from XIntervals, and every path that removes an executable interval invalidates it first.
+  // A range that was never executable therefore has no translated code, so data writes such as file reads into
+  // heap buffers don't need to take the code invalidation lock and stall compilation on every thread.
+  {
+    std::shared_lock Lock(IntervalsLock);
+    if (!XIntervals.Intersect({AlignedBase, AlignedBase + AlignedSize})) {
+      return;
+    }
+  }
 
   InvalidateIntervalInternal(AlignedBase, AlignedSize);
 
@@ -243,6 +261,73 @@ bool InvalidationTracker::HandleRWXAccessViolation(FEXCore::Core::InternalThread
     return true;
   }
   return false;
+}
+
+bool InvalidationTracker::MayAffectExecutable(uint64_t Address, uint64_t Size, ULONG Prot) {
+  std::shared_lock Lock(IntervalsLock);
+  if (ProtHasExec(Prot) || (DEPDisabled && ProtIsReadable(Prot))) {
+    return true;
+  }
+  if (!Address) {
+    return false;
+  }
+
+  const auto AlignedBase = Address & FEXCore::Utils::FEX_PAGE_MASK;
+  const auto AlignedSize = std::max<uint64_t>(FEXCore::Utils::FEX_PAGE_SIZE,
+                                              (Address - AlignedBase + Size + FEXCore::Utils::FEX_PAGE_SIZE - 1) & FEXCore::Utils::FEX_PAGE_MASK);
+  return XIntervals.Intersect({AlignedBase, AlignedBase + AlignedSize});
+}
+
+void InvalidationTracker::ResyncRange(uint64_t Address, uint64_t Size) {
+  const auto AlignedBase = Address & FEXCore::Utils::FEX_PAGE_MASK;
+  const auto AlignedEnd = AlignedBase + std::max<uint64_t>(FEXCore::Utils::FEX_PAGE_SIZE, (Address - AlignedBase + Size + FEXCore::Utils::FEX_PAGE_SIZE - 1) &
+                                                                                            FEXCore::Utils::FEX_PAGE_MASK);
+
+  {
+    std::unique_lock Lock(IntervalsLock);
+    uint64_t Current = AlignedBase;
+    while (Current < AlignedEnd) {
+      MEMORY_BASIC_INFORMATION Info;
+      uint64_t RegionEnd = AlignedEnd;
+      ULONG Prot = PAGE_NOACCESS;
+      if (!NtQueryVirtualMemory(NtCurrentProcess(), reinterpret_cast<void*>(Current), MemoryBasicInformation, &Info, sizeof(Info), nullptr)) {
+        RegionEnd = std::min(AlignedEnd, reinterpret_cast<uint64_t>(Info.BaseAddress) + Info.RegionSize);
+        if (Info.State == MEM_COMMIT) {
+          Prot = Info.Protect;
+        }
+      }
+      // A failed query or an empty region ends the walk, leaving the rest marked non-executable below.
+      if (RegionEnd <= Current) {
+        RegionEnd = AlignedEnd;
+        Prot = PAGE_NOACCESS;
+      }
+
+      const FEXCore::IntervalList<uint64_t>::Interval Region {Current, RegionEnd};
+      const bool HasExec = ProtHasExec(Prot);
+      const bool EffectiveExec = HasExec || (DEPDisabled && ProtIsReadable(Prot));
+
+      // Mirrors HandleMemoryProtectionNotification. Executable non-writable pages keep their RWX tracking, which
+      // covers write-trapped RWX pages that read back as read-only.
+      if (EffectiveExec) {
+        XIntervals.Insert(Region);
+        if (ProtIsWritable(Prot)) {
+          RWXIntervals.Insert(Region);
+        }
+        if (DEPDisabled && !HasExec) {
+          DEPPromotedIntervals.Insert(Region);
+        }
+      } else {
+        XIntervals.Remove(Region);
+        RWXIntervals.Remove(Region);
+        DEPPromotedIntervals.Remove(Region);
+      }
+
+      Current = RegionEnd;
+    }
+  }
+
+  // IntervalsLock cannot be held during invalidation
+  InvalidateIntervalInternal(AlignedBase, AlignedEnd - AlignedBase);
 }
 
 bool InvalidationTracker::BeginUntrackedWriteLocked(uint64_t Address, uint64_t Size) {
@@ -356,6 +441,11 @@ bool InvalidationTracker::ProtectRWXIntervalsInternal(uint64_t Address, uint64_t
   std::shared_lock Lock(IntervalsLock);
 
   if (SMCDetectionDisabled) {
+    return false;
+  }
+
+  // Mono backpatcher detection relies on the first trapped write, so keep trapping until it has run.
+  if (!ForWriteLocked && WritableCodeValidated && !MonoBackpatcherDetectionPending) {
     return false;
   }
 

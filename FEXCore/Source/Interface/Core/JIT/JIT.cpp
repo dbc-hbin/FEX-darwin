@@ -40,30 +40,6 @@ $end_info$
 #include <unistd.h>
 
 namespace {
-struct DivRem {
-  uint64_t Quotient;
-  uint64_t Remainder;
-};
-
-static struct DivRem LUDIV(uint64_t SrcHigh, uint64_t SrcLow, uint64_t Divisor) {
-  __uint128_t Source = (static_cast<__uint128_t>(SrcHigh) << 64) | SrcLow;
-
-  return {
-    .Quotient = (uint64_t)(Source / Divisor),
-    .Remainder = (uint64_t)(Source % Divisor),
-  };
-}
-
-static struct DivRem
-LDIV(uint64_t SrcHigh, uint64_t SrcLow, int64_t Divisor) {
-  __int128_t Source = (static_cast<__uint128_t>(SrcHigh) << 64) | SrcLow;
-
-  return {
-    .Quotient = (uint64_t)(Source / Divisor),
-    .Remainder = (uint64_t)(Source % Divisor),
-  };
-}
-
 static void
 PrintValue(uint64_t Value) {
   LogMan::Msg::DFmt("Value: 0x{:x}", Value);
@@ -499,7 +475,7 @@ void Arm64JITCore::Op_Unhandled(const IR::IROp_Header* IROp, IR::Ref Node) {
 }
 
 static void DirectBlockDelinker(FEXCore::Context::ExitFunctionLinkData* Record, bool Call) {
-  FEXCore::Allocator::JitWriteScope Writable;
+  // GuestToHostMap::InvalidateRange holds the JIT write scope for every delink in the range.
   uintptr_t JumpThunkStartAddress = reinterpret_cast<uintptr_t>(Record) - 0x10;
   uintptr_t CallerAddress = JumpThunkStartAddress + Record->CallerOffset;
   auto BranchOffset = JumpThunkStartAddress / 4 - CallerAddress / 4;
@@ -518,7 +494,7 @@ static void DirectBlockDelinker(FEXCore::Context::ExitFunctionLinkData* Record, 
 }
 
 static void IndirectBlockDelinker(FEXCore::Context::ExitFunctionLinkData* Record) {
-  FEXCore::Allocator::JitWriteScope Writable;
+  // GuestToHostMap::InvalidateRange holds the JIT write scope for every delink in the range.
   uintptr_t JumpThunkStartAddress = reinterpret_cast<uintptr_t>(Record) - 0x10;
   uint32_t BranchInst = 0;
   ARMEmitter::Emitter BranchEmit(reinterpret_cast<uint8_t*>(&BranchInst), 4);
@@ -532,7 +508,6 @@ static void IndirectBlockDelinker(FEXCore::Context::ExitFunctionLinkData* Record
 }
 
 uint64_t Arm64JITCore::ExitFunctionLink(FEXCore::Core::CpuStateFrame* Frame, FEXCore::Context::ExitFunctionLinkData* Record) {
-  FEXCore::Allocator::JitWriteScope Writable;
   auto Thread = Frame->Thread;
   bool TFSet = Thread->CurrentFrame->State.flags[X86State::RFLAG_TF_RAW_LOC];
   uintptr_t HostCode {};
@@ -574,6 +549,9 @@ uint64_t Arm64JITCore::ExitFunctionLink(FEXCore::Core::CpuStateFrame* Frame, FEX
   // Lock here is necessary to prevent simultaneous linking and delinking
   auto lk = Thread->LookupCache->AcquireWriteLock();
 
+  // Compilation and cached-code loading open their own scopes; only the link patch below writes JIT code here.
+  FEXCore::Allocator::JitWriteScope Writable;
+
   // For non-calls, this would extend into the block's code, however that's fine as an out-of-range adr would never
   // be generated avoiding any false positives.
   uintptr_t KnownCallMarkerAddr = CallerAddress - 0x8;
@@ -610,6 +588,98 @@ uint64_t Arm64JITCore::ExitFunctionLink(FEXCore::Core::CpuStateFrame* Frame, FEX
     ARMEmitter::Emitter::ClearICache(reinterpret_cast<void*>(JumpThunkStartAddress), 4);
 
     Thread->LookupCache->AddBlockLink(GuestRip, Record, IndirectBlockDelinker, lk);
+  }
+
+  return HostCode;
+}
+
+// Inline cache slot layout, see ExitFunction in BranchOps.cpp.
+// IC_SITE: low 32 bits are the signed hit site offset from the slot with bit 0 set for calls, high 32 bits are the
+// site's unpatched instruction.
+// IC_PINNED is the only guest target the hit site may ever branch to directly. A reader that matched an older slot
+// value can reach the hit site after the slot was delinked and refilled, so once the slot has held a second guest
+// target the site is pinned to ~0 and stays indirect, the same as an unpatched inline cache.
+enum InlineCacheSlotField { IC_GUEST = 0, IC_HOST = 1, IC_SITE = 2, IC_PINNED = 3 };
+
+static void PatchInlineCacheSite(uint64_t* Slot, uint64_t HostCode) {
+  const auto SiteInfo = Slot[IC_SITE];
+  const auto SiteOffset = static_cast<int32_t>(static_cast<uint32_t>(SiteInfo));
+  const bool Call = SiteOffset & 1;
+  const auto SiteAddress = reinterpret_cast<uintptr_t>(Slot) + (SiteOffset & ~int32_t {1});
+  const auto BranchOffset = static_cast<int64_t>(HostCode / 4 - SiteAddress / 4);
+
+  uint32_t BranchInst = static_cast<uint32_t>(SiteInfo >> 32);
+  if (HostCode && ARMEmitter::Emitter::IsInt26(BranchOffset)) {
+    ARMEmitter::Emitter BranchEmit(reinterpret_cast<uint8_t*>(&BranchInst), 4);
+    if (Call) {
+      BranchEmit.bl(BranchOffset);
+    } else {
+      BranchEmit.b(BranchOffset);
+    }
+  }
+
+  std::atomic_ref<uint32_t>(*reinterpret_cast<uint32_t*>(SiteAddress)).store(BranchInst, std::memory_order::relaxed);
+  ARMEmitter::Emitter::ClearICache(reinterpret_cast<void*>(SiteAddress), 4);
+}
+
+static void InlineCacheDelinker(FEXCore::Context::ExitFunctionLinkData* Record) {
+  // Empty the slot; the next execution refills it through InlineCacheFill. The host target is left in place so a
+  // concurrent reader that still sees the old guest target never pairs it with a null host target.
+  // Restoring the hit site to its indirect form keeps such a reader on the host target it loaded.
+  auto Slot = reinterpret_cast<uint64_t*>(Record);
+  std::atomic_ref<uint64_t>(Slot[IC_GUEST]).store(0, std::memory_order::relaxed);
+  PatchInlineCacheSite(Slot, 0);
+}
+
+uint64_t Arm64JITCore::InlineCacheFill(FEXCore::Core::CpuStateFrame* Frame, uint64_t* Slot) {
+  auto Thread = Frame->Thread;
+  const auto GuestRip = Frame->State.rip;
+
+  // Only link to blocks that already exist. Uncompiled targets, ARM64EC native targets and TF single-stepping
+  // all go through the dispatcher; a later execution fills the slot.
+  if (Frame->State.flags[X86State::RFLAG_TF_RAW_LOC]) {
+    return Frame->Pointers.DispatcherLoopTop;
+  }
+
+  // Holding the invalidation mutex across lookup and link ensures the block can't be invalidated in between.
+  auto lk_inval = GuardSignalDeferringSection<std::shared_lock>(static_cast<Context::ContextImpl*>(Thread->CTX)->CodeInvalidationMutex, Thread);
+  // The slot must belong to the code buffer whose block links are used below, otherwise a later delink could write into a
+  // retired buffer.
+  auto& CodeBuffer = static_cast<Arm64JITCore*>(Thread->CPUBackend.get())->CurrentCodeBuffer;
+  const auto SlotAddress = reinterpret_cast<uintptr_t>(Slot);
+  const auto BufferBase = reinterpret_cast<uintptr_t>(CodeBuffer->GetBufferBase());
+  if (Thread->LookupCache->Shared != CodeBuffer->LookupCache.get() || SlotAddress < BufferBase ||
+      SlotAddress >= BufferBase + CodeBuffer->UsableSize()) {
+    return Frame->Pointers.DispatcherLoopTop;
+  }
+  const auto HostCode = Thread->LookupCache->FindBlock(Thread, GuestRip);
+  if (!HostCode) {
+#ifdef ARCHITECTURE_arm64ec
+    if (GuestRip < EC_CODE_BITMAP_MAX_ADDRESS && RtlIsEcCode(GuestRip)) {
+      // Native targets never become FEX blocks. Park the slot on a guest address that can't match so this site
+      // keeps using the L1 lookup instead of calling the filler on every execution.
+      FEXCore::Allocator::JitWriteScope Writable;
+      std::atomic_ref<uint64_t>(Slot[IC_GUEST]).store(~0ULL, std::memory_order::relaxed);
+    }
+#endif
+    return Frame->Pointers.DispatcherLoopTop;
+  }
+
+  auto lk = Thread->LookupCache->AcquireWriteLock();
+  // The slot lives in the block tail and may only be written while the JIT is writable.
+  FEXCore::Allocator::JitWriteScope Writable;
+  if (std::atomic_ref<uint64_t>(Slot[IC_GUEST]).load(std::memory_order::relaxed) == 0) {
+    std::atomic_ref<uint64_t>(Slot[IC_HOST]).store(HostCode, std::memory_order::relaxed);
+    std::atomic_ref<uint64_t>(Slot[IC_GUEST]).store(GuestRip, std::memory_order::release);
+    if (Slot[IC_PINNED] == 0) {
+      Slot[IC_PINNED] = GuestRip;
+    } else if (Slot[IC_PINNED] != GuestRip) {
+      Slot[IC_PINNED] = ~0ULL;
+    }
+    if (Slot[IC_PINNED] == GuestRip) {
+      PatchInlineCacheSite(Slot, HostCode);
+    }
+    Thread->LookupCache->AddBlockLink(GuestRip, reinterpret_cast<FEXCore::Context::ExitFunctionLinkData*>(Slot), InlineCacheDelinker, lk);
   }
 
   return HostCode;
@@ -666,8 +736,7 @@ Arm64JITCore::Arm64JITCore(FEXCore::Context::ContextImpl* ctx, FEXCore::Core::In
       Ptrs.SyscallHandlerFunc = PMF.GetVTableEntry(CTX->SyscallHandler);
     }
     Ptrs.ExitFunctionLink = reinterpret_cast<uintptr_t>(&Arm64JITCore::ExitFunctionLink);
-    Ptrs.LUDIV = reinterpret_cast<uint64_t>(LUDIV);
-    Ptrs.LDIV = reinterpret_cast<uint64_t>(LDIV);
+    Ptrs.InlineCacheFill = reinterpret_cast<uintptr_t>(&Arm64JITCore::InlineCacheFill);
   }
 
   CurrentCodeBuffer = SharedCodeBuffers.GetLatest();
@@ -767,6 +836,24 @@ void Arm64JITCore::EmitTFCheck() {
   (void)Bind(&l_TFUnset);
 }
 
+#ifdef ARCHITECTURE_arm64ec
+// The suspend handler matches this `brk` immediate (Source/Windows/ARM64EC/Module.cpp SuspendTrapMagic).
+static constexpr uint16_t SuspendMagic {0xCAFE};
+#endif
+
+void Arm64JITCore::EmitL1Lookup(ARMEmitter::XRegister Rip, ARMEmitter::ForwardLabel* Found) {
+  ldp<ARMEmitter::IndexType::OFFSET>(TMP1, TMP2, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.L1Pointer));
+  // L1Mask is pre-shifted, so the scaled hashed index is ((Rip ^ (Rip << L1_HASH_SHIFT)) & L1Mask).
+  eor(ARMEmitter::Size::i64Bit, TMP3, Rip, Rip, ARMEmitter::ShiftType::LSL, LookupCache::L1_HASH_SHIFT);
+  and_(ARMEmitter::Size::i64Bit, TMP2, TMP2, TMP3);
+  add(TMP1, TMP1, TMP2);
+  ldp<ARMEmitter::IndexType::OFFSET>(TMP2, TMP1, TMP1, 0);
+  sub(TMP1, TMP1, Rip);
+  (void)cbz(ARMEmitter::Size::i64Bit, TMP1, Found);
+  ldr(TMP2, STATE, offsetof(FEXCore::Core::CpuStateFrame, Pointers.DispatcherLoopTop));
+  str(Rip, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.rip));
+}
+
 void Arm64JITCore::EmitSuspendInterruptCheck() {
   if (CTX->Config.NeedsPendingInterruptFaultCheck) {
     // Trigger a fault if there are any pending interrupts
@@ -783,14 +870,27 @@ void Arm64JITCore::EmitSuspendInterruptCheck() {
   }
 
 #ifdef ARCHITECTURE_arm64ec
-  static constexpr uint16_t SuspendMagic {0xCAFE};
-
   ldr(TMP2.W(), STATE_PTR(CpuStateFrame, SuspendDoorbell));
   ARMEmitter::ForwardLabel l_NoSuspend;
   (void)cbz(ARMEmitter::Size::i32Bit, TMP2, &l_NoSuspend);
   brk(SuspendMagic);
   (void)Bind(&l_NoSuspend);
 #endif
+}
+
+void Arm64JITCore::EmitSuspendCheckedBackwardBranch(ARMEmitter::BiDirectionalLabel* Target) {
+#ifdef ARCHITECTURE_arm64ec
+  if (!CTX->Config.NeedsPendingInterruptFaultCheck) {
+    // Branch straight to the target when no suspend is pending. The suspend
+    // handler replaces the whole context, so nothing executes after the brk.
+    ldr(TMP2.W(), STATE_PTR(CpuStateFrame, SuspendDoorbell));
+    cbz_OrRestart(ARMEmitter::Size::i32Bit, TMP2, Target);
+    brk(SuspendMagic);
+    return;
+  }
+#endif
+  EmitSuspendInterruptCheck();
+  b_OrRestart(Target);
 }
 
 void Arm64JITCore::EmitEntryPoint(ARMEmitter::BackwardLabel& HeaderLabel, bool CheckTF) {
@@ -824,7 +924,7 @@ CodeBuffer::CodeBufferAllocation Arm64JITCore::AllocateCodeBufferInSharedCache(s
                                                                                                "doesn't match up!\n");
   // Bring CodeBuffer up to date
   if (auto Prev = CheckCodeBufferUpdate()) {
-    Allocator::VirtualDontNeed(ThreadState->CallRetStackBase, FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE);
+    CTX->InvalidateCallRetStack(ThreadState);
     auto lk = ThreadState->LookupCache->AcquireWriteLock();
     ThreadState->LookupCache->ChangeGuestToHostMapping(*Prev, *CurrentCodeBuffer->LookupCache, lk);
   }
@@ -876,6 +976,7 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
   JumpTargets.clear();
   CallReturnTargets.clear();
   PendingJumpThunks.clear();
+  PendingInlineCacheSlots.clear();
   JumpTargets.resize(IR->GetHeader()->BlockCount, {});
   Relocations.resize(PrevNumAllocations, FEXCore::CPU::Relocation::Default()); // Discard any relocations generated from a previous attempt
 
@@ -946,9 +1047,10 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
       // if there's a pending branch, and it is not fall-through
       if (PendingTargetLabel && PendingTargetLabel != Target) {
         if (PendingTargetLabel->Backward.Location) {
-          EmitSuspendInterruptCheck();
+          EmitSuspendCheckedBackwardBranch(PendingTargetLabel);
+        } else {
+          b_OrRestart(PendingTargetLabel);
         }
-        b_OrRestart(PendingTargetLabel);
         PendingTargetLabel = nullptr;
       }
 
@@ -1002,9 +1104,10 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
   // Make sure last branch is generated. It certainly can't be eliminated here.
   if (PendingTargetLabel) {
     if (PendingTargetLabel->Backward.Location) {
-      EmitSuspendInterruptCheck();
+      EmitSuspendCheckedBackwardBranch(PendingTargetLabel);
+    } else {
+      b_OrRestart(PendingTargetLabel);
     }
-    b_OrRestart(PendingTargetLabel);
   }
   PendingTargetLabel = nullptr;
 
@@ -1033,6 +1136,53 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
       PlaceNamedSymbolLiteral(InsertGuestRIPLiteral(PendingJumpThunk.GuestRIP)); // GuestRIP
     }
     dc64(PendingJumpThunk.CallerAddress - ThunkAddress); // CallerOffset
+  }
+
+  if (!PendingInlineCacheSlots.empty()) {
+    for (auto& Slot : PendingInlineCacheSlots) {
+      if (!Slot.Call) {
+        continue;
+      }
+      // Out-of-line miss path of a call inline cache, entered from the guard in ExitFunction with guest registers
+      // intact, TMP1 = the slot's guest target and TMP4 = the slot. An empty slot (TMP1 == 0) goes to the filler,
+      // otherwise to the L1 lookup. The call uses its own return point so the return address prediction stays exact,
+      // then rejoins after the hit site.
+      const auto RipReg = ARMEmitter::XRegister(Slot.RipReg);
+      ARMEmitter::ForwardLabel L1Lookup;
+      ARMEmitter::ForwardLabel DoCall;
+      ARMEmitter::ForwardLabel MissReturn;
+      BindOrRestart(&Slot.Miss);
+      (void)cbnz(ARMEmitter::Size::i64Bit, TMP1, &L1Lookup);
+      // Filler expects the target in State.rip and the slot in TMP4.
+      str(RipReg, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.rip));
+      ldr(TMP2, STATE, offsetof(FEXCore::Core::CpuStateFrame, Pointers.InlineCacheFiller));
+      (void)b(&DoCall);
+      (void)Bind(&L1Lookup);
+      EmitL1Lookup(RipReg, &DoCall);
+      (void)Bind(&DoCall);
+      EmitCallRetPush(Slot.HasReturnBlock, ARMEmitter::XRegister(Slot.CallReturnAddressReg), &MissReturn);
+      blr(TMP2);
+      (void)Bind(&MissReturn);
+      b_OrRestart(&Slot.CallReturn);
+    }
+    for (auto& Slot : PendingInlineCacheSlots) {
+      if (Slot.Call) {
+        BindOrRestart(&Slot.Trampoline);
+        br(TMP2);
+      }
+    }
+    // 16-byte alignment keeps each slot's LDP single-copy atomic (LSE2), so a reader never pairs a guest target with a stale host target.
+    Align(16);
+    for (auto& Slot : PendingInlineCacheSlots) {
+      // Every hit site and its trampoline are final here, so the site's unpatched instruction can be recorded.
+      BindOrRestart(&Slot.Label);
+      const auto SiteOffset = static_cast<int32_t>(Slot.SiteAddress - GetCursorAddress<uint64_t>());
+      const uint64_t SiteInst = *reinterpret_cast<const uint32_t*>(Slot.SiteAddress);
+      dc64(0);                                                                                  // GuestTarget, 0 = empty
+      dc64(0);                                                                                  // HostTarget
+      dc64((SiteInst << 32) | static_cast<uint32_t>(SiteOffset | (Slot.Call ? 1 : 0)));         // SiteInfo
+      dc64(0);                                                                                  // Pinned guest target, 0 = none yet
+    }
   }
 
   BindOrRestart(&l_ExitLink);

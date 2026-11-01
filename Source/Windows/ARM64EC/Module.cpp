@@ -139,6 +139,11 @@ struct ThreadCPUArea {
 
 struct FrontendThreadData {
   bool InLockedRWXRead {};
+  // Set while this thread runs another process's queued memory notifications, whose Before and After callbacks may
+  // arrive in different batches.
+  bool InCrossProcessWork {};
+  FEX::Windows::InvalidationTracker::PendingMemoryChange PendingMemoryChange {};
+  FEX::Windows::CallRetStack::State CallRetStack;
 };
 
 namespace {
@@ -168,6 +173,19 @@ ThreadCPUArea GetCPUArea() {
 
 FrontendThreadData* GetFrontendThreadData(FEXCore::Core::InternalThreadState* Thread) {
   return static_cast<FrontendThreadData*>(Thread->FrontendPtr);
+}
+
+// Returns the Before/After state of the current thread's memory notification, or null for cross-process work.
+FEX::Windows::InvalidationTracker::PendingMemoryChange* GetPendingMemoryChange() {
+  auto* Data = GetFrontendThreadData(GetCPUArea().ThreadState());
+  return Data->InCrossProcessWork ? nullptr : &Data->PendingMemoryChange;
+}
+
+void ProcessCrossProcessWork() {
+  auto* Data = GetFrontendThreadData(GetCPUArea().ThreadState());
+  Data->InCrossProcessWork = true;
+  ProcessPendingCrossProcessEmulatorWork();
+  Data->InCrossProcessWork = false;
 }
 
 bool IsEmulatorStackAddress(const ThreadCPUArea CPUArea, uint64_t Address) {
@@ -520,16 +538,8 @@ static ARM64_NT_CONTEXT StoreStateToPackedECContext(FEXCore::Core::InternalThrea
   return ECContext;
 }
 
-static void RethrowGuestException(const EXCEPTION_RECORD& Rec, ARM64_NT_CONTEXT& Context) {
-  auto* Thread = GetCPUArea().ThreadState();
+static void RaiseException(FEXCore::Core::InternalThreadState* Thread, const EXCEPTION_RECORD& Rec, ARM64_NT_CONTEXT& GuestContext) {
   auto& Fault = Thread->CurrentFrame->SynchronousFaultData;
-
-  LogMan::Msg::DFmt("Reconstructing context");
-  if (!IsDispatcherAddress(Context.Pc)) {
-    ReconstructThreadState(Thread, Context);
-  }
-  ARM64_NT_CONTEXT GuestContext = StoreStateToPackedECContext(Thread, Context.Fpcr, Context.Fpsr);
-  LogMan::Msg::DFmt("pc: {:X} rip: {:X}", Context.Pc, GuestContext.Pc);
 
   // The saved context retains the original flags; clear TF for exception dispatch itself.
   uint32_t EFlags = CTX->ReconstructCompactedEFLAGS(Thread, false, nullptr, 0);
@@ -548,12 +558,47 @@ static void RethrowGuestException(const EXCEPTION_RECORD& Rec, ARM64_NT_CONTEXT&
   NtRaiseExceptionNative(&GuestRec, &GuestContext, FirstChance);
 }
 
+static void RethrowGuestException(FEXCore::Core::InternalThreadState* Thread, const EXCEPTION_RECORD& Rec, ARM64_NT_CONTEXT& HostContext) {
+  LogMan::Msg::DFmt("Reconstructing context");
+  if (!IsDispatcherAddress(HostContext.Pc)) {
+    ReconstructThreadState(Thread, HostContext);
+  }
+  auto GuestContext = StoreStateToPackedECContext(Thread, HostContext.Fpcr, HostContext.Fpsr);
+  LogMan::Msg::DFmt("pc: {:X} rip: {:X}", HostContext.Pc, GuestContext.Pc);
+
+  RaiseException(Thread, Rec, GuestContext);
+}
+
+[[noreturn]]
+static void SynchronousExceptionHandler(FEXCore::Context::Context* CTX, FEXCore::Core::CpuStateFrame* Frame) {
+  // The dispatcher has spilled the guest state and reset the JIT stack; raise the guest exception without a host fault.
+  auto Thread = Frame->Thread;
+  auto& Fault = Thread->CurrentFrame->SynchronousFaultData;
+
+  uint64_t FPCR, FPSR;
+  __asm volatile("mrs %[fpcr], fpcr" : [fpcr] "=r"(FPCR));
+  __asm volatile("mrs %[fpsr], fpsr" : [fpsr] "=r"(FPSR));
+
+  auto Context = StoreStateToPackedECContext(Thread, static_cast<uint32_t>(FPCR), static_cast<uint32_t>(FPSR));
+  // Match the host exception codes of the faulting GuestSignal_* handlers (hlt, brk, null load).
+  EXCEPTION_RECORD Record = {};
+  switch (Fault.Signal) {
+  case FEXCore::Core::FAULT_SIGILL: Record.ExceptionCode = EXCEPTION_ILLEGAL_INSTRUCTION; break;
+  case FEXCore::Core::FAULT_SIGTRAP: Record.ExceptionCode = EXCEPTION_BREAKPOINT; break;
+  case FEXCore::Core::FAULT_SIGSEGV: Record.ExceptionCode = EXCEPTION_ACCESS_VIOLATION; break;
+  default: ERROR_AND_DIE_FMT("Unknown fault signal"); break;
+  }
+
+  RaiseException(Thread, Record, Context);
+  ERROR_AND_DIE_FMT("This should always noreturn");
+}
+
 class ECSyscallHandler : public FEXCore::HLE::SyscallHandler, public FEXCore::Allocator::FEXAllocOperators {
 public:
   ECSyscallHandler() = default;
 
   void HandleSyscall(FEXCore::Core::CpuStateFrame* Frame) override {
-    ProcessPendingCrossProcessEmulatorWork();
+    ProcessCrossProcessWork();
 
     // Manually raise an exeption with the current JIT state packed into a native context, ntdll handles this and
     // reenters the JIT (see dlls/ntdll/signal_arm64ec.c in wine).
@@ -585,6 +630,11 @@ public:
     InvalidationTracker->InvalidateAlignedInterval(Start, Length, false);
   }
 
+  bool InvalidateCallRetStack(FEXCore::Core::InternalThreadState* Thread) override {
+    FEX::Windows::CallRetStack::Invalidate(Thread, GetFrontendThreadData(Thread)->CallRetStack);
+    return true;
+  }
+
   void MarkOvercommitRange(uint64_t Start, uint64_t Length) override {
     OvercommitTracker->MarkRange(Start, Length);
   }
@@ -598,13 +648,13 @@ public:
   }
 
   void PreCompile() override {
-    ProcessPendingCrossProcessEmulatorWork();
+    ProcessCrossProcessWork();
   }
 };
 } // namespace Exception
 
 extern "C" void SyncThreadContext(CONTEXT* Context) {
-  ProcessPendingCrossProcessEmulatorWork();
+  ProcessCrossProcessWork();
   auto* Thread = GetCPUArea().ThreadState();
   // Wine transports arithmetic flags, DF and TF. Preserve only the system flags absent from that packet.
   static constexpr uint32_t ECValidEFlagsMask {(1U << FEXCore::X86State::RFLAG_OF_RAW_LOC) | (1U << FEXCore::X86State::RFLAG_CF_RAW_LOC) |
@@ -727,7 +777,7 @@ bool ResetToConsistentStateImpl(const ThreadCPUArea CPUArea, EXCEPTION_RECORD* E
       return true;
     }
 
-    if (FEX::Windows::CallRetStack::HandleAccessViolation(Thread, FaultAddress, NativeContext->X17)) {
+    if (FEX::Windows::CallRetStack::HandleAccessViolation(Thread, GetFrontendThreadData(Thread)->CallRetStack, FaultAddress, NativeContext->X17)) {
       return true;
     }
 
@@ -780,7 +830,7 @@ bool ResetToConsistentStateImpl(const ThreadCPUArea CPUArea, EXCEPTION_RECORD* E
   }
 
   if (IsEmulatorStackAddress(CPUArea, reinterpret_cast<uint64_t>(__builtin_frame_address(0)))) {
-    Exception::RethrowGuestException(*Exception, *NativeContext);
+    Exception::RethrowGuestException(Thread, *Exception, *NativeContext);
     LogMan::Msg::DFmt("Rethrowing onto guest stack: {:X}", NativeContext->Sp);
     return true;
   } else {
@@ -888,14 +938,18 @@ void NotifyMemoryAlloc(void* Address, SIZE_T Size, ULONG Type, ULONG Prot, BOOL 
     return;
   }
 
+  // MEM_RESET(_UNDO) ignores the passed permissions
+  const bool Reset = Type & (MEM_RESET | MEM_RESET_UNDO);
+  const ULONG EffectiveProt = Reset ? PAGE_NOACCESS : Prot;
+  const auto Base = reinterpret_cast<uint64_t>(Address);
   if (!After) {
-    ThreadCreationMutex.lock();
+    InvalidationTracker->BeginMemoryChange(ThreadCreationMutex, GetPendingMemoryChange(), Base, Size, EffectiveProt);
   } else {
-    // MEM_RESET(_UNDO) ignores the passed permissions
-    if (!Status && !(Type & (MEM_RESET | MEM_RESET_UNDO))) {
-      InvalidationTracker->HandleMemoryProtectionNotification(reinterpret_cast<uint64_t>(Address), static_cast<uint64_t>(Size), Prot);
-    }
-    ThreadCreationMutex.unlock();
+    InvalidationTracker->EndMemoryChange(ThreadCreationMutex, GetPendingMemoryChange(), Base, Size, EffectiveProt, !Status, [&] {
+      if (!Reset) {
+        InvalidationTracker->HandleMemoryProtectionNotification(Base, Size, Prot);
+      }
+    });
   }
 }
 
@@ -904,13 +958,12 @@ void NotifyMemoryFree(void* Address, SIZE_T Size, ULONG FreeType, BOOL After, NT
     return;
   }
 
+  const auto Base = reinterpret_cast<uint64_t>(Address);
   if (!After) {
-    ThreadCreationMutex.lock();
+    InvalidationTracker->BeginMemoryChange(ThreadCreationMutex, GetPendingMemoryChange(), Base, Size, PAGE_NOACCESS);
   } else {
-    if (!Status) {
-      InvalidationTracker->InvalidateAlignedInterval(reinterpret_cast<uint64_t>(Address), static_cast<uint64_t>(Size), true);
-    }
-    ThreadCreationMutex.unlock();
+    InvalidationTracker->EndMemoryChange(ThreadCreationMutex, GetPendingMemoryChange(), Base, Size, PAGE_NOACCESS, !Status,
+                                         [&] { InvalidationTracker->InvalidateAlignedInterval(Base, Size, true); });
   }
 }
 
@@ -919,13 +972,12 @@ void NotifyMemoryProtect(void* Address, SIZE_T Size, ULONG NewProt, BOOL After, 
     return;
   }
 
+  const auto Base = reinterpret_cast<uint64_t>(Address);
   if (!After) {
-    ThreadCreationMutex.lock();
+    InvalidationTracker->BeginMemoryChange(ThreadCreationMutex, GetPendingMemoryChange(), Base, Size, NewProt);
   } else {
-    if (!Status) {
-      InvalidationTracker->HandleMemoryProtectionNotification(reinterpret_cast<uint64_t>(Address), static_cast<uint64_t>(Size), NewProt);
-    }
-    ThreadCreationMutex.unlock();
+    InvalidationTracker->EndMemoryChange(ThreadCreationMutex, GetPendingMemoryChange(), Base, Size, NewProt, !Status,
+                                         [&] { InvalidationTracker->HandleMemoryProtectionNotification(Base, Size, NewProt); });
   }
 }
 
@@ -949,13 +1001,9 @@ void NotifyUnmapViewOfSection(void* Address, BOOL After, NTSTATUS Status) {
   }
 
   if (!After) {
-    ThreadCreationMutex.lock();
-    auto [Start, Size] = InvalidationTracker->InvalidateContainingSection(reinterpret_cast<uint64_t>(Address), true);
-    if (Size) {
-      HandleImageUnmap(Start, Size);
-    }
+    InvalidationTracker->BeginUnmap(ThreadCreationMutex, GetPendingMemoryChange(), reinterpret_cast<uint64_t>(Address), HandleImageUnmap);
   } else {
-    ThreadCreationMutex.unlock();
+    InvalidationTracker->EndUnmap(ThreadCreationMutex, GetPendingMemoryChange(), !Status);
   }
 }
 
@@ -1040,7 +1088,8 @@ void BTCpu64NotifyReadFile(HANDLE Handle, void* Address, SIZE_T Size, BOOL After
 }
 
 NTSTATUS ThreadInit() {
-  std::scoped_lock Lock(ThreadCreationMutex);
+  // Only the Threads map needs the lock. Creating the thread state allocates memory, and its notifications must not
+  // wait behind other threads' executable changes for the whole of thread creation.
   FEX::Windows::InitCRTThread();
   const auto CPUArea = GetCPUArea();
 
@@ -1070,8 +1119,10 @@ NTSTATUS ThreadInit() {
   Frame->State.cs_idx = FEXCore::Core::CPUState::DEFAULT_USER_CS << 3;
   Frame->State.cs_cached = FEXCore::Core::CPUState::CalculateGDTBase(GDT);
 
-  FEX::Windows::CallRetStack::InitializeThread(Thread);
+  Thread->FrontendPtr = new FrontendThreadData();
+  FEX::Windows::CallRetStack::InitializeThread(Thread, GetFrontendThreadData(Thread)->CallRetStack);
   Thread->CurrentFrame->Pointers.ExitFunctionEC = reinterpret_cast<uintptr_t>(&ExitFunctionEC);
+  Thread->CurrentFrame->Pointers.SynchronousExceptionHandler = reinterpret_cast<uintptr_t>(&Exception::SynchronousExceptionHandler);
   CPUArea.StateFrame() = Thread->CurrentFrame;
 
   uint64_t EnterEC = Thread->CurrentFrame->Pointers.DispatcherLoopTopEnterEC;
@@ -1093,14 +1144,12 @@ NTSTATUS ThreadInit() {
                             .AMD64_ControlWord = 0x27f};
   Exception::LoadStateFromECContext(Thread, CPUArea.ContextAmd64().AMD64_Context);
 
-  Thread->FrontendPtr = new FrontendThreadData();
-
-  {
-    auto ThreadTID = GetCurrentThreadId();
-    Threads.emplace(ThreadTID, Thread);
-    if (StatAllocHandler) {
-      Thread->ThreadStats = StatAllocHandler->AllocateSlot(ThreadTID);
-    }
+  // ThreadTerm reads the CPU area state of any thread it finds in Threads.
+  std::scoped_lock Lock(ThreadCreationMutex);
+  auto ThreadTID = GetCurrentThreadId();
+  Threads.emplace(ThreadTID, Thread);
+  if (StatAllocHandler) {
+    Thread->ThreadStats = StatAllocHandler->AllocateSlot(ThreadTID);
   }
 
   CPUArea.ThreadState() = Thread;

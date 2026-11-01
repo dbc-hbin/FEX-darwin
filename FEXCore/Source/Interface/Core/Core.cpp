@@ -64,8 +64,10 @@ $end_info$
 #include <condition_variable>
 #include <fcntl.h>
 #include <functional>
+#include <limits>
 #include <mutex>
 #include <queue>
+#include <ranges>
 #include <shared_mutex>
 #include <signal.h>
 #include <stdio.h>
@@ -506,7 +508,50 @@ void ContextImpl::ClearCodeCache(FEXCore::Core::InternalThreadState* Thread, boo
     auto lk = Thread->LookupCache->AcquireWriteLock();
     Thread->LookupCache->ClearCache(lk);
   }
-  Allocator::VirtualDontNeed(Thread->CallRetStackBase, FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE);
+  InvalidateCallRetStack(Thread);
+}
+
+// Whether an op can write guest memory, serialize, or leave translated code to run other guest or host code.
+// Unlisted ops only touch registers, the thread context or host-side state.
+static bool CanChangeCodeBytes(IR::IROps Op) {
+  switch (Op) {
+  case IR::OP_STOREMEM:
+  case IR::OP_STOREMEMPAIR:
+  case IR::OP_STOREMEMX87SVEOPTPREDICATE:
+  case IR::OP_STOREMEMTSO:
+  case IR::OP_STORESTACKMEM:
+  case IR::OP_VSTOREVECTORMASKED:
+  case IR::OP_VSTOREVECTORELEMENT:
+  case IR::OP_VSTORENONTEMPORAL:
+  case IR::OP_VSTORENONTEMPORALPAIR:
+  case IR::OP_PUSH:
+  case IR::OP_PUSHTWO:
+  case IR::OP_MEMSET:
+  case IR::OP_MEMCPY:
+  case IR::OP_CACHELINECLEAR:
+  case IR::OP_CACHELINECLEAN:
+  case IR::OP_CACHELINEZERO:
+  case IR::OP_CAS:
+  case IR::OP_CASPAIR:
+  case IR::OP_ATOMICSWAP:
+  case IR::OP_ATOMICFETCHADD:
+  case IR::OP_ATOMICFETCHSUB:
+  case IR::OP_ATOMICFETCHAND:
+  case IR::OP_ATOMICFETCHCLR:
+  case IR::OP_ATOMICFETCHOR:
+  case IR::OP_ATOMICFETCHXOR:
+  case IR::OP_ATOMICFETCHNEG:
+  case IR::OP_MONOBACKPATCHERWRITE:
+  case IR::OP_FENCE:
+  case IR::OP_CPUID:
+  case IR::OP_SYSCALL:
+  case IR::OP_THUNK:
+  case IR::OP_CALLBACKRETURN:
+  case IR::OP_BREAK:
+  case IR::OP_PRINT:
+  case IR::OP_PRINTMSG: return true;
+  default: return false;
+  }
 }
 
 static void IRDumper(FEXCore::Core::InternalThreadState* Thread, IR::IREmitter* IREmitter, uint64_t GuestRIP) {
@@ -605,7 +650,16 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
         Thread->OpDispatcher->ExitFunction(Thread->OpDispatcher->_InlineEntrypointOffset(GPRSize, Block.Entry - GuestRIP));
       }
 
+      // Code validation covers a segment of straight-line instructions with one check before
+      // the first. Instructions between the check and a segment end cannot write guest memory
+      // or leave the JIT, so this thread cannot change the bytes of later instructions in the
+      // segment; another thread's modification needs serialization by this thread before it is
+      // architecturally visible (Intel SDM Vol. 3A, "Handling Self- and Cross-Modifying Code"), and every
+      // serializing or JIT-leaving instruction ends the segment.
       uint64_t BlockInstructionsLength {};
+      IR::IROp_ValidateCode* SegmentValidate {};
+      IR::IROp_Constant* SegmentCRC {};
+      size_t SegmentScanNode {};
       for (size_t i = 0; i < InstsInBlock; ++i) {
         uint64_t InstAddress = Block.Entry + BlockInstructionsLength;
         const FEXCore::X86Tables::X86InstInfo* TableInfo {nullptr};
@@ -665,35 +719,58 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
         // that more explicitly later.
         Thread->OpDispatcher->FlushRegisterCache(true);
 
+        const bool ValidateCode = Config.SMCChecks == FEXCore::Config::CONFIG_SMC_FULL || Block.ForceFullSMCDetection;
+        if (ValidateCode && SegmentValidate) {
+          // Per-instruction validation used to end the IR block here. Keep its complete
+          // flush so fault-visible state matches without the check.
+          Thread->OpDispatcher->FlushRegisterCache();
+        }
+
         if (ExtendedDebugInfo || DivRemainderDead || Thread->OpDispatcher->CanHaveSideEffects(TableInfo, DecodedInfo)) {
           Thread->OpDispatcher->_GuestOpcode(InstAddress - GuestRIP);
         }
 
-        if (Config.SMCChecks == FEXCore::Config::CONFIG_SMC_FULL || Block.ForceFullSMCDetection) {
-          auto ExistingCodePtr = reinterpret_cast<uint8_t*>(GetGuestBase() + Block.Entry + BlockInstructionsLength);
-          auto InstAddressReg = Thread->OpDispatcher->_EntrypointOffset(GPRSize, InstAddress - GuestRIP);
-
-          auto crc32 = [](const uint8_t* Ptr, size_t Size) -> uint32_t {
+        auto crc32 = [](const uint8_t* Ptr, size_t Size) -> uint32_t {
 #if defined(ARCHITECTURE_arm64)
-            uint32_t Result {};
+          uint32_t Result {};
 #define do_crc(type, suffix)                                               \
   while (Size >= sizeof(type)) {                                           \
     Result = __crc32##suffix(Result, *reinterpret_cast<const type*>(Ptr)); \
     Ptr += sizeof(type);                                                   \
     Size -= sizeof(type);                                                  \
   }
-            do_crc(uint64_t, d);
-            do_crc(uint32_t, w);
-            do_crc(uint16_t, h);
-            do_crc(uint8_t, b);
-            return Result;
+          do_crc(uint64_t, d);
+          do_crc(uint32_t, w);
+          do_crc(uint16_t, h);
+          do_crc(uint8_t, b);
+          return Result;
 #else
-            // Unsupported on non-arm.
-            return 0;
+          // Unsupported on non-arm.
+          return 0;
 #endif
-          };
-          auto CodeChanged = Thread->OpDispatcher->_ValidateCode(
-            Thread->OpDispatcher->Constant(crc32(ExistingCodePtr, DecodedInfo->InstSize)), InstAddressReg, DecodedInfo->InstSize);
+        };
+        if (ValidateCode) {
+          if (SegmentValidate) {
+            const uint64_t SegmentStart = InstAddress - SegmentValidate->CodeLength;
+            const uint64_t SegmentLength = SegmentValidate->CodeLength + DecodedInfo->InstSize;
+            if (SegmentLength > std::numeric_limits<uint8_t>::max() ||
+                (SegmentStart & FEXCore::Utils::FEX_PAGE_MASK) != ((InstAddress + DecodedInfo->InstSize - 1) & FEXCore::Utils::FEX_PAGE_MASK)) {
+              SegmentValidate = nullptr;
+            } else {
+              SegmentValidate->CodeLength = SegmentLength;
+              SegmentCRC->Constant = crc32(reinterpret_cast<const uint8_t*>(GetGuestBase() + SegmentStart), SegmentLength);
+            }
+          }
+        }
+
+        if (ValidateCode && !SegmentValidate) {
+          auto ExistingCodePtr = reinterpret_cast<uint8_t*>(GetGuestBase() + InstAddress);
+          auto InstAddressReg = Thread->OpDispatcher->_EntrypointOffset(GPRSize, InstAddress - GuestRIP);
+          // Unpooled: the segment extends this constant in place.
+          auto CRC = Thread->OpDispatcher->_Constant(crc32(ExistingCodePtr, DecodedInfo->InstSize));
+          auto CodeChanged = Thread->OpDispatcher->_ValidateCode(CRC, InstAddressReg, DecodedInfo->InstSize);
+          SegmentValidate = CodeChanged.first;
+          SegmentCRC = CRC.first;
 
           auto InvalidateCodeCond = Thread->OpDispatcher->CondJump(CodeChanged);
 
@@ -734,7 +811,16 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
           }
 
           Thread->OpDispatcher->SetForceTSO(ForceTSO);
+          SegmentScanNode = Thread->OpDispatcher->GetAllocatedNodeCount();
           std::invoke(Fn, Thread->OpDispatcher, DecodedInfo);
+          if (SegmentValidate) {
+            for (size_t Node = SegmentScanNode, End = Thread->OpDispatcher->GetAllocatedNodeCount(); Node < End; ++Node) {
+              if (CanChangeCodeBytes(Thread->OpDispatcher->GetAllocatedNodeOp(Node))) {
+                SegmentValidate = nullptr;
+                break;
+              }
+            }
+          }
           if (Thread->OpDispatcher->HadDecodeFailure()) {
             HadDispatchError = true;
           } else {
@@ -939,11 +1025,14 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
 
         LOGMAN_THROW_A_FMT(Hit->EntryPointRIPs.size() == Hit->EntryPointHostOffsets.size(), "Mismatched Disk Cache entrypoint pairs!");
 
+        auto EntryPoints = std::views::iota(size_t {0}, Hit->EntryPointRIPs.size()) | std::views::transform([&](size_t i) {
+                             return std::pair {Hit->EntryPointRIPs[i], LoadedCode.BlockBegin + Hit->EntryPointHostOffsets[i]};
+                           });
+        Thread->LookupCache->AddBlockMappings(Thread, EntryPoints, Hit->GuestPages);
+
         uintptr_t CachedHostCode = 0;
-        for (size_t i = 0; i < Hit->EntryPointRIPs.size(); i++) {
-          void* HostAddr = LoadedCode.BlockBegin + Hit->EntryPointHostOffsets[i];
-          Thread->LookupCache->AddBlockMapping(Thread, Hit->EntryPointRIPs[i], Hit->GuestPages, HostAddr);
-          if (Hit->EntryPointRIPs[i] == GuestRIP) {
+        for (const auto& [GuestAddr, HostAddr] : EntryPoints) {
+          if (GuestAddr == GuestRIP) {
             CachedHostCode = reinterpret_cast<uintptr_t>(HostAddr);
           }
         }
@@ -1053,9 +1142,7 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
   }
 
   // Insert to lookup cache
-  for (auto [GuestAddr, HostAddr] : CompiledCode.EntryPoints) {
-    Thread->LookupCache->AddBlockMapping(Thread, GuestAddr, CodePages, HostAddr);
-  }
+  Thread->LookupCache->AddBlockMappings(Thread, CompiledCode.EntryPoints, CodePages);
 
   // Clear any relocations that might have been generated
   if (!CodeCache.IsGeneratingCache) {
@@ -1116,9 +1203,20 @@ void ContextImpl::InvalidateThreadCachedCodeRange(FEXCore::Core::InternalThreadS
   if (Thread->LookupCache->InvalidateCacheRange(Start, Length)) {
     FEXCORE_PROFILE_SCOPED("InvalidateCallRet");
 
-    // This may cause access violations in the thread on Windows as zeroing is not atomic, this is handled by the frontend
-    Allocator::VirtualDontNeed(Thread->CallRetStackBase, FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE);
+    InvalidateCallRetStack(Thread);
   }
+}
+
+void ContextImpl::InvalidateCallRetStack(FEXCore::Core::InternalThreadState* Thread) {
+  // Threads not created by the frontend (e.g. the cache validation thread) have no call-ret stack.
+  if (!Thread->CallRetStackBase) {
+    return;
+  }
+  if (SyscallHandler && SyscallHandler->InvalidateCallRetStack(Thread)) {
+    return;
+  }
+  // This may cause access violations in a concurrently running thread as zeroing is not atomic, this is handled by the frontend
+  Allocator::VirtualDontNeed(Thread->CallRetStackBase, FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE);
 }
 
 void ContextImpl::ThreadRemoveCodeEntryFromJit(FEXCore::Core::CpuStateFrame* Frame, uint64_t GuestRIP) {

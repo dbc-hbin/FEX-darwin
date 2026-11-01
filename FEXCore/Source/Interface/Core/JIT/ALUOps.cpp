@@ -745,7 +745,88 @@ DEF_OP(PDep) {
       bdep(ARMEmitter::SubRegSize::i64Bit, VTMP1.Z(), VTMP1.Z(), VTMP2.Z());
       umov<ARMEmitter::SubRegSize::i64Bit>(Dest, VTMP1, 0);
     }
-  } else {
+    return;
+  }
+
+  ARMEmitter::ForwardLabel Loop;
+  ARMEmitter::ForwardLabel Done;
+
+  if (CTX->HostFeatures.SupportsPMULL_128Bit && CTX->HostFeatures.SupportsCSSC) {
+    // Branchless expand from Hacker's Delight 7-5. The mask half is the PEXT compress rounds
+    // (prefix-XOR via carry-less multiply with all-ones), recording the moved-bit mask of each
+    // round; the value is then expanded by replaying those masks in reverse with left shifts.
+    // The recorded masks do not fit in the scratch registers, so they go to a small host stack
+    // frame. It costs a constant ~75 instructions, so masks with few set bits still take the
+    // loop below. In guest measurements on M5 Pro the two break even at about 13 set bits for
+    // 64-bit and 11 for 32-bit.
+    // Only non-flag-setting instructions are used, so NZCV is untouched.
+    const uint32_t LoopMaxPopCount = EmitSize == ARMEmitter::Size::i32Bit ? 11 : 13;
+    const auto MoveKeep = TMP1.R(); // mk, then the expanded value once the mask rounds are done
+    const auto MaskCur = TMP2.R();
+    const auto MoveVal = TMP3.R();
+    const auto Temp = TMP4.R();
+    const auto Prefix = VTMP1;
+    const auto AllOnes = VTMP2;
+    const int Rounds = EmitSize == ARMEmitter::Size::i32Bit ? 5 : 6;
+    constexpr uint32_t FrameSize = 48;
+
+    cnt(EmitSize, TMP1, OrigMask);
+    sub(ARMEmitter::Size::i64Bit, TMP1, TMP1, LoopMaxPopCount);
+    (void)tbnz(TMP1, 63, &Loop);
+
+    sub(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::rsp, ARMEmitter::Reg::rsp, FrameSize);
+    movi(ARMEmitter::SubRegSize::i64Bit, AllOnes.Q(), ~0ULL);
+    mvn(EmitSize, MoveKeep, OrigMask);
+    lsl(EmitSize, MoveKeep, MoveKeep, 1);
+    mov(EmitSize, MaskCur, OrigMask);
+
+    for (int Round = 0; Round < Rounds; ++Round) {
+      const int Shift = 1 << Round;
+      // A 32-bit move zero-extends, and the upper half of the product is discarded by the
+      // 32-bit operations that follow.
+      if (EmitSize == ARMEmitter::Size::i32Bit) {
+        fmov(ARMEmitter::Size::i32Bit, Prefix.S(), MoveKeep.W());
+      } else {
+        fmov(ARMEmitter::Size::i64Bit, Prefix.D(), MoveKeep.X());
+      }
+      pmull(ARMEmitter::SubRegSize::i128Bit, Prefix.D(), Prefix.D(), AllOnes.D());
+      if (EmitSize == ARMEmitter::Size::i32Bit) {
+        fmov(ARMEmitter::Size::i32Bit, MoveVal.W(), Prefix.S());
+      } else {
+        fmov(ARMEmitter::Size::i64Bit, MoveVal.X(), Prefix.D());
+      }
+      if (Round != Rounds - 1) {
+        bic(EmitSize, MoveKeep, MoveKeep, MoveVal);
+      }
+      and_(EmitSize, MoveVal, MoveVal, MaskCur);
+      if (Round != Rounds - 1) {
+        eor(EmitSize, MaskCur, MaskCur, MoveVal);
+        orr(EmitSize, MaskCur, MaskCur, MoveVal, ARMEmitter::ShiftType::LSR, Shift);
+        str(MoveVal.X(), ARMEmitter::Reg::rsp, Round * 8);
+      }
+    }
+
+    // Expand, last round first. The last round's moved-bit mask is still in MoveVal.
+    const auto Value = MoveKeep;
+    mov(ARMEmitter::Size::i64Bit, Value, OrigInput);
+    for (int Round = Rounds - 1; Round >= 0; --Round) {
+      const int Shift = 1 << Round;
+      if (Round != Rounds - 1) {
+        ldr(MoveVal.X(), ARMEmitter::Reg::rsp, Round * 8);
+      }
+      lsl(EmitSize, Temp, Value, Shift);
+      bic(EmitSize, Value, Value, MoveVal);
+      and_(EmitSize, Temp, Temp, MoveVal);
+      orr(EmitSize, Value, Value, Temp);
+    }
+    add(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::rsp, ARMEmitter::Reg::rsp, FrameSize);
+    // Dest may alias the input or mask, so it is written last.
+    and_(EmitSize, Dest, Value, OrigMask);
+    (void)b(&Done);
+    (void)Bind(&Loop);
+  }
+
+  {
     // PDep implementation follows the ideas from
     // http://0x80.pl/articles/pdep-soft-emu.html ... Basically, iterate the *set*
     // bits only, which will be faster than the naive implementation as long as
@@ -766,7 +847,6 @@ DEF_OP(PDep) {
     const auto T1 = TMP4.R();
 
     ARMEmitter::BackwardLabel NextBit;
-    ARMEmitter::ForwardLabel Done;
 
     // First, copy the input/mask, since we'll be clobbering. Copy as 64-bit to
     // make this 0-uop on Firestorm.
@@ -821,14 +901,73 @@ DEF_OP(PExt) {
       bext(ARMEmitter::SubRegSize::i64Bit, VTMP1.Z(), VTMP1.Z(), VTMP2.Z());
       umov<ARMEmitter::SubRegSize::i64Bit>(Dest, VTMP1, 0);
     }
-  } else {
+    return;
+  }
+
+  ARMEmitter::ForwardLabel Loop;
+  ARMEmitter::ForwardLabel Done;
+  const bool Branchless = CTX->HostFeatures.SupportsPMULL_128Bit && CTX->HostFeatures.SupportsCSSC;
+
+  if (Branchless) {
+    // Branchless compress from Hacker's Delight 7-4, with the prefix-XOR of each round computed
+    // by a carry-less multiply with all-ones. Each round moves every selected bit right by
+    // 1, 2, 4, ... positions according to the parity of the zero mask bits below it.
+    // It costs a constant ~60 instructions, so masks with few set bits still take the loop
+    // below. In guest measurements on M5 Pro the two break even at about 10 set bits for
+    // 64-bit and 8 for 32-bit.
+    // Only non-flag-setting instructions are used, so NZCV is untouched.
+    const uint32_t LoopMaxPopCount = EmitSize == ARMEmitter::Size::i32Bit ? 8 : 10;
+    const auto MoveKeep = TMP1.R();  // mk: bits whose zero-count parity is still pending
+    const auto MaskCur = TMP2.R();   // m, compressed alongside the value
+    const auto MoveVal = TMP3.R();   // mv
+    const auto Prefix = VTMP1;
+    const auto AllOnes = VTMP2;
+    const auto RegSize = EmitSize == ARMEmitter::Size::i32Bit ? 32 : 64;
+
+    cnt(EmitSize, TMP1, Mask);
+    sub(ARMEmitter::Size::i64Bit, TMP1, TMP1, LoopMaxPopCount);
+    (void)tbnz(TMP1, 63, &Loop);
+
+    movi(ARMEmitter::SubRegSize::i64Bit, AllOnes.Q(), ~0ULL);
+    mvn(EmitSize, MoveKeep, Mask);
+    lsl(EmitSize, MoveKeep, MoveKeep, 1);
+    mov(EmitSize, MaskCur, Mask);
+    // Dest may alias Input or Mask, so it is written only after both are consumed.
+    and_(EmitSize, Dest, Input, Mask);
+
+    for (int Shift = 1; Shift < RegSize; Shift <<= 1) {
+      // mp = prefix_xor(mk). A 32-bit move zero-extends, and the upper half of the product
+      // is discarded by the 32-bit operations that follow.
+      if (EmitSize == ARMEmitter::Size::i32Bit) {
+        fmov(ARMEmitter::Size::i32Bit, Prefix.S(), MoveKeep.W());
+      } else {
+        fmov(ARMEmitter::Size::i64Bit, Prefix.D(), MoveKeep.X());
+      }
+      pmull(ARMEmitter::SubRegSize::i128Bit, Prefix.D(), Prefix.D(), AllOnes.D());
+      if (EmitSize == ARMEmitter::Size::i32Bit) {
+        fmov(ARMEmitter::Size::i32Bit, MoveVal.W(), Prefix.S());
+      } else {
+        fmov(ARMEmitter::Size::i64Bit, MoveVal.X(), Prefix.D());
+      }
+      bic(EmitSize, MoveKeep, MoveKeep, MoveVal);
+      and_(EmitSize, MoveVal, MoveVal, MaskCur);
+      eor(EmitSize, MaskCur, MaskCur, MoveVal);
+      orr(EmitSize, MaskCur, MaskCur, MoveVal, ARMEmitter::ShiftType::LSR, Shift);
+      and_(EmitSize, MoveVal, Dest, MoveVal);
+      eor(EmitSize, Dest, Dest, MoveVal);
+      orr(EmitSize, Dest, Dest, MoveVal, ARMEmitter::ShiftType::LSR, Shift);
+    }
+    (void)b(&Done);
+    (void)Bind(&Loop);
+  }
+
+  {
     const auto MaskReg = TMP1;
     const auto BitReg = TMP2;
     const auto ValueReg = TMP3;
 
     ARMEmitter::ForwardLabel EarlyExit;
     ARMEmitter::BackwardLabel NextBit;
-    ARMEmitter::ForwardLabel Done;
 
     (void)cbz(EmitSize, Mask, &EarlyExit);
     mov(EmitSize, MaskReg, Mask);
@@ -852,6 +991,127 @@ DEF_OP(PExt) {
     // All done with nothing to do.
     (void)Bind(&Done);
   }
+}
+
+// Divide a uint128_t by a uint64_t, producing the low 64 bits of the quotient.
+//
+// Adapted from divllu() in libdivide: https://github.com/ridiculousfish/libdivide/blob/master/doc/divlu.c
+// divllu() specifically is licensed as public domain, despite the zlib license that covers the rest of libdivide.
+// divllu() is itself an adaptation of Knuth's classic Algorithm D for long division, with some optimizations.
+// The C comments below follow divllu().
+//
+// Unlike upstream FEX, this never uses the remainder destination as a temporary: it may be invalid when the
+// DIV remainder is unobserved. It needs only TMP1-TMP4 and Quotient. The partial remainder is derived from the
+// estimate correction (rem = c2 - c1 + k * den) instead of a multiply, and q1 is parked in the dead high digit
+// of numlo. Clobbers NZCV.
+//
+// Additional reading:
+// https://ridiculousfish.com/blog/posts/labor-of-division-episode-iv.html
+// https://ridiculousfish.com/blog/posts/labor-of-division-episode-v.html
+void Arm64JITCore::EmitDivllu(ARMEmitter::Register Quotient, ARMEmitter::Register Upper, ARMEmitter::Register Lower,
+                              ARMEmitter::Register Divisor) {
+  const auto EmitSize = ARMEmitter::Size::i64Bit;
+  ARMEmitter::ForwardLabel UpperReduced {};
+  ARMEmitter::ForwardLabel HighDigitDone {};
+  ARMEmitter::ForwardLabel LowDigitDone {};
+
+  // We work in base 2**32. Our numerator is conceptually [num3, num2, num1, num0], our denominator [den1, den0].
+  const auto Shift = TMP1;
+  const auto Den = TMP2;
+  const auto NumHi = TMP3;
+  const auto NumLo = TMP4;
+
+  // An x86 quotient overflow keeps the low 64 bits of the quotient, like the previous helper call:
+  // reduce numhi modulo den first so that numhi < den.
+  if (NumHi != Upper) {
+    mov(EmitSize, NumHi, Upper);
+  }
+  cmp(EmitSize, Upper, Divisor);
+  (void)b(ARMEmitter::Condition::CC_LO, &UpperReduced);
+  udiv(EmitSize, Quotient, Upper, Divisor);
+  msub(EmitSize, NumHi, Quotient, Divisor, Upper);
+  (void)Bind(&UpperReduced);
+
+  // shift = divlu_count_leading_zeros64(den);
+  clz(EmitSize, Shift, Divisor);
+  // den <<= shift;
+  lslv(EmitSize, Den, Divisor, Shift);
+  // numhi <<= shift;
+  lslv(EmitSize, NumHi, NumHi, Shift);
+  // numhi |= (numlo >> (-shift & 63)) & (-(int64_t)shift >> 63);
+  // Computed as (numlo >> (63 - shift)) >> 1, which is zero when shift is zero.
+  mvn(EmitSize, Quotient, Shift);
+  lsrv(EmitSize, Quotient, Lower, Quotient);
+  orr(EmitSize, NumHi, NumHi, Quotient, ARMEmitter::ShiftType::LSR, 1);
+  // numlo <<= shift;
+  lslv(EmitSize, NumLo, Lower, Shift);
+
+  // q1 = [n3 n2 n1] / [d1 d0], estimated as [n3 n2] / [d1] and then corrected.
+  {
+    const auto Den1 = TMP1;
+    const auto Den0 = TMP1;
+    const auto C1 = TMP1;
+    const auto RHat = NumHi;
+    const auto C2 = NumHi;
+
+    // qhat = numhi / den1;
+    lsr(EmitSize, Den1, Den, 32);
+    udiv(EmitSize, Quotient, NumHi, Den1);
+    // rhat = numhi % den1;
+    msub(EmitSize, RHat, Quotient, Den1, NumHi);
+    // c1 = qhat * den0;
+    mov(ARMEmitter::Size::i32Bit, Den0, Den);
+    mul(EmitSize, C1, Quotient, Den0);
+    // c2 = rhat * b + num1;
+    extr(EmitSize, C2, RHat, NumLo, 32);
+    // if (c1 > c2) qhat -= (c1 - c2 > den) ? 2 : 1;
+    // C1 holds c1 - c2 - k * den, where k is the number of corrections.
+    subs(EmitSize, C1, C1, C2);
+    (void)b(ARMEmitter::Condition::CC_LS, &HighDigitDone);
+    sub(EmitSize, Quotient, Quotient, 1);
+    subs(EmitSize, C1, C1, Den);
+    (void)b(ARMEmitter::Condition::CC_LS, &HighDigitDone);
+    sub(EmitSize, Quotient, Quotient, 1);
+    sub(EmitSize, C1, C1, Den);
+    (void)Bind(&HighDigitDone);
+  }
+
+  // rem = numhi * b + num1 - q1 * den = c2 - c1 + k * den;
+  const auto Rem = NumHi;
+  neg(EmitSize, Rem, TMP1);
+  // num1 is dead: numlo = [num0, q1].
+  orr(EmitSize, NumLo, Quotient, NumLo, ARMEmitter::ShiftType::LSL, 32);
+
+  // q0 = [rem1 rem0 n0] / [d1 d0], estimated as [rem1 rem0] / [d1] and then corrected.
+  {
+    const auto Den1 = TMP1;
+    const auto Den0 = TMP1;
+    const auto C1 = TMP1;
+    const auto RHat = Rem;
+    const auto C2 = Rem;
+
+    // qhat = rem / den1;
+    lsr(EmitSize, Den1, Den, 32);
+    udiv(EmitSize, Quotient, Rem, Den1);
+    // rhat = rem % den1;
+    msub(EmitSize, RHat, Quotient, Den1, Rem);
+    // c1 = qhat * den0;
+    mov(ARMEmitter::Size::i32Bit, Den0, Den);
+    mul(EmitSize, C1, Quotient, Den0);
+    // c2 = rhat * b + num0;
+    extr(EmitSize, C2, RHat, NumLo, 32);
+    // if (c1 > c2) qhat -= (c1 - c2 > den) ? 2 : 1;
+    subs(EmitSize, C1, C1, C2);
+    (void)b(ARMEmitter::Condition::CC_LS, &LowDigitDone);
+    sub(EmitSize, Quotient, Quotient, 1);
+    cmp(EmitSize, C1, Den);
+    (void)b(ARMEmitter::Condition::CC_LS, &LowDigitDone);
+    sub(EmitSize, Quotient, Quotient, 1);
+    (void)Bind(&LowDigitDone);
+  }
+
+  // q = ((uint64_t)q1 << 32) | q0;
+  orr(EmitSize, Quotient, Quotient, NumLo, ARMEmitter::ShiftType::LSL, 32);
 }
 
 DEF_OP(Div) {
@@ -926,23 +1186,40 @@ DEF_OP(Div) {
 
     // If the sign bit matches then the result is zero
     (void)cbz(EmitSize, TMP1, &Only64Bit);
+    // x86 raises #DE here, which FEX does not emulate; keep the 64-bit sdiv result.
+    (void)cbz(EmitSize, Divisor, &Only64Bit);
 
-    // Long divide
+    // Long divide: divide the magnitudes unsigned, then apply the sign.
+    // Quotient and Remainder never alias the sources, and nothing here can fault.
     {
-      mov(EmitSize, TMP1, Upper);
-      mov(EmitSize, TMP2, Lower);
-      mov(EmitSize, TMP3, Divisor);
+      const auto Sign = TMP1;
+      const auto AbsUpper = TMP3;
+      const auto AbsLower = TMP4;
+      const auto AbsDivisor = TMP2;
 
-      ldr(TMP4, STATE, offsetof(FEXCore::Core::CpuStateFrame, Pointers.LDIVHandler));
+      mrs(TMP1, ARMEmitter::SystemRegister::NZCV);
+      str(TMP1.W(), STATE.R(), offsetof(FEXCore::Core::CpuStateFrame, State.flags[X86State::RFLAG_NZCV_LOC]));
 
-      str<ARMEmitter::IndexType::PRE>(ARMEmitter::XReg::lr, ARMEmitter::Reg::rsp, -16);
-      blr(TMP4);
-      ldr<ARMEmitter::IndexType::POST>(ARMEmitter::XReg::lr, ARMEmitter::Reg::rsp, 16);
+      asr(EmitSize, Sign, Upper, 63);
+      eor(EmitSize, AbsLower, Lower, Sign);
+      eor(EmitSize, AbsUpper, Upper, Sign);
+      subs(EmitSize, AbsLower, AbsLower, Sign);
+      sbc(EmitSize, AbsUpper, AbsUpper, Sign);
+      cmp(EmitSize, Divisor, 0);
+      cneg(EmitSize, AbsDivisor, Divisor, ARMEmitter::Condition::CC_LT);
 
-      // Move results to the destination registers
-      mov(EmitSize, Quotient, TMP1);
+      EmitDivllu(Quotient, AbsUpper, AbsLower, AbsDivisor);
+
+      // The quotient is negative when the dividend and the divisor have different signs.
+      eor(EmitSize, TMP1, Upper, Divisor);
+      cmp(EmitSize, TMP1, 0);
+      cneg(EmitSize, Quotient, Quotient, ARMEmitter::Condition::CC_LT);
+
+      ldr(TMP1.W(), STATE.R(), offsetof(FEXCore::Core::CpuStateFrame, State.flags[X86State::RFLAG_NZCV_LOC]));
+      msr(ARMEmitter::SystemRegister::NZCV, TMP1);
+
       if (NeedsRemainder) {
-        mov(EmitSize, Remainder, TMP2);
+        msub(EmitSize, Remainder, Quotient, Divisor, Lower);
       }
 
       // Skip 64-bit path
@@ -1020,23 +1297,21 @@ DEF_OP(UDiv) {
     // Check the upper bits for zero
     // If the upper bits are zero then we can do a 64-bit divide
     (void)cbz(EmitSize, Upper, &Only64Bit);
+    // x86 raises #DE here, which FEX does not emulate; keep the 64-bit udiv result.
+    (void)cbz(EmitSize, Divisor, &Only64Bit);
 
-    // Long divide
+    // Long divide. Quotient and Remainder never alias the sources, and nothing here can fault.
     {
-      mov(EmitSize, TMP1, Upper);
-      mov(EmitSize, TMP2, Lower);
-      mov(EmitSize, TMP3, Divisor);
+      mrs(TMP1, ARMEmitter::SystemRegister::NZCV);
+      str(TMP1.W(), STATE.R(), offsetof(FEXCore::Core::CpuStateFrame, State.flags[X86State::RFLAG_NZCV_LOC]));
 
-      ldr(TMP4, STATE, offsetof(FEXCore::Core::CpuStateFrame, Pointers.LUDIVHandler));
+      EmitDivllu(Quotient, Upper, Lower, Divisor);
 
-      str<ARMEmitter::IndexType::PRE>(ARMEmitter::XReg::lr, ARMEmitter::Reg::rsp, -16);
-      blr(TMP4);
-      ldr<ARMEmitter::IndexType::POST>(ARMEmitter::XReg::lr, ARMEmitter::Reg::rsp, 16);
+      ldr(TMP1.W(), STATE.R(), offsetof(FEXCore::Core::CpuStateFrame, State.flags[X86State::RFLAG_NZCV_LOC]));
+      msr(ARMEmitter::SystemRegister::NZCV, TMP1);
 
-      // Move results to the destination registers
-      mov(EmitSize, Quotient, TMP1);
       if (NeedsRemainder) {
-        mov(EmitSize, Remainder, TMP2);
+        msub(EmitSize, Remainder, Quotient, Divisor, Lower);
       }
 
       // Skip 64-bit path

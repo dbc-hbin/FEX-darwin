@@ -5831,6 +5831,17 @@ void OpDispatchBuilder::VPGATHER(OpcodeArgs, OpSize AddrElementSize) {
     }
   };
 
+  // A mask whose last in-block definition is a full-width integer self-compare (the compiler idiom for an
+  // unmasked gather) is all ones. Read this before normalization below redefines the mask register.
+  auto IsAllOnes = [&](uint8_t Index) {
+    const Ref Def = RegCache.LastDef[Index];
+    if (!Def) return false;
+    const auto* Header = GetOpHeader(WrapNode(Def));
+    return Header->Op == IR::OP_VCMPEQ && Header->Size == OpSize::i128Bit && Header->Args[0].ID() == Header->Args[1].ID();
+  };
+  const bool MaskAllOnesLow = Split && IsAllOnes(FPR0Index + MaskReg);
+  const bool MaskAllOnesHigh = Split && IsAllOnes(AVXHigh0Index + MaskReg);
+
   // VEX gathers normalize masks and zero unused lanes before the first faulting access.
   for (unsigned Half = 0; Half < 2; ++Half) {
     Ref Dest = LoadHalf(DestReg, Half);
@@ -5848,7 +5859,21 @@ void OpDispatchBuilder::VPGATHER(OpcodeArgs, OpSize AddrElementSize) {
   const auto DefaultSegment = BaseReg == X86State::REG_RBP || BaseReg == X86State::REG_RSP
     ? X86Tables::DecodeFlags::FLAG_SS_PREFIX : X86Tables::DecodeFlags::FLAG_DS_PREFIX;
   const uint32_t SegmentFlags = (Op->Flags & X86Tables::DecodeFlags::FLAG_SEGMENTS) ?: DefaultSegment;
-  // ponytail: scalar lanes commit fault progress; a vector path needs equivalent architectural recovery.
+  if (Split && Is64BitMode) {
+    // One op commits each lane to the flushed guest registers, so a fault keeps x86 partial state without block splits.
+    FlushRegisterCache();
+    Ref Base = BaseReg != X86State::REG_INVALID ? LoadGPRRegister(BaseReg) : nullptr;
+    Ref Displacement = Operand.IsSIBRelocation() ? _EntrypointOffset(OpSize::i64Bit, Operand.Data.SIB.Offset)
+                       : Operand.Data.SIB.Offset ? Constant(static_cast<int32_t>(Operand.Data.SIB.Offset)) : nullptr;
+    if (Base && Displacement) Base = Add(OpSize::i64Bit, Base, Displacement);
+    else if (Displacement) Base = Displacement;
+    Ref Segment = GetSegment(Op->Flags, DefaultSegment);
+    Ref IndexHigh = Lanes * IndexBytes > 16 ? AVX128_LoadXMMRegister(IndexReg, true) : Invalid();
+    _VGatherLanes(AVX128_LoadXMMRegister(IndexReg, false), IndexHigh, Base ?: Invalid(), Segment ?: Invalid(), DestReg, MaskReg,
+                  ElementSize, AddrElementSize, Lanes, FEXCore::ilog2(Operand.Data.SIB.Scale), AddrSize != OpSize::i64Bit,
+                  IsTSOEnabled(RegClass::GPR), MaskAllOnesLow, MaskAllOnesHigh);
+    return;
+  }
   for (unsigned Lane = 0; Lane < Lanes; ++Lane) {
     const unsigned DataHalf = Lane * ElementBytes / 16;
     const unsigned DataLane = Lane % (16 / ElementBytes);

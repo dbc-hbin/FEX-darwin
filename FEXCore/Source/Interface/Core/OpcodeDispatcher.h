@@ -198,14 +198,14 @@ public:
     auto Cond = Set ? CondClass::TSTNZ : CondClass::TSTZ;
     return _CondJump(Src, InlineConst, InvalidNode, InvalidNode, Cond, OpSize::iInvalid, false);
   }
-  IRPair<IROp_ExitFunction> ExitFunction(Ref NewRIP, BranchHint Hint = BranchHint::None) {
+  IRPair<IROp_ExitFunction> ExitFunction(Ref NewRIP, BranchHint Hint = BranchHint::None, bool InlineCache = false) {
     FlushRegisterCache();
-    return _ExitFunction(GetOpSize(NewRIP), NewRIP, Hint, InvalidNode, InvalidNode);
+    return _ExitFunction(GetOpSize(NewRIP), NewRIP, Hint, InvalidNode, InvalidNode, 0, 0, InlineCache);
   }
   IRPair<IROp_ExitFunction> ExitFunction(Ref NewRIP, BranchHint Hint, Ref CallReturnAddress, Ref CallReturnBlock,
-                                         uint64_t PatchSiteAddress = 0, uint64_t PatchSiteSize = 0) {
+                                         uint64_t PatchSiteAddress = 0, uint64_t PatchSiteSize = 0, bool InlineCache = false) {
     FlushRegisterCache();
-    return _ExitFunction(GetOpSize(NewRIP), NewRIP, Hint, CallReturnAddress, CallReturnBlock, PatchSiteAddress, PatchSiteSize);
+    return _ExitFunction(GetOpSize(NewRIP), NewRIP, Hint, CallReturnAddress, CallReturnBlock, PatchSiteAddress, PatchSiteSize, InlineCache);
   }
   IRPair<IROp_Break> Break(BreakDefinition Reason) {
     FlushRegisterCache();
@@ -442,6 +442,8 @@ public:
   void IMULOp(OpcodeArgs);
   void StringMemOp(OpcodeArgs, bool Copy);
   void CMPSOp(OpcodeArgs);
+  void RepCompareOp(OpcodeArgs, bool Cmps);
+  Ref CrossesGuestPage(IR::OpSize Size, Ref Address, unsigned Bytes);
   void LODSOp(OpcodeArgs);
   void SCASOp(OpcodeArgs);
   void BSWAPOp(OpcodeArgs);
@@ -487,6 +489,7 @@ public:
   void SGDTOp(OpcodeArgs);
   void SIDTOp(OpcodeArgs);
   void SMSWOp(OpcodeArgs);
+  void SLDTOp(OpcodeArgs);
 
   enum class VectorOpType {
     MMX,
@@ -825,6 +828,7 @@ public:
   void LoadFenceOrXRSTOR(OpcodeArgs);
   void MemFenceOrXSAVEOPT(OpcodeArgs);
   void StoreFenceOrCLFlush(OpcodeArgs);
+  void SerializeOp(OpcodeArgs);
   void UMonitorOrCLRSSBSY(OpcodeArgs);
   void UMWaitOp(OpcodeArgs);
   void CLZeroOp(OpcodeArgs);
@@ -1158,6 +1162,12 @@ public:
     // At block boundaries, fix up the carry flag.
     if (!SRAOnly) {
       RectifyCarryInvert(CFInvertedABI);
+
+      // Cross-instruction peephole state cannot be trusted across block boundaries.
+      RegCache.SHA256Rounds.A = nullptr;
+      for (auto& Def : RegCache.LastDef) {
+        Def = nullptr;
+      }
     }
 
     if (!MMXOnly) {
@@ -1523,6 +1533,20 @@ private:
   static bool IsOperandMem(const X86Tables::DecodedOperand& Operand, bool Load) {
     // Literals are immediates as sources but memory addresses as destinations.
     return !(Load && (Operand.IsLiteral() || Operand.IsLiteralRelocation() || Operand.IsLiteralPatchable())) && !Operand.IsGPR();
+  }
+
+  // Import-table style `call/jmp [rip+disp]` (64-bit) or `call/jmp [disp32]` (32-bit): the target comes from one fixed slot,
+  // so it is almost always monomorphic and benefits from a per-callsite inline cache.
+  [[nodiscard]]
+  static bool IsFixedSlotOperand(const X86Tables::DecodedOperand& Operand) {
+    return Operand.IsRIPRelative() || Operand.IsRIPRelativeRelocation();
+  }
+
+  // `call reg` and `call [reg+disp]` (vtable-style) calls. Only calls are cached: register jumps are usually switch
+  // tables or dispatchers with many targets. The cache stays on the slot's first target; other targets use the L1 lookup.
+  [[nodiscard]]
+  static bool IsRegisterCallOperand(const X86Tables::DecodedOperand& Operand) {
+    return Operand.IsGPR() || Operand.IsGPRIndirect() || Operand.IsGPRIndirectRelocation();
   }
 
   [[nodiscard]]
@@ -1926,12 +1950,30 @@ private:
     uint64_t Partial;
 
     Ref Value[64];
+
+    // Per-register write counters and last written value within the current block, for
+    // cross-instruction peepholes. Counters only need to be compared for equality.
+    uint32_t WriteCount[64];
+    Ref LastDef[64];
+
+    // Pending first half of a SHA256RNDS2 pair. A is null when nothing is pending.
+    struct {
+      Ref A;
+      Ref B;
+      Ref Block;
+      uint32_t DestCount;
+      uint32_t SrcCount;
+      uint32_t KeyCount;
+      uint8_t DestReg;
+      uint8_t SrcReg;
+    } SHA256Rounds;
   } RegCache {};
 
   void InvalidateReg(uint8_t Index) {
     uint64_t Bit = (1ull << (uint64_t)Index);
     RegCache.Cached &= ~Bit;
     RegCache.Written &= ~Bit;
+    RegCache.LastDef[Index] = nullptr;
   }
 
   Ref LoadRegCache(uint64_t Offset, uint8_t Index, RegClass Class, IR::OpSize Size) {
@@ -2047,6 +2089,8 @@ private:
     RegCache.Value[Index] = Value;
     RegCache.Cached |= Bit;
     RegCache.Written |= Bit;
+    ++RegCache.WriteCount[Index];
+    RegCache.LastDef[Index] = Value;
   }
 
   void InvalidateHighAVXRegisters() {
