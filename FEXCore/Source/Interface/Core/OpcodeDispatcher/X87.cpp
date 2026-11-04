@@ -113,11 +113,12 @@ void OpDispatchBuilder::FILD(OpcodeArgs) {
   auto absolute = _Neg(OpSize::i64Bit, Data, CondClass::MI);
 
   // left justify the absolute integer
-  auto shift = Sub(OpSize::i64Bit, Constant(63), _FindMSB(IR::OpSize::i64Bit, absolute));
+  auto shift = _CountLeadingZeroes(OpSize::i64Bit, absolute);
   auto shifted = _Lshl(OpSize::i64Bit, absolute, shift);
 
   auto adjusted_exponent = Sub(OpSize::i64Bit, Constant(0x3fff + 63), shift);
-  auto zeroed_exponent = _Select(OpSize::i64Bit, OpSize::i64Bit, CondClass::EQ, absolute, zero, zero, adjusted_exponent);
+  // Normalization preserves NZCV from the signed input comparison above.
+  auto zeroed_exponent = _NZCVSelect(OpSize::i64Bit, CondClass::EQ, zero, adjusted_exponent);
   auto upper = _Or(OpSize::i64Bit, sign, zeroed_exponent);
 
   Ref ConvertedData = _VLoadTwoGPRs(shifted, upper);

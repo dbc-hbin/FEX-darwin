@@ -150,6 +150,8 @@ void Dispatcher::EmitDispatcher() {
 #ifdef ARCHITECTURE_arm64ec
   // Clobbers TMP1/2
   // Check the EC code bitmap incase we need to exit the JIT to call into native code.
+  ARMEmitter::BiDirectionalLabel CheckECCode {};
+  (void)Bind(&CheckECCode);
   ARMEmitter::ForwardLabel l_NotECCode;
   ldr(TMP1, ARMEmitter::XReg::x18, TEB_PEB_OFFSET);
   ldr(TMP1, TMP1, PEB_EC_CODE_BITMAP_OFFSET);
@@ -335,6 +337,15 @@ void Dispatcher::EmitDispatcher() {
 
     br(TMP1);
   }
+
+#ifdef ARCHITECTURE_arm64ec
+  // Native IC slots are immutable, and TMP4 still points to the matched slot after
+  // a call/return stack push. Recheck the live EC bitmap in case the VA was remapped.
+  NativeInlineCacheAddress = GetCursorAddress<uint64_t>();
+  ldr(RipReg, TMP4, 0);
+  str(RipReg, STATE_PTR(CpuStateFrame, State.rip));
+  (void)b(&CheckECCode);
+#endif
 
   // Need to create the block
   {

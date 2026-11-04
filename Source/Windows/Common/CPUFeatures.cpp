@@ -2,6 +2,7 @@
 
 #include "Common/CPUInfo.h"
 
+#include <FEXCore/Config/Config.h>
 #include <FEXCore/Core/Context.h>
 #include <FEXCore/Core/HostFeatures.h>
 #include <FEXCore/fextl/fmt.h>
@@ -9,6 +10,7 @@
 #include <windows.h>
 
 #include "CPUFeatures.h"
+#include "FEXUnixLib.h"
 
 namespace {
 
@@ -92,6 +94,8 @@ FEXCore::HostFeatures CPUFeatures::FetchHostFeatures(bool IsWine, FEXCore::HostF
 
   // ARM64EC raises synchronous guest exceptions from the dispatcher without a host fault.
   HostFeatures.SupportsFaultFreeSynchronousFaults = HostType == FEXCore::HostFeatures::HostTypeEnum::Arm64ec;
+  FEX_CONFIG_OPT(TSOEnabled, TSOENABLED);
+  HostFeatures.SupportsHardwareTSO = TSOEnabled() && UnixLib::TryEnableHardwareTSO();
   return HostFeatures;
 }
 

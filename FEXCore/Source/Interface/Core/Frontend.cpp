@@ -1699,7 +1699,8 @@ void Decoder::DecodeLoop(const uint8_t* _InstStream, uint64_t GuestSizePause) {
   }
 }
 
-void Decoder::SetupDecodeInstructionsAtEntry(FEXCore::Core::InternalThreadState* Thread, uint64_t PC, uint64_t MaxInst) {
+std::optional<ExecutableFileSectionInfo> Decoder::SetupDecodeInstructionsAtEntry(FEXCore::Core::InternalThreadState* Thread, uint64_t PC,
+                                                                                uint64_t MaxInst, bool NeedSection) {
   FEXCORE_PROFILE_SCOPED("DecodeInstructions");
   BlockInfo.TotalInstructionCount = 0;
   BlockInfo.Blocks.clear();
@@ -1730,13 +1731,12 @@ void Decoder::SetupDecodeInstructionsAtEntry(FEXCore::Core::InternalThreadState*
   SectionMaxAddress = ~0ULL;
   Relocations = nullptr;
 
-  if (CTX->GetCodeCache().IsGeneratingCache || EnableCodeCacheValidation) {
-    // If generating cache, attempt to load section bounds and relocations
-    if (auto SectionInfo = CTX->SyscallHandler->LookupExecutableFileSection(Thread, EntryPoint)) {
-      SectionMinAddress = SectionInfo->FileStartVA;
-      SectionMaxAddress = SectionInfo->EndVA;
-      Relocations = &SectionInfo->FileInfo.Relocations;
-    }
+  const bool NeedRelocations = CTX->GetCodeCache().IsGeneratingCache || EnableCodeCacheValidation;
+  auto Section = (NeedSection || NeedRelocations) ? CTX->SyscallHandler->LookupExecutableFileSection(Thread, EntryPoint) : std::nullopt;
+  if (NeedRelocations && Section) {
+    SectionMinAddress = Section->FileStartVA;
+    SectionMaxAddress = Section->EndVA;
+    Relocations = &Section->FileInfo.Relocations;
   }
 
   DecodedMinAddress = EntryPoint;
@@ -1751,6 +1751,7 @@ void Decoder::SetupDecodeInstructionsAtEntry(FEXCore::Core::InternalThreadState*
 
   EntryBlock = true;
   FinalInstruction = false;
+  return Section;
 }
 
 } // namespace FEXCore::Frontend

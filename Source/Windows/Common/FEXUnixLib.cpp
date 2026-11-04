@@ -28,6 +28,9 @@ decltype(__wine_unix_call_dispatcher) UnixCallDispatcher {};
 using wine_server_handle_to_fd_t = NTSTATUS(CDECL*)(HANDLE, unsigned int, int*, unsigned int*);
 static wine_server_handle_to_fd_t WineServerHandleToFd {};
 
+using wine_process_hardware_tso_enabled_t = BOOL(WINAPI*)();
+static wine_process_hardware_tso_enabled_t WineProcessHardwareTSOEnabled {};
+
 #ifdef ARCHITECTURE_arm64ec
 // On ARM64EC, indirect calls go through __os_arm64x_dispatch_icall which invokes
 // FEX's custom call checker. Use a naked trampoline to bypass the dispatch mechanism
@@ -44,6 +47,8 @@ static NTSTATUS __attribute__((naked)) TrampolineCall(unixlib_handle_t, unsigned
 }
 #endif
 bool Init(HMODULE NtDll) {
+  WineProcessHardwareTSOEnabled = reinterpret_cast<wine_process_hardware_tso_enabled_t>(
+    GetProcAddress(NtDll, "__wine_process_hardware_tso_enabled"));
   const auto Sym = GetProcAddress(NtDll, "__wine_unix_call_dispatcher");
   WineServerHandleToFd = reinterpret_cast<wine_server_handle_to_fd_t>(GetProcAddress(NtDll, "wine_server_handle_to_fd"));
 
@@ -97,6 +102,12 @@ bool Available() {
 }
 
 bool TryEnableHardwareTSO() {
+  // This hook promises TSO for every current/future guest-executing thread for
+  // the process lifetime, not just the querying thread. FALSE is authoritative.
+  if (WineProcessHardwareTSOEnabled) {
+    return WineProcessHardwareTSOEnabled() == TRUE;
+  }
+
   if (!Available()) {
     return false;
   }

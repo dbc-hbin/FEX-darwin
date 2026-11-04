@@ -3256,6 +3256,7 @@ void OpDispatchBuilder::StringMemOp(OpcodeArgs, bool Copy) {
     AddrSize == (Is64BitMode ? OpSize::i64Bit : OpSize::i32Bit);
   CalculateDeferredFlags();
   ForeachDirection([&](int32_t PtrDir) {
+    IRPair<IROp_CondJump> PageDone {};
     if (Chunk && PtrDir == 1) {
       // Forward REP runs whole chunks whose source and destination each lie in one 4KiB page: single scalar
       // elements until RDI is 8-byte aligned or past a source page boundary, 8 bytes until RDI is 64-byte
@@ -3286,91 +3287,94 @@ void OpDispatchBuilder::StringMemOp(OpcodeArgs, bool Copy) {
         ToScalar.push_back(CondJump(_And(A, LoadGPRRegister(X86State::REG_RDI, AddrSize), Constant(IR::OpSizeToSize(Size) - 1))));
         NextBlock(ToScalar.back());
       }
-      IRPair<IROp_CondJump> Far {};
-      if (Copy) {
-        // Loading a chunk before storing it is only exact if no store in the chunk feeds a load in it, that is
-        // unless 0 < RDI - RSI < chunk size. 8-byte chunks need a distance outside [1, 7]; it is loop invariant.
-        Far = CondJump(_Lshr(A, _Sub(A, LoadGPRRegister(X86State::REG_RDI, AddrSize), LoadGPRRegister(X86State::REG_RSI, AddrSize)),
-                                  Constant(3)));
-        NextBlock(Far);
-        ToScalar.push_back(CondJump(_Sub(A, LoadGPRRegister(X86State::REG_RDI, AddrSize), LoadGPRRegister(X86State::REG_RSI, AddrSize))));
+      auto Enter = [&](Ref Block) {
+        SetCurrentCodeBlock(Block);
+        StartNewBlock();
+      };
+      auto Reg = [&](unsigned R) { return LoadGPRRegister(R, AddrSize); };
+      auto Distance = [&] { return _Sub(A, Reg(X86State::REG_RDI), Reg(X86State::REG_RSI)); };
+      auto ChunkLoop = [&](Ref Header, bool Wide) {
+        Enter(Header);
+        ToScalar.push_back(CondJump(_Lshr(A, Reg(X86State::REG_RCX), Constant(3 - ElementShift)), CondClass::EQ));
         NextBlock(ToScalar.back());
-      }
-      auto Begin = Jump();
-      auto Header = CreateNewCodeBlockAfter(GetCurrentBlock());
-      SetJumpTarget(Begin, Header);
-      if (Copy) SetTrueJumpTarget(Far, Header);
-      SetCurrentCodeBlock(Header);
-      StartNewBlock();
-      ToScalar.push_back(CondJump(_Lshr(A, LoadGPRRegister(X86State::REG_RCX, AddrSize), Constant(3 - ElementShift)), CondClass::EQ));
-      NextBlock(ToScalar.back());
-      ToNarrow.push_back(CondJump(_And(A, LoadGPRRegister(X86State::REG_RDI, AddrSize), Constant(63))));
-      NextBlock(ToNarrow.back());
-      ToNarrow.push_back(CondJump(_Lshr(A, LoadGPRRegister(X86State::REG_RCX, AddrSize), Constant(6 - ElementShift)), CondClass::EQ));
-      NextBlock(ToNarrow.back());
-      if (Copy) {
-        ToNarrow.push_back(
-          CondJump(_Lshr(A, _Sub(A, LoadGPRRegister(X86State::REG_RDI, AddrSize), LoadGPRRegister(X86State::REG_RSI, AddrSize)), Constant(6)),
-                   CondClass::EQ));
-        NextBlock(ToNarrow.back());
-        ToNarrow.push_back(CondJump(CrossesPage(LoadGPRRegister(X86State::REG_RSI, AddrSize), 64)));
-        NextBlock(ToNarrow.back());
-      }
-      auto Body = [&](unsigned Bytes) {
-        _GuestOpcode(Op->PC - Entry);
-        Ref Src = Copy ? LoadGPRRegister(X86State::REG_RSI, AddrSize) : Invalid();
-        Ref Dest = LoadGPRRegister(X86State::REG_RDI, AddrSize);
-        if (Bytes == 64) {
+        if (Wide) {
+          ToNarrow.push_back(CondJump(_And(A, Reg(X86State::REG_RDI), Constant(63))));
+          NextBlock(ToNarrow.back());
+          ToNarrow.push_back(CondJump(_Lshr(A, Reg(X86State::REG_RCX), Constant(6 - ElementShift)), CondClass::EQ));
+          NextBlock(ToNarrow.back());
           if (Copy) {
-            auto Low = LoadMemPair(RegClass::FPR, OpSize::i128Bit, Src, 0);
-            auto High = LoadMemPair(RegClass::FPR, OpSize::i128Bit, Src, 32);
-            _StoreMemPair(RegClass::FPR, OpSize::i128Bit, Low.Low, Low.High, Dest, 0);
-            _StoreMemPair(RegClass::FPR, OpSize::i128Bit, High.Low, High.High, Dest, 32);
-          } else {
-            Ref Value = _VDupFromGPR(OpSize::i128Bit, Size, LoadGPRRegister(X86State::REG_RAX));
-            _StoreMemPair(RegClass::FPR, OpSize::i128Bit, Value, Value, Dest, 0);
-            _StoreMemPair(RegClass::FPR, OpSize::i128Bit, Value, Value, Dest, 32);
+            ToNarrow.push_back(CondJump(CrossesPage(Reg(X86State::REG_RSI), 64)));
+            NextBlock(ToNarrow.back());
           }
-        } else {
-          Ref Value;
-          if (Copy) {
-            Value = _LoadMem(RegClass::GPR, OpSize::i64Bit, Src, Invalid(), OpSize::i8Bit, MemOffsetType::SXTX, 1);
-          } else if (Size == OpSize::i64Bit) {
-            Value = LoadGPRRegister(X86State::REG_RAX);
-          } else {
-            const unsigned Bits = IR::OpSizeToSize(Size) * 8;
-            Value = _Mul(OpSize::i64Bit, _Bfe(OpSize::i64Bit, Bits, 0, LoadGPRRegister(X86State::REG_RAX)),
-                         Constant(~0ULL / ((1ULL << Bits) - 1)));
-          }
-          // Load each 8-byte chunk after the preceding store, retaining scalar propagation at distance 8.
-          _StoreMem(RegClass::GPR, OpSize::i64Bit, Value, Dest, Invalid(), OpSize::i64Bit, MemOffsetType::SXTX, 1);
+          _GuestOpcode(Op->PC - Entry);
+          FlushRegisterCache();
+          const auto High = Copy ? AllocatePair(RegClass::FPR, OpSize::i128Bit) : RefPair {Invalid(), Invalid()};
+          _RepStringPage(Size, Copy, !Is64BitMode, High.Low, High.High);
+          PageDone = CondJump(Reg(X86State::REG_RCX), CondClass::EQ);
+          SetFalseJumpTarget(PageDone, Header);
+          auto Narrow = CreateNewCodeBlockAfter(GetCurrentBlock());
+          for (auto Jump : ToNarrow) SetTrueJumpTarget(Jump, Narrow);
+          Enter(Narrow);
         }
-        StoreOffset(X86State::REG_RDI, Add(A, Dest, Bytes));
-        if (Copy) StoreOffset(X86State::REG_RSI, Add(A, Src, Bytes));
-        StoreOffset(X86State::REG_RCX, Sub(A, LoadGPRRegister(X86State::REG_RCX, AddrSize), Bytes >> ElementShift));
+
+        // A naturally aligned 8-byte store never straddles a guest page.
+        ToSingle.push_back(CondJump(_And(A, Reg(X86State::REG_RDI), Constant(7))));
+        NextBlock(ToSingle.back());
+        if (Copy) {
+          ToSingle.push_back(CondJump(CrossesPage(Reg(X86State::REG_RSI), 8)));
+          NextBlock(ToSingle.back());
+        }
+        _GuestOpcode(Op->PC - Entry);
+        Ref Dest = Reg(X86State::REG_RDI);
+        Ref Src = Copy ? Reg(X86State::REG_RSI) : Invalid();
+        Ref Value;
+        if (Copy) {
+          Value = _LoadMem(RegClass::GPR, OpSize::i64Bit, Src, Invalid(), OpSize::i8Bit, MemOffsetType::SXTX, 1);
+        } else if (Size == OpSize::i64Bit) {
+          Value = LoadGPRRegister(X86State::REG_RAX);
+        } else {
+          const unsigned Bits = IR::OpSizeToSize(Size) * 8;
+          Value = _Mul(OpSize::i64Bit, _Bfe(OpSize::i64Bit, Bits, 0, LoadGPRRegister(X86State::REG_RAX)),
+                       Constant(~0ULL / ((1ULL << Bits) - 1)));
+        }
+        _StoreMem(RegClass::GPR, OpSize::i64Bit, Value, Dest, Invalid(), OpSize::i64Bit, MemOffsetType::SXTX, 1);
+        StoreOffset(X86State::REG_RDI, Add(A, Dest, 8));
+        if (Copy) StoreOffset(X86State::REG_RSI, Add(A, Src, 8));
+        StoreOffset(X86State::REG_RCX, Sub(A, Reg(X86State::REG_RCX), 8 >> ElementShift));
+        Jump(Header);
+
+        auto Single = CreateNewCodeBlockAfter(GetCurrentBlock());
+        for (auto Jump : ToSingle) SetTrueJumpTarget(Jump, Single);
+        ToSingle.clear();
+        Enter(Single);
+        _GuestOpcode(Op->PC - Entry);
+        Element(PtrDir);
         Jump(Header);
       };
-      Body(64);
-      auto Narrow = CreateNewCodeBlockAfter(GetCurrentBlock());
-      for (auto Jump : ToNarrow) SetTrueJumpTarget(Jump, Narrow);
-      SetCurrentCodeBlock(Narrow);
-      StartNewBlock();
-      // An 8-aligned RDI keeps the 8-byte store inside one page.
-      ToSingle.push_back(CondJump(_And(A, LoadGPRRegister(X86State::REG_RDI, AddrSize), Constant(7))));
       if (Copy) {
-        NextBlock(ToSingle.back());
-        ToSingle.push_back(CondJump(CrossesPage(LoadGPRRegister(X86State::REG_RSI, AddrSize), 8)));
+        // Forward distance is invariant under every index update (including 32-bit wrap).
+        // A previous store can feed the next load at distances 1..7 or 8..63.
+        auto Far = CondJump(_Lshr(A, Distance(), Constant(6)));
+        NextBlock(Far);
+        auto Same = CondJump(Distance(), CondClass::EQ);
+        NextBlock(Same);
+        ToScalar.push_back(CondJump(_Lshr(A, Distance(), Constant(3)), CondClass::EQ));
+        NextBlock(ToScalar.back());
+        auto Begin = Jump();
+        auto NarrowHeader = CreateNewCodeBlockAfter(GetCurrentBlock());
+        SetJumpTarget(Begin, NarrowHeader);
+        ChunkLoop(NarrowHeader, false);
+        auto WideHeader = CreateNewCodeBlockAfter(GetCurrentBlock());
+        SetTrueJumpTarget(Far, WideHeader);
+        SetTrueJumpTarget(Same, WideHeader);
+        ChunkLoop(WideHeader, true);
+      } else {
+        auto Begin = Jump();
+        auto Header = CreateNewCodeBlockAfter(GetCurrentBlock());
+        SetJumpTarget(Begin, Header);
+        ChunkLoop(Header, true);
       }
-      NextBlock(ToSingle.back());
-      Body(8);
-      auto Single = CreateNewCodeBlockAfter(GetCurrentBlock());
-      for (auto Jump : ToSingle) SetTrueJumpTarget(Jump, Single);
-      SetCurrentCodeBlock(Single);
-      StartNewBlock();
-      _GuestOpcode(Op->PC - Entry);
-      Element(PtrDir);
-      Jump(Header);
-      auto Scalar = CreateNewCodeBlockAfter(Single);
+      auto Scalar = CreateNewCodeBlockAfter(GetCurrentBlock());
       for (auto Jump : ToScalar) SetTrueJumpTarget(Jump, Scalar);
       SetCurrentCodeBlock(Scalar);
       StartNewBlock();
@@ -3390,6 +3394,7 @@ void OpDispatchBuilder::StringMemOp(OpcodeArgs, bool Copy) {
     Jump(Header);
     auto End = CreateNewCodeBlockAfter(Body);
     SetTrueJumpTarget(Empty, End);
+    if (Chunk && PtrDir == 1) SetTrueJumpTarget(PageDone, End);
     SetCurrentCodeBlock(End);
     StartNewBlock();
   });
@@ -4661,6 +4666,7 @@ Ref OpDispatchBuilder::LoadSource_WithOpSize(RegClass Class, const X86Tables::De
 
   const bool ShouldLoad = (IsOperandMem(Operand, true) && LoadData) || ForceLoad;
   if (ShouldLoad) {
+    MapFixedSharedDataRead(A, OpSizeToSize(OpSize));
     if (OpSize == OpSize::f80Bit) {
       Ref MemSrc = LoadEffectiveAddress(this, A, GetGPROpSize(), true);
       CheckGuestMemSpan(Op, MemSrc, Constant(10));

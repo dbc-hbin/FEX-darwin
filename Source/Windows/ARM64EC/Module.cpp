@@ -714,7 +714,7 @@ NTSTATUS ProcessInit() {
   CTX->SetSignalDelegator(SignalDelegator.get());
   CTX->SetSyscallHandler(SyscallHandler.get());
   CTX->InitCore();
-  Exception::HandlerConfig.emplace(*CTX);
+  Exception::HandlerConfig.emplace();
   InvalidationTracker.emplace(*CTX, Threads);
   ImageTracker.emplace(*CTX, false);
 
@@ -1122,6 +1122,9 @@ NTSTATUS ThreadInit() {
   Thread->FrontendPtr = new FrontendThreadData();
   FEX::Windows::CallRetStack::InitializeThread(Thread, GetFrontendThreadData(Thread)->CallRetStack);
   Thread->CurrentFrame->Pointers.ExitFunctionEC = reinterpret_cast<uintptr_t>(&ExitFunctionEC);
+  static_assert(FEX::Windows::UserSharedData::GuestBase == FEXCore::Core::JITPointers::WindowsSharedPage);
+  Thread->CurrentFrame->Pointers.WindowsSharedDataBase =
+    UserSharedDataBacking ? reinterpret_cast<uintptr_t>(UserSharedDataBacking) : FEXCore::Core::JITPointers::WindowsSharedPage;
   Thread->CurrentFrame->Pointers.SynchronousExceptionHandler = reinterpret_cast<uintptr_t>(&Exception::SynchronousExceptionHandler);
   CPUArea.StateFrame() = Thread->CurrentFrame;
 

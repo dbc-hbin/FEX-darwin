@@ -810,7 +810,8 @@ def print_ir_allocator_helpers():
                             elif inline == "Mem":
                                 P += ["OffsetType", "OffsetScale"]
                             elif inline == "Memtso":
-                                P += ["OffsetType", "OffsetScale", "true /* TSO */"]
+                                # NEON TSO uses an ordinary LDR/STR with a separate barrier.
+                                P += ["OffsetType", "OffsetScale", "Class == RegClass::GPR || Size == OpSize::i256Bit"]
                                 inline = "Mem"
 
                             output_file.write(f"\t\t{arg.Name} = Inline{inline}({', '.join(P)});\n")

@@ -36,7 +36,8 @@ inline void ApplyFEXExtendedVolatileMetadata(FEX::VolatileMetadata::ExtendedVola
 
   // Walk the volatile list
   for (const auto it_ranges : ExtendedMetaData.VolatileValidRanges) {
-    if (it_ranges.Offset >= FileOffset && it_ranges.End < FileOffsetEnd) {
+    if (it_ranges.Offset >= FileOffset && it_ranges.Offset < it_ranges.End && it_ranges.End <= FileOffsetEnd &&
+        it_ranges.End - FileOffset <= EndAddress - Address) {
       VolatileValidRanges.Insert({Address + it_ranges.Offset - FileOffset, Address + it_ranges.End - FileOffset});
     }
   }

@@ -196,6 +196,7 @@
       },
 
       "GPR = ValidateCode GPR:$crc, GPR:$Address, u8:$CodeLength": {
+        "Desc": ["Returns zero when the code CRC matches and nonzero otherwise."],
         "HasSideEffects": true,
         "HasDest": true,
         "DestSize": "OpSize::i64Bit"
@@ -731,6 +732,12 @@
         "Desc": ["Pop two values from the address. Fused post-RA."],
         "HasSideEffects": true,
         "DestSize": "Size"
+      },
+      "RepStringPage OpSize:$ElementSize, i1:$Copy, i1:$Address32, FPR:$High0, FPR:$High1": {
+        "Desc": ["Forward REP with RDI aligned to 64, at least 64 bytes remaining, and one full chunk in each page.",
+                 "Runs whole 64-byte chunks within the current pages, committing the flushed RSI/RDI/RCX after each.",
+                 "High0 and High1 are scratch registers for MOVS. Preserves NZCV at every faulting access."],
+        "HasSideEffects": true
       },
       "GPR = MemSet i1:$IsAtomic, OpSize:$Size, GPR:$Prefix, GPR:$Addr, GPR:$Value, GPR:$Length, GPR:$Direction": {
         "Desc": ["Duplicates behaviour of x86 STOS repeat",

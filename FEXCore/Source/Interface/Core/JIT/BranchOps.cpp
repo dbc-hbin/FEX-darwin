@@ -426,45 +426,37 @@ DEF_OP(ValidateCode) {
 
   // Changes to TMP1
   auto WorkingReg = ARMEmitter::XReg::zr;
-  auto BaseReg = TMP2;
   auto TmpDataReg = TMP3;
-  mov(ARMEmitter::Size::i64Bit, BaseReg, Base);
 
   while (len >= 8) {
-    ldr<ARMEmitter::IndexType::POST>(TmpDataReg, BaseReg, 8);
+    ldr(TmpDataReg, Base, Op->CodeLength - len);
     crc32x(TMP1, WorkingReg, TmpDataReg);
     len -= 8;
     WorkingReg = TMP1;
   }
 
   while (len >= 4) {
-    ldr<ARMEmitter::IndexType::POST>(TmpDataReg.W(), BaseReg, 4);
+    ldr(TmpDataReg.W(), Base, Op->CodeLength - len);
     crc32w(TMP1.W(), WorkingReg.W(), TmpDataReg.W());
     len -= 4;
     WorkingReg = TMP1;
   }
 
   while (len >= 2) {
-    ldrh<ARMEmitter::IndexType::POST>(TmpDataReg.W(), BaseReg, 2);
+    ldrh(TmpDataReg.W(), Base, Op->CodeLength - len);
     crc32h(TMP1.W(), WorkingReg.W(), TmpDataReg.W());
     len -= 2;
     WorkingReg = TMP1;
   }
 
   while (len >= 1) {
-    ldrb<ARMEmitter::IndexType::POST>(TmpDataReg.W(), BaseReg, 1);
+    ldrb(TmpDataReg.W(), Base, Op->CodeLength - len);
     crc32b(TMP1.W(), WorkingReg.W(), TmpDataReg.W());
     len -= 1;
     WorkingReg = TMP1;
   }
 
-  sub(ARMEmitter::Size::i32Bit, Dst, TMP1, CRC32Reg);
-
-  ARMEmitter::ForwardLabel End;
-  cbz_OrRestart(ARMEmitter::Size::i32Bit, Dst, &End);
-
-  LoadConstant(ARMEmitter::Size::i32Bit, Dst, 1);
-  BindOrRestart(&End);
+  sub(ARMEmitter::Size::i32Bit, Dst, WorkingReg, CRC32Reg);
 }
 
 DEF_OP(ThreadRemoveCodeEntry) {
