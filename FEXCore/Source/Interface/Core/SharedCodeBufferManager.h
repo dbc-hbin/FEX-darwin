@@ -8,28 +8,25 @@ $end_info$
 #pragma once
 
 #include <FEXCore/fextl/memory.h>
+#include <FEXCore/fextl/vector.h>
 #include <FEXCore/Utils/MathUtils.h>
 #include <FEXCore/Utils/SignalScopeGuards.h>
 #include <FEXCore/Utils/TypeDefines.h>
 
 #include <cstddef>
 #include <cstdint>
+#include <mutex>
 
 namespace FEXCore {
 struct GuestToHostMap;
 }
 
 namespace FEXCore::CPU {
-struct CodeBuffer {
-  fextl::unique_ptr<GuestToHostMap> LookupCache;
+struct CodeBufferRegion {
+  explicit CodeBufferRegion(size_t Size, bool ShouldBeNamed, const CodeBufferRegion* Previous = nullptr);
+  ~CodeBufferRegion();
 
-  CodeBuffer(size_t Size, bool ShouldBeNamed);
-  CodeBuffer(const CodeBuffer&) = delete;
-  CodeBuffer& operator=(const CodeBuffer&) = delete;
-  CodeBuffer(CodeBuffer&& oth) = delete;
-  CodeBuffer& operator=(CodeBuffer&&) = delete;
-
-  ~CodeBuffer();
+  const CodeBufferRegion* const Previous;
 
   // Atomically allocate a fixed size buffer out of the current allocated codebuffer.
   // Lockless because it's just a linear allocator.
@@ -38,32 +35,15 @@ struct CodeBuffer {
     uint8_t* BufferAllocationOffset;
   };
 
-  CodeBufferAllocation AtomicAllocateBuffer(size_t Size) {
+  CodeBufferAllocation TryAllocate(size_t Size) {
     Size = FEXCore::AlignUp(Size, 16);
-    LOGMAN_THROW_A_FMT(reinterpret_cast<uintptr_t>(CodeBufferOffset.load()) % 16 == 0, "Buffer needs to always be 16B aligned!");
-
     auto ExpectedOffset = CodeBufferOffset.load(std::memory_order_relaxed);
-    auto DesiredOffset = ExpectedOffset + Size;
-
-    if (DesiredOffset > CodeBufferEnd) {
-      // Couldn't fit.
-      return {};
-    }
-
-    while (!CodeBufferOffset.compare_exchange_strong(ExpectedOffset, DesiredOffset)) {
-      DesiredOffset = ExpectedOffset + Size;
-
-      if (DesiredOffset > CodeBufferEnd) {
-        // Couldn't fit.
-        return {};
+    while (Size <= static_cast<size_t>(CodeBufferEnd - ExpectedOffset)) {
+      if (CodeBufferOffset.compare_exchange_weak(ExpectedOffset, ExpectedOffset + Size, std::memory_order_relaxed)) {
+        return {Ptr, ExpectedOffset};
       }
     }
-
-    // Managed to fit.
-    return {
-      .BufferBase = Ptr,
-      .BufferAllocationOffset = ExpectedOffset,
-    };
+    return {};
   }
 
   // Returns the total number of bytes available for storing code
@@ -101,6 +81,35 @@ private:
   std::atomic<uint8_t*> CodeBufferOffset {};
 };
 
+// All regions in a generation share one block map and retire together. A thread or signal
+// handler pinning the generation keeps all its branch targets and return addresses alive.
+struct CodeBuffer : CodeBufferRegion {
+  explicit CodeBuffer(size_t Size, bool ShouldBeNamed);
+  ~CodeBuffer();
+
+  fextl::unique_ptr<GuestToHostMap> LookupCache;
+
+  CodeBufferAllocation AtomicAllocateBuffer(size_t Size) {
+    return ActiveRegion.load(std::memory_order_acquire)->TryAllocate(Size);
+  }
+  CodeBufferAllocation GrowAndAllocate(size_t Size, const CodeBufferRegion*& Added);
+  bool Contains(uintptr_t Address) const {
+    for (const auto* Region = ActiveRegion.load(std::memory_order_acquire); Region; Region = Region->Previous) {
+      if (Address - reinterpret_cast<uintptr_t>(Region->GetBufferBase()) < Region->UsableSize()) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+private:
+  std::atomic<CodeBufferRegion*> ActiveRegion {this};
+  std::mutex GrowthMutex;
+  fextl::vector<fextl::unique_ptr<CodeBufferRegion>> AdditionalRegions;
+  size_t GenerationBytes;
+  const bool NameJITBuffers;
+};
+
 /**
  * A manager that coordinates access to the CodeBuffer used for compiling new code across threads.
  *
@@ -118,6 +127,9 @@ public:
   // Get the CodeBuffer that was most recently allocated.
   // This is the only CodeBuffer that data may be written to.
   fextl::shared_ptr<CodeBuffer> GetLatest();
+  bool IsLatest(const CodeBuffer* Buffer) const {
+    return Published.load(std::memory_order_acquire) == Buffer;
+  }
 
   // Allocate a new CodeBuffer with geometric growth up to an internal maximum.
   // Subsequent calls to GetLatest will point to the returned buffer.
@@ -130,6 +142,8 @@ public:
   virtual void OnCodeBufferAllocated(const std::shared_ptr<CodeBuffer>&) {};
 
 private:
+  std::mutex GenerationMutex;
+  std::atomic<CodeBuffer*> Published {};
   fextl::shared_ptr<CodeBuffer> Latest;
 
   fextl::shared_ptr<CodeBuffer> AllocateNew(size_t Size);

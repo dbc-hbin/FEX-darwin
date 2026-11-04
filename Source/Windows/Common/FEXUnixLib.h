@@ -22,9 +22,10 @@ bool Init(HMODULE NtDll);
 bool Available();
 
 /**
- * @brief Tries to enable hardware TSO if supported.
+ * @brief Accept Wine's process-wide TSO guarantee, or enable inherited Unix TSO.
  *
- * @return true if hardware TSO is supported and enabled.
+ * Call before creating the context so its code-cache identity includes this state.
+ * @return true if hardware TSO is guaranteed for guest execution.
  */
 bool TryEnableHardwareTSO();
 

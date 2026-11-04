@@ -63,7 +63,8 @@ struct HostFeatures {
     uint8_t SupportsSVE128 : 1 {};
     uint8_t SupportsSVE256 : 1 {};
 
-    uint8_t pad : 1 {};
+    // Wine's guarantee for every guest-executing thread is process state.
+    uint8_t SupportsHardwareTSO : 1 {};
   };
   static_assert(sizeof(ProcessFeaturesHash) == 1);
 

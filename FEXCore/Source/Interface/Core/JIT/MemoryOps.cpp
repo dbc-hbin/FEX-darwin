@@ -796,8 +796,8 @@ DEF_OP(LoadMem) {
 
 DEF_OP(LoadMemPair) {
   const auto Op = IROp->C<IR::IROp_LoadMemPair>();
-  // Architectural displacement is already in Addr. The pair immediate is a linear
-  // offset within the checked operand (its u32 field also carries signed imm7 values).
+  // For a 32-bit window Addr already includes the wrapping guest displacement.
+  // In long mode the pair immediate can carry an architectural displacement.
   const auto Addr = GetGuestMemReg(Op->Addr);
 
   if (Op->Class == IR::RegClass::GPR) {
@@ -844,8 +844,7 @@ DEF_OP(LoadMemTSO) {
   // learn about an extended-register addressing mode.
   //
   // The vector class is the exception - it lowers to a plain ldr (plus a DMB when
-  // vector TSO is on), which the backpatcher never sees and which does have a register-offset form,
-  // so it takes the fold. That is the whole x87/SSE load path on a VectorTSOEnabled=0 build.
+  // ordered access was requested), which the backpatcher never sees and which does have a register-offset form.
 #ifdef FEX_GUEST_WINDOW
   const auto Guest = GetGuestMemAddr(OpSize, Op->Addr, Op->Offset, Op->OffsetType, Op->OffsetScale, REG_GUEST_ADDR_TMP.R(), false,
                                      Op->Class != IR::RegClass::GPR && OpSize != IR::OpSize::i256Bit);
@@ -925,10 +924,8 @@ DEF_OP(LoadMemTSO) {
     }
     default: LOGMAN_MSG_A_FMT("Unhandled LoadMemTSO size: {}", OpSize); break;
     }
-    if (CTX->IsVectorAtomicTSOEnabled()) {
-      // Half-barrier.
-      dmb(ARMEmitter::BarrierScope::ISHLD);
-    }
+    // The dispatcher already selected TSO, including per-instruction PE overrides.
+    dmb(ARMEmitter::BarrierScope::ISHLD);
   }
 }
 
@@ -2025,7 +2022,7 @@ DEF_OP(LoadMemX87SVEOptPredicate) {
 DEF_OP(StoreMemPair) {
   const auto Op = IROp->C<IR::IROp_StoreMemPair>();
   const auto OpSize = IROp->Size;
-  // Like LoadMemPair, the pair immediate is linear, not an architectural displacement.
+  // As for LoadMemPair, window translation precedes the linear subaccess offset.
   const auto Addr = GetGuestMemReg(Op->Addr);
 
   if (Op->Class == IR::RegClass::GPR) {
@@ -2111,10 +2108,7 @@ DEF_OP(StoreMemTSO) {
       }
     }
   } else {
-    if (CTX->IsVectorAtomicTSOEnabled()) {
-      // Half-Barrier.
-      dmb(ARMEmitter::BarrierScope::ISH);
-    }
+    dmb(ARMEmitter::BarrierScope::ISH);
     const auto Src = GetVReg(Op->Value);
 #ifdef FEX_GUEST_WINDOW
     const auto MemSrc = GenerateMemOperand(OpSize, Guest);
@@ -2136,6 +2130,56 @@ DEF_OP(StoreMemTSO) {
     default: LOGMAN_MSG_A_FMT("Unhandled StoreMemTSO size: {}", OpSize); break;
     }
   }
+}
+
+DEF_OP(RepStringPage) {
+  const auto Op = IROp->C<IR::IROp_RepStringPage>();
+  const auto A = Op->Address32 ? ARMEmitter::Size::i32Bit : ARMEmitter::Size::i64Bit;
+  const auto Src = StaticRegisters[X86State::REG_RSI], Dst = StaticRegisters[X86State::REG_RDI], Count = StaticRegisters[X86State::REG_RCX];
+  const unsigned ElementShift = FEXCore::ilog2(IR::OpSizeToSize(Op->ElementSize));
+  constexpr auto W = ARMEmitter::Size::i32Bit;
+  if (!Op->Copy) dup(static_cast<ARMEmitter::SubRegSize>(ElementShift), VTMP1.Q(), StaticRegisters[X86State::REG_RAX]);
+  ARMEmitter::BiDirectionalLabel Loop;
+  lsr(A, TMP1, Count, 6 - ElementShift);
+  // The dispatcher has already checked that the first 64 bytes fit both pages.
+  sub(A, TMP2, TMP1, 1);
+  (void)cbz(A, TMP2, &Loop);
+  if (!CTX->HostFeatures.SupportsCSSC) mrs(TMP4, ARMEmitter::SystemRegister::NZCV);
+  auto LimitToPage = [&](ARMEmitter::Register Ptr) {
+    // floor((4096 - page_offset) / 64), including 64 chunks at page offset zero.
+    and_(W, TMP2, Ptr, FEXCore::Utils::FEX_PAGE_SIZE - 1);
+    neg(W, TMP2, TMP2);
+    add(W, TMP2, TMP2, FEXCore::Utils::FEX_PAGE_SIZE);
+    lsr(W, TMP2, TMP2, 6);
+    if (CTX->HostFeatures.SupportsCSSC) {
+      umin(A, TMP1, TMP1, TMP2);
+    } else {
+      cmp(A, TMP1, TMP2);
+      csel(A, TMP1, TMP1, TMP2, ARMEmitter::Condition::CC_LO);
+    }
+  };
+  LimitToPage(Dst);
+  if (Op->Copy) LimitToPage(Src);
+  if (!CTX->HostFeatures.SupportsCSSC) msr(ARMEmitter::SystemRegister::NZCV, TMP4);
+
+  (void)Bind(&Loop);
+  const auto Dest = ApplyGuestBase(Dst, TMP3);
+  if (Op->Copy) {
+    const auto Source = ApplyGuestBase(Src, TMP4);
+    const auto High0 = GetVReg(Op->High0).Q(), High1 = GetVReg(Op->High1).Q();
+    ldp<ARMEmitter::IndexType::OFFSET>(VTMP1.Q(), VTMP2.Q(), Source, 0);
+    ldp<ARMEmitter::IndexType::OFFSET>(High0, High1, Source, 32);
+    stp<ARMEmitter::IndexType::OFFSET>(VTMP1.Q(), VTMP2.Q(), Dest, 0);
+    stp<ARMEmitter::IndexType::OFFSET>(High0, High1, Dest, 32);
+    add(A, Src, Src, 64);
+  } else {
+    stp<ARMEmitter::IndexType::OFFSET>(VTMP1.Q(), VTMP1.Q(), Dest, 0);
+    stp<ARMEmitter::IndexType::OFFSET>(VTMP1.Q(), VTMP1.Q(), Dest, 32);
+  }
+  add(A, Dst, Dst, 64);
+  sub(A, Count, Count, 64U >> ElementShift);
+  sub(W, TMP1, TMP1, 1);
+  (void)cbnz(W, TMP1, &Loop);
 }
 
 DEF_OP(MemSet) {

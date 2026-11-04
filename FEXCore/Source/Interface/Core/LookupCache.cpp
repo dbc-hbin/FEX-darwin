@@ -73,6 +73,18 @@ LookupCache::LookupCache(FEXCore::Context::ContextImpl* CTX)
     // Start at maximum instead.
     L1PointerMask = MAX_L1_ENTRIES - 1;
   }
+  CommitL1Window();
+}
+
+void LookupCache::CommitL1Window() {
+#ifdef _WIN32
+  // Wine commits the whole reservation on an overcommit fault. Back the active L1
+  // window before the dispatcher touches it, leaving its unused suffix reserved.
+  if (FEXCore::Allocator::VirtualJitWriteProtect && !L2CacheSize && DynamicL1Cache() &&
+      !::VirtualAlloc(reinterpret_cast<void*>(L1Pointer), (L1PointerMask + 1) * sizeof(LookupCacheEntry), MEM_COMMIT, PAGE_READWRITE)) {
+    ERROR_AND_DIE_FMT("Failed to commit the L1 lookup cache");
+  }
+#endif
 }
 
 LookupCache::~LookupCache() {
@@ -94,6 +106,7 @@ void LookupCache::ClearThreadLocalCaches(const LookupCacheWriteLockToken&) {
   // TODO: Preserve code cache entries?
   // Clear L1 and L2 (when reserved) by clearing the full cache.
   FEXCore::Allocator::VirtualDontNeed(reinterpret_cast<void*>(CacheBase), TotalCacheSize, false);
+  CommitL1Window();
 
   // TODO: Rename this member to avoid confusion with code caching
   CachedCodePages.clear();

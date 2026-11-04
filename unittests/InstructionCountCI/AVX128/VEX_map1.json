@@ -36,15 +36,11 @@
       ]
     },
     "vmovups ymm0, ymm0": {
-      "ExpectedInstructionCount": 2,
+      "ExpectedInstructionCount": 0,
       "Comment": [
-        "Spurious moves",
         "Map 1 0b00 0x10 256-bit"
       ],
-      "ExpectedArm64ASM": [
-        "ldr q2, [x28, #192]",
-        "str q2, [x28, #192]"
-      ]
+      "ExpectedArm64ASM": []
     },
     "vmovups ymm0, [rax]": {
       "ExpectedInstructionCount": 2,
@@ -76,15 +72,11 @@
       ]
     },
     "vmovupd ymm0, ymm0": {
-      "ExpectedInstructionCount": 2,
+      "ExpectedInstructionCount": 0,
       "Comment": [
-        "Spurious moves",
         "Map 1 0b01 0x10 256-bit"
       ],
-      "ExpectedArm64ASM": [
-        "ldr q2, [x28, #192]",
-        "str q2, [x28, #192]"
-      ]
+      "ExpectedArm64ASM": []
     },
     "vmovupd ymm0, [rax]": {
       "ExpectedInstructionCount": 2,
@@ -4159,7 +4151,7 @@
       ]
     },
     "vpmovmskb rax, ymm0": {
-      "ExpectedInstructionCount": 16,
+      "ExpectedInstructionCount": 10,
       "Comment": [
         "Map 1 0b01 0xd7 256-bit"
       ],
@@ -4168,18 +4160,12 @@
         "ldr q3, [x28, #3248]",
         "cmlt v4.16b, v16.16b, #0",
         "and v4.16b, v4.16b, v3.16b",
-        "addp v4.16b, v4.16b, v4.16b",
-        "addp v4.16b, v4.16b, v4.16b",
-        "addp v4.8b, v4.8b, v4.8b",
-        "umov w20, v4.h[0]",
         "cmlt v2.16b, v2.16b, #0",
         "and v2.16b, v2.16b, v3.16b",
-        "addp v2.16b, v2.16b, v2.16b",
+        "addp v2.16b, v4.16b, v2.16b",
         "addp v2.16b, v2.16b, v2.16b",
         "addp v2.8b, v2.8b, v2.8b",
-        "umov w21, v2.h[0]",
-        "orr x20, x20, x21, lsl #16",
-        "mov w4, w20"
+        "mov w4, v2.s[0]"
       ]
     },
     "vpsubusb xmm0, xmm1, xmm2": {

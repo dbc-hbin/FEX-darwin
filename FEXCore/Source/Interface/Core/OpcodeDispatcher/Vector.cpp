@@ -4506,7 +4506,23 @@ void OpDispatchBuilder::AVXVectorVariableBlend(OpcodeArgs, IR::OpSize ElementSiz
   StoreResultFPR(Op, Result);
 }
 
+void OpDispatchBuilder::SetSelfPTestFlags(OpSize Size, Ref Bits) {
+  Ref Max = _VUMaxV(Size, OpSize::i16Bit, Bits);
+  Ref Any = _VExtractToGPR(Size, OpSize::i16Bit, Max, 0);
+  // CMP with zero sets host C (the self-test always sets guest CF).
+  // Any fits in 16 bits, so the same comparison also clears N and V.
+  HandleNZCVWrite();
+  _SubNZCV(OpSize::i32Bit, Any, Constant(0));
+  CFInverted = false;
+  ZeroPF_AF();
+}
+
 void OpDispatchBuilder::PTestOpImpl(OpSize Size, Ref Dest, Ref Src) {
+  if (Dest == Src) {
+    SetSelfPTestFlags(Size, Src);
+    return;
+  }
+
   Ref Test1 = _VAnd(Size, Dest, Src);
   Ref Test2 = _VAndn(Size, Src, Dest);
 
@@ -4539,6 +4555,11 @@ void OpDispatchBuilder::VTESTOpImpl(OpSize SrcSize, IR::OpSize ElementSize, Ref 
   LOGMAN_THROW_A_FMT(ElementSize >= IR::OpSize::i8Bit && ElementSize <= IR::OpSize::i64Bit, "Invalid size");
   const auto ElementSizeInBits = IR::OpSizeAsBits(ElementSize);
   const auto MaskConstant = uint64_t {1} << (ElementSizeInBits - 1);
+
+  if (Src1 == Src2) {
+    SetSelfPTestFlags(SrcSize, _VUShrI(SrcSize, ElementSize, Src1, ElementSizeInBits - 1));
+    return;
+  }
 
   Ref Mask = _VDupFromGPR(SrcSize, ElementSize, Constant(MaskConstant));
 

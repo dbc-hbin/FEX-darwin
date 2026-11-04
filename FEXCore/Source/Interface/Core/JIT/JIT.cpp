@@ -668,8 +668,7 @@ uint64_t Arm64JITCore::InlineCacheFill(FEXCore::Core::CpuStateFrame* Frame, uint
   auto Thread = Frame->Thread;
   const auto GuestRip = Frame->State.rip;
 
-  // Only link to blocks that already exist. Uncompiled targets, ARM64EC native targets and TF single-stepping
-  // all go through the dispatcher; a later execution fills the slot.
+  // Only link to blocks that already exist or to the guarded ARM64EC entry.
   if (Frame->State.flags[X86State::RFLAG_TF_RAW_LOC]) {
     return Frame->Pointers.DispatcherLoopTop;
   }
@@ -680,19 +679,23 @@ uint64_t Arm64JITCore::InlineCacheFill(FEXCore::Core::CpuStateFrame* Frame, uint
   // retired buffer.
   auto& CodeBuffer = static_cast<Arm64JITCore*>(Thread->CPUBackend.get())->CurrentCodeBuffer;
   const auto SlotAddress = reinterpret_cast<uintptr_t>(Slot);
-  const auto BufferBase = reinterpret_cast<uintptr_t>(CodeBuffer->GetBufferBase());
-  if (Thread->LookupCache->Shared != CodeBuffer->LookupCache.get() || SlotAddress < BufferBase ||
-      SlotAddress >= BufferBase + CodeBuffer->UsableSize()) {
+  if (Thread->LookupCache->Shared != CodeBuffer->LookupCache.get() || !CodeBuffer->Contains(SlotAddress)) {
     return Frame->Pointers.DispatcherLoopTop;
   }
   const auto HostCode = Thread->LookupCache->FindBlock(Thread, GuestRip);
   if (!HostCode) {
 #ifdef ARCHITECTURE_arm64ec
     if (GuestRip < EC_CODE_BITMAP_MAX_ADDRESS && RtlIsEcCode(GuestRip)) {
-      // Native targets never become FEX blocks. Park the slot on a guest address that can't match so this site
-      // keeps using the L1 lookup instead of calling the filler on every execution.
+      // The native entry belongs to the shared context dispatcher, not to a mapped
+      // module. Keep this slot immutable so even a racing hit recovers its original
+      // guest RIP. The entry checks the current mapping on every hit.
+      auto lk = Thread->LookupCache->AcquireWriteLock();
       FEXCore::Allocator::JitWriteScope Writable;
-      std::atomic_ref<uint64_t>(Slot[IC_GUEST]).store(~0ULL, std::memory_order::relaxed);
+      if (std::atomic_ref<uint64_t>(Slot[IC_GUEST]).load(std::memory_order::relaxed) == 0) {
+        const auto Entry = static_cast<Context::ContextImpl*>(Thread->CTX)->Dispatcher->GetNativeInlineCacheAddress();
+        std::atomic_ref<uint64_t>(Slot[IC_HOST]).store(Entry, std::memory_order::relaxed);
+        std::atomic_ref<uint64_t>(Slot[IC_GUEST]).store(GuestRip, std::memory_order::release);
+      }
     }
 #endif
     return Frame->Pointers.DispatcherLoopTop;
@@ -972,6 +975,21 @@ CodeBuffer::CodeBufferAllocation Arm64JITCore::AllocateCodeBufferInSharedCache(s
     AllocatedInfo = CurrentCodeBuffer->AtomicAllocateBuffer(Size);
 
     if (AllocatedInfo.BufferAllocationOffset == nullptr) {
+#ifdef _WIN32
+      // Offline caches serialize one contiguous code span. Live Darwin translations can
+      // append disjoint regions, using the existing far-link thunk for distant targets.
+      if (FEXCore::Allocator::VirtualJitWriteProtect && !CTX->CodeCache.IsGeneratingCache &&
+          !FEXCore::Config::Get_ENABLECODECACHINGWIP() && !FEXCore::Config::Get_ENABLECODECACHEVALIDATION()) {
+        const CodeBufferRegion* Added {};
+        AllocatedInfo = CurrentCodeBuffer->GrowAndAllocate(Size, Added);
+        if (Added && CTX->Config.GlobalJITNaming()) {
+          CTX->Symbols.RegisterJITSpace(Added->GetBufferBase(), Added->TotalAllocationSize());
+        }
+        if (AllocatedInfo.BufferAllocationOffset) {
+          return AllocatedInfo;
+        }
+      }
+#endif
       // If it didn't fit then clear the buffer and try again.
       // This has the possibility of migrating the SharedCodeBuffer. See above in `Arm64JITCore::ClearCache()`
       CTX->ClearCodeCache(ThreadState);
@@ -1019,6 +1037,8 @@ CPUBackend::CompiledCode Arm64JITCore::EmitJITCode(uint64_t Entry, uint64_t Size
   Relocations.resize(PrevNumAllocations, FEXCore::CPU::Relocation::Default()); // Discard any relocations generated from a previous attempt
 
   CodeData.EntryPoints.clear();
+  DebugData->GuestOpcodes.clear();
+  DebugData->Subblocks.clear();
 
   // Fairly excessive buffer range to make sure we don't overflow
   // One page baseline, plus SSANodeMultipler bytes, plus another page for guard page.
@@ -1071,6 +1091,7 @@ CPUBackend::CompiledCode Arm64JITCore::EmitJITCode(uint64_t Entry, uint64_t Size
   PendingTargetLabel = nullptr;
   PendingCallReturnTargetLabel = nullptr;
 
+  const bool RecordSubblocks = CTX->Config.BlockJITNaming();
   for (auto [BlockNode, BlockHeader] : IR->GetBlocks()) {
     auto BlockIROp = BlockHeader->CW<FEXCore::IR::IROp_CodeBlock>();
 #if defined(ASSERTIONS_ENABLED) && ASSERTIONS_ENABLED
@@ -1135,8 +1156,10 @@ CPUBackend::CompiledCode Arm64JITCore::EmitJITCode(uint64_t Entry, uint64_t Size
       }
     }
 
-    DebugData->Subblocks.push_back({static_cast<uint32_t>(BlockStartHostCode - CodeData.BlockBegin),
-                                    static_cast<uint32_t>(GetCursorAddress<uint8_t*>() - BlockStartHostCode)});
+    if (RecordSubblocks) {
+      DebugData->Subblocks.push_back({static_cast<uint32_t>(BlockStartHostCode - CodeData.BlockBegin),
+                                      static_cast<uint32_t>(GetCursorAddress<uint8_t*>() - BlockStartHostCode)});
+    }
   }
 
   // Make sure last branch is generated. It certainly can't be eliminated here.
@@ -1314,7 +1337,7 @@ CPUBackend::CompiledCode Arm64JITCore::EmitJITCode(uint64_t Entry, uint64_t Size
       EntryPoint.second += Delta;
     }
     CodeBegin += Delta;
-    CodeData.HostCodeOffset = CodeData.BlockBegin - CurrentCodeBuffer->GetBufferBase();
+    CodeData.HostCodeOffset = CodeData.BlockBegin - AllocatedInfo.BufferBase;
 
     // Copy over CodeBuffer contents
     memcpy(AllocatedInfo.BufferAllocationOffset, TempCodeBuffer, CodeData.Size);
@@ -1369,7 +1392,7 @@ CPUBackend::CompiledCode Arm64JITCore::LoadCachedCode(std::span<const uint8_t> H
   CPUBackend::CompiledCode Result;
   Result.BlockBegin = Dest;
   Result.Size = HostBytes.size();
-  Result.HostCodeOffset = Dest - CurrentCodeBuffer->GetBufferBase();
+  Result.HostCodeOffset = Dest - AllocatedInfo.BufferBase;
   return Result;
 }
 

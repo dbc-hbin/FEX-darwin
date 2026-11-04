@@ -330,6 +330,9 @@ namespace CPU {
   }
 
   fextl::shared_ptr<CodeBuffer> CPUBackend::CheckCodeBufferUpdate() {
+    if (SharedCodeBuffers.IsLatest(CurrentCodeBuffer.get())) {
+      return nullptr;
+    }
     auto NewCodeBuffer = SharedCodeBuffers.GetLatest();
     if (CurrentCodeBuffer != NewCodeBuffer) {
       RegisterForSignalHandler(CurrentCodeBuffer);
@@ -339,17 +342,11 @@ namespace CPU {
   }
 
   bool CPUBackend::IsAddressInCodeBuffer(uintptr_t Address) const {
-    const auto CheckCodeBuffer = [](const CodeBuffer& Buffer, uintptr_t Address) {
-      const auto BufferPtr = reinterpret_cast<uintptr_t>(Buffer.GetBufferBase());
-      const uintptr_t LastPageAddr = BufferPtr + Buffer.UsableSize();
-      return (Address >= BufferPtr && Address < LastPageAddr);
-    };
-
-    if (CheckCodeBuffer(*CurrentCodeBuffer, Address)) {
+    if (CurrentCodeBuffer->Contains(Address)) {
       return true;
     }
     for (const auto& Buffer : SignalHandlerCodeBuffers) {
-      if (CheckCodeBuffer(*Buffer, Address)) {
+      if (Buffer->Contains(Address)) {
         return true;
       }
     }

@@ -21,6 +21,21 @@ class OrderedNode;
 
 #define OpcodeArgs [[maybe_unused]] FEXCore::X86Tables::DecodedOp Op
 
+AddressMode OpDispatchBuilder::AVX128_DecodeMemoryAddress(const X86Tables::DecodedOp& Op, const X86Tables::DecodedOperand& Operand,
+                                                         MemoryAccessType AccessType, bool IsLoad, unsigned Bytes) {
+  auto A = DecodeAddress(Op, Operand, AccessType, IsLoad);
+  if (IsLoad) {
+    MapFixedSharedDataRead(A, Bytes);
+  }
+  if (!Is64BitMode) {
+    // Complete the wrapping EA once, then check the whole operand before its two linear subaccesses.
+    Ref Base = LoadEffectiveAddress(this, A, GetGPROpSize(), true);
+    CheckGuestMemSpan(Op, Base, Constant(Bytes));
+    return {.Base = Base, .AddrSize = OpSize::i64Bit, .NonTSO = A.NonTSO};
+  }
+  return A;
+}
+
 OpDispatchBuilder::RefPair OpDispatchBuilder::AVX128_LoadSource_WithOpSize(
   const X86Tables::DecodedOp& Op, const X86Tables::DecodedOperand& Operand, uint32_t Flags, bool NeedsHigh, MemoryAccessType AccessType) {
 
@@ -40,10 +55,7 @@ OpDispatchBuilder::RefPair OpDispatchBuilder::AVX128_LoadSource_WithOpSize(
       LOGMAN_THROW_A_FMT(!IsVSIB, "VSIB is handled by gather");
     }
 
-    AddressMode A = DecodeAddress(Op, Operand, AccessType, true /* IsLoad */);
-    Ref Base = LoadEffectiveAddress(this, A, GetGPROpSize(), true);
-    CheckGuestMemSpan(Op, Base, Constant(NeedsHigh ? 32 : 16));
-    A = {.Base = Base, .AddrSize = OpSize::i64Bit, .NonTSO = A.NonTSO};
+    const auto A = AVX128_DecodeMemoryAddress(Op, Operand, AccessType, true, NeedsHigh ? 32 : 16);
     if (NeedsHigh) {
       return _LoadMemPairFPRAutoTSO(OpSize::i128Bit, A, OpSize::i8Bit);
     } else {
@@ -68,10 +80,7 @@ void OpDispatchBuilder::AVX128_StoreResult_WithOpSize(FEXCore::X86Tables::Decode
       AVX128_StoreXMMRegister(gprIndex, Src.High, true);
     }
   } else {
-    AddressMode A = DecodeAddress(Op, Operand, AccessType, false /* IsLoad */);
-    Ref Base = LoadEffectiveAddress(this, A, GetGPROpSize(), true);
-    CheckGuestMemSpan(Op, Base, Constant(Src.High ? 32 : 16));
-    A = {.Base = Base, .AddrSize = OpSize::i64Bit, .NonTSO = A.NonTSO};
+    const auto A = AVX128_DecodeMemoryAddress(Op, Operand, AccessType, false, Src.High ? 32 : 16);
 
     if (Src.High) {
       _StoreMemPairFPRAutoTSO(OpSize::i128Bit, A, Src.Low, Src.High, OpSize::i8Bit);
@@ -91,31 +100,29 @@ Ref OpDispatchBuilder::AVX128_LoadXMMRegister(uint32_t XMM, bool High) {
 
 void OpDispatchBuilder::AVX128_StoreXMMRegister(uint32_t XMM, const Ref Src, bool High) {
   if (High) {
-    StoreContext(AVXHigh0Index + XMM, Src);
+    const auto Index = AVXHigh0Index + XMM;
+    if (!(RegCache.Cached & (1ULL << Index)) || RegCache.Value[Index] != Src) {
+      StoreContext(Index, Src);
+    }
   } else {
     StoreXMMRegister(XMM, Src);
   }
 }
 
 void OpDispatchBuilder::AVX128_VMOVAPS(OpcodeArgs) {
-  // Reg <- Mem or Reg <- Reg
-  const auto SrcSize = GetSrcSize(Op);
-  const auto Is128Bit = SrcSize == Core::CPUState::XMM_SSE_REG_SIZE;
-
-  if (Is128Bit) {
-    // Zero upper 128-bits
-    auto Src = AVX128_LoadSource_WithOpSize(Op, Op->Src[0], Op->Flags, false);
-
-    ///< Zero upper bits when destination is GPR.
-    if (Op->Dest.IsGPR()) {
-      Src.High = LoadZeroVector(OpSize::i128Bit);
+  const bool Is128Bit = GetSrcSize(Op) == Core::CPUState::XMM_SSE_REG_SIZE;
+  if (Op->Dest.IsGPR() && Op->Src[0].IsGPR() && Op->Dest.Data.GPR.GPR == Op->Src[0].Data.GPR.GPR) {
+    if (Is128Bit) {
+      AVX128_StoreXMMRegister(Op->Dest.Data.GPR.GPR - X86State::REG_XMM_0, LoadZeroVector(OpSize::i128Bit), true);
     }
-    AVX128_StoreResult_WithOpSize(Op, Op->Dest, Src);
-  } else {
-    // Copy or memory load
-    auto Src = AVX128_LoadSource_WithOpSize(Op, Op->Src[0], Op->Flags, true);
-    AVX128_StoreResult_WithOpSize(Op, Op->Dest, Src);
+    return;
   }
+
+  auto Src = AVX128_LoadSource_WithOpSize(Op, Op->Src[0], Op->Flags, !Is128Bit);
+  if (Is128Bit && Op->Dest.IsGPR()) {
+    Src.High = LoadZeroVector(OpSize::i128Bit);
+  }
+  AVX128_StoreResult_WithOpSize(Op, Op->Dest, Src);
 }
 
 void OpDispatchBuilder::AVX128_VMOVScalarImpl(OpcodeArgs, IR::OpSize ElementSize) {
@@ -310,12 +317,34 @@ void OpDispatchBuilder::AVX128_VZERO(OpcodeArgs) {
       AVX128_StoreXMMRegister(i, ZeroVector, false);
     }
 
-    InvalidateHighAVXRegisters();
+  }
+
+  // Publish the clear immediately. Only clean cache entries prove the corresponding
+  // context memory already holds zero, including across adjacent VZEROUPPERs.
+  const Ref Zero = LoadZeroVector(OpSize::i128Bit);
+  const uint64_t Clean = RegCache.Cached & ~RegCache.Written;
+  uint32_t NeedsClear = 0;
+  for (unsigned i = 0; i < NumRegs; ++i) {
+    const unsigned Index = AVXHigh0Index + i;
+    if (!(Clean & (1ULL << Index)) || RegCache.Value[Index] != Zero) {
+      NeedsClear |= 1U << i;
+      StoreContext(Index, Zero);
+      RegCache.Written &= ~(1ULL << Index);
+    }
+  }
+
+  if (NeedsClear == (1U << NumRegs) - 1) {
     _ContextClear(offsetof(FEXCore::Core::CPUState, avx_high), sizeof(FEXCore::Core::CPUState::avx_high[0]) * NumRegs);
   } else {
-    // Likewise, VZEROUPPER will only ever zero only up to the first 16 registers
-    InvalidateHighAVXRegisters();
-    _ContextClear(offsetof(FEXCore::Core::CPUState, avx_high), sizeof(FEXCore::Core::CPUState::avx_high[0]) * NumRegs);
+    // Pair adjacent unknown lanes. A single 128-bit zero uses STP XZR, XZR.
+    for (unsigned i = 0; NeedsClear; i += 2, NeedsClear >>= 2) {
+      auto Pair = NeedsClear & 3;
+      if (Pair == 3) {
+        _StoreContextPair(OpSize::i128Bit, RegClass::FPR, Zero, Zero, CacheIndexToContextOffset(AVXHigh0Index + i));
+      } else if (Pair) {
+        StoreContextHelper(OpSize::i128Bit, RegClass::FPR, Zero, CacheIndexToContextOffset(AVXHigh0Index + i + (Pair >> 1)));
+      }
+    }
   }
 }
 
@@ -503,24 +532,6 @@ void OpDispatchBuilder::AVX128_VPUNPCKL(OpcodeArgs, IR::OpSize ElementSize) {
 void OpDispatchBuilder::AVX128_VPUNPCKH(OpcodeArgs, IR::OpSize ElementSize) {
   AVX128_VectorBinaryImpl(Op, OpSizeFromSrc(Op), ElementSize,
                           [this](IR::OpSize _ElementSize, Ref Src1, Ref Src2) { return _VZip2(OpSize::i128Bit, _ElementSize, Src1, Src2); });
-}
-
-void OpDispatchBuilder::AVX128_MOVVectorUnaligned(OpcodeArgs) {
-  const auto SrcSize = GetSrcSize(Op);
-  const auto Is128Bit = SrcSize == Core::CPUState::XMM_SSE_REG_SIZE;
-
-  if (!Is128Bit && Op->Dest.IsGPR() && Op->Src[0].IsGPR() && Op->Dest.Data.GPR.GPR == Op->Src[0].Data.GPR.GPR) {
-    // Nop
-    return;
-  }
-
-  auto Src = AVX128_LoadSource_WithOpSize(Op, Op->Src[0], Op->Flags, !Is128Bit);
-
-  if (Is128Bit) {
-    Src.High = LoadZeroVector(OpSize::i128Bit);
-  }
-
-  AVX128_StoreResult_WithOpSize(Op, Op->Dest, Src);
 }
 
 void OpDispatchBuilder::AVX128_InsertCVTGPR_To_FPR(OpcodeArgs, IR::OpSize DstElementSize) {
@@ -854,25 +865,19 @@ void OpDispatchBuilder::AVX128_MOVMSKB(OpcodeArgs) {
   auto Src = AVX128_LoadSource_WithOpSize(Op, Op->Src[0], Op->Flags, !Is128Bit);
   Ref VMask = LoadAndCacheNamedVectorConstant(OpSize::i128Bit, NAMED_VECTOR_MOVMASKB);
 
-  auto Mask1Byte = [this](Ref Src, Ref VMask) {
+  auto MaskBytes = [this, VMask](Ref Src) -> Ref {
     auto VCMP = _VCMPLTZ(OpSize::i128Bit, OpSize::i8Bit, Src);
-    auto VAnd = _VAnd(OpSize::i128Bit, VCMP, VMask);
-
-    auto VAdd1 = _VAddP(OpSize::i128Bit, OpSize::i8Bit, VAnd, VAnd);
-    auto VAdd2 = _VAddP(OpSize::i128Bit, OpSize::i8Bit, VAdd1, VAdd1);
-    auto VAdd3 = _VAddP(OpSize::i64Bit, OpSize::i8Bit, VAdd2, VAdd2);
-
-    ///< 16-bits of data per 128-bit
-    return _VExtractToGPR(OpSize::i128Bit, OpSize::i16Bit, VAdd3, 0);
+    return _VAnd(OpSize::i128Bit, VCMP, VMask);
   };
 
-  Ref Result = Mask1Byte(Src.Low, VMask);
-
-  if (!Is128Bit) {
-    auto ResultHigh = Mask1Byte(Src.High, VMask);
-    Result = _Orlshl(OpSize::i64Bit, Result, ResultHigh, 16);
-  }
-
+  // ADDP concatenates the pair sums from both inputs. Keep the complete
+  // 32-byte mask together through the remaining two horizontal reductions.
+  Ref Low = MaskBytes(Src.Low);
+  Ref High = Is128Bit ? Low : MaskBytes(Src.High);
+  Ref Pairs = _VAddP(OpSize::i128Bit, OpSize::i8Bit, Low, High);
+  Ref Quads = _VAddP(OpSize::i128Bit, OpSize::i8Bit, Pairs, Pairs);
+  Ref Octets = _VAddP(OpSize::i64Bit, OpSize::i8Bit, Quads, Quads);
+  Ref Result = _VExtractToGPR(OpSize::i128Bit, Is128Bit ? OpSize::i16Bit : OpSize::i32Bit, Octets, 0);
   StoreResultGPR(Op, Result);
 }
 
@@ -1722,6 +1727,12 @@ void OpDispatchBuilder::AVX128_VTESTP(OpcodeArgs, IR::OpSize ElementSize) {
   }
 
   // For 256-bit, we need to split up the operation. This is nontrivial.
+  if (Src1.Low == Src2.Low && Src1.High == Src2.High) {
+    Ref Both = _VOr(OpSize::i128Bit, Src1.Low, Src1.High);
+    SetSelfPTestFlags(OpSize::i128Bit, _VUShrI(OpSize::i128Bit, ElementSize, Both, IR::OpSizeAsBits(ElementSize) - 1));
+    return;
+  }
+
   // Let's go the simple route here.
   Ref ZF, CFInv;
 
@@ -1788,6 +1799,11 @@ void OpDispatchBuilder::AVX128_PTest(OpcodeArgs) {
   }
 
   // For 256-bit, we need to unroll. This is nontrivial.
+  if (Src1.Low == Src2.Low && Src1.High == Src2.High) {
+    SetSelfPTestFlags(OpSize::i128Bit, _VOr(OpSize::i128Bit, Src1.Low, Src1.High));
+    return;
+  }
+
   Ref Test1Low = _VAnd(OpSize::i128Bit, Src1.Low, Src2.Low);
   Ref Test2Low = _VAndn(OpSize::i128Bit, Src2.Low, Src1.Low);
 

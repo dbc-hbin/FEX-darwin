@@ -634,7 +634,7 @@ void BTCpuProcessInit() {
   CTX->SetSignalDelegator(SignalDelegator.get());
   CTX->SetSyscallHandler(SyscallHandler.get());
   CTX->InitCore();
-  Context::HandlerConfig.emplace(*CTX);
+  Context::HandlerConfig.emplace();
   InvalidationTracker.emplace(*CTX, Threads, GuestBase);
   ImageTracker.emplace(*CTX, false, GuestBase);
 

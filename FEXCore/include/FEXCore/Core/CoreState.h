@@ -439,6 +439,11 @@ struct JITPointers {
 
   // Copy of process-wide named vector constants data.
   alignas(16) uint64_t NamedVectorConstants[FEXCore::IR::NamedVectorConstant::NAMED_VECTOR_CONST_POOL_MAX][2];
+#ifdef ARCHITECTURE_arm64ec
+  // Absolute Windows shared-page reads use this base, including after a disk-cache reload.
+  static constexpr uint64_t WindowsSharedPage = 0x7ffe0000;
+  uint64_t WindowsSharedDataBase {WindowsSharedPage};
+#endif
 };
 
 // Each guest JIT frame has one of these

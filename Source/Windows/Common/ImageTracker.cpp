@@ -46,17 +46,25 @@ static void LoadImageVolatileMetadata(fextl::set<uint64_t>& VolatileInstructions
 
   const auto* LoadConfig =
     reinterpret_cast<ArchImageLoadConfigDirectory*>(RtlImageDirectoryEntryToData(Module, true, IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG, &Size));
-  if (!LoadConfig || LoadConfig->Size <= offsetof(ArchImageLoadConfigDirectory, VolatileMetadataPointer)) {
+  constexpr size_t Required = offsetof(ArchImageLoadConfigDirectory, VolatileMetadataPointer) + sizeof(LoadConfig->VolatileMetadataPointer);
+  if (!LoadConfig || Size < Required || LoadConfig->Size < Required) {
     return;
   }
 
-  if (GuestBase + LoadConfig->VolatileMetadataPointer < Address || GuestBase + LoadConfig->VolatileMetadataPointer + sizeof(IMAGE_VOLATILE_METADATA) >= EndAddress) {
+  const auto ImageSize = EndAddress - Address;
+  const auto ImageVA = Address - GuestBase;
+  auto InImage = [ImageSize](uint64_t RVA, uint64_t Bytes) { return RVA <= ImageSize && Bytes <= ImageSize - RVA; };
+  const uint64_t MetadataRVA = LoadConfig->VolatileMetadataPointer - ImageVA;
+  if (!InImage(MetadataRVA, sizeof(IMAGE_VOLATILE_METADATA))) {
     return;
   }
 
-  const auto* VolatileMetadata = reinterpret_cast<IMAGE_VOLATILE_METADATA*>(GuestBase + LoadConfig->VolatileMetadataPointer);
-  if (!VolatileMetadata || Address + VolatileMetadata->VolatileAccessTable + VolatileMetadata->VolatileAccessTableSize >= EndAddress ||
-      Address + VolatileMetadata->VolatileInfoRangeTable + VolatileMetadata->VolatileInfoRangeTableSize >= EndAddress) {
+  const auto* VolatileMetadata = reinterpret_cast<const IMAGE_VOLATILE_METADATA*>(Address + MetadataRVA);
+  if (VolatileMetadata->Size < sizeof(*VolatileMetadata) ||
+      !InImage(VolatileMetadata->VolatileAccessTable, VolatileMetadata->VolatileAccessTableSize) ||
+      !InImage(VolatileMetadata->VolatileInfoRangeTable, VolatileMetadata->VolatileInfoRangeTableSize) ||
+      VolatileMetadata->VolatileAccessTableSize % sizeof(IMAGE_VOLATILE_RVA_METADATA) ||
+      VolatileMetadata->VolatileInfoRangeTableSize % sizeof(IMAGE_VOLATILE_RANGE_METADATA)) {
     return;
   }
 
@@ -64,14 +72,19 @@ static void LoadImageVolatileMetadata(fextl::set<uint64_t>& VolatileInstructions
   const auto* VolatileAccessTableEnd =
     VolatileAccessTableBegin + (VolatileMetadata->VolatileAccessTableSize / sizeof(IMAGE_VOLATILE_RVA_METADATA));
   for (auto It = VolatileAccessTableBegin; It != VolatileAccessTableEnd; It++) {
-    VolatileInstructions.emplace(Address - GuestBase + It->Rva);
+    if (It->Rva >= ImageSize) {
+      return; // Never certify an unmarked range using a malformed instruction table.
+    }
+    VolatileInstructions.emplace(ImageVA + It->Rva);
   }
 
   const auto* VolatileInfoRangeTableBegin = reinterpret_cast<IMAGE_VOLATILE_RANGE_METADATA*>(Address + VolatileMetadata->VolatileInfoRangeTable);
   const auto* VolatileInfoRangeTableEnd =
     VolatileInfoRangeTableBegin + (VolatileMetadata->VolatileInfoRangeTableSize / sizeof(IMAGE_VOLATILE_RANGE_METADATA));
   for (auto It = VolatileInfoRangeTableBegin; It != VolatileInfoRangeTableEnd; It++) {
-    VolatileValidRanges.Insert({Address - GuestBase + It->Rva, Address - GuestBase + It->Rva + It->Size});
+    if (InImage(It->Rva, It->Size)) {
+      VolatileValidRanges.Insert({ImageVA + It->Rva, ImageVA + It->Rva + It->Size});
+    }
   }
 }
 
@@ -186,7 +199,9 @@ FEXCore::ExecutableFileSectionInfo ImageTracker::HandleImageMap(std::string_view
   uint64_t EndAddress = Address + Nt->OptionalHeader.SizeOfImage;
   fextl::set<uint64_t> VolatileInstructions {};
   FEXCore::IntervalList<uint64_t> VolatileValidRanges {};
-  LoadImageVolatileMetadata(VolatileInstructions, VolatileValidRanges, Module, Nt, Address, EndAddress, GuestBase);
+  if (FEXCore::Config::Get_VOLATILEMETADATA()) {
+    LoadImageVolatileMetadata(VolatileInstructions, VolatileValidRanges, Module, Nt, Address, EndAddress, GuestBase);
+  }
   if (auto It = ExtendedMetaData.find(ID); It != ExtendedMetaData.end()) {
     FEX::VolatileMetadata::ApplyFEXExtendedVolatileMetadata(It->second, VolatileInstructions, VolatileValidRanges, Address - GuestBase, EndAddress - GuestBase);
   }

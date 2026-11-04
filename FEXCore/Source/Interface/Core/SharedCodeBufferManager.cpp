@@ -16,8 +16,9 @@ static constexpr size_t INITIAL_CODE_SIZE = 1024 * 1024 * 16;
 // We don't want to move above 128MB atm because that means we will have to encode longer jumps
 static constexpr size_t MAX_CODE_SIZE = 1024 * 1024 * 128;
 
-CodeBuffer::CodeBuffer(size_t Size, bool ShouldBeNamed)
-  : AllocatedSize(Size) {
+CodeBufferRegion::CodeBufferRegion(size_t Size, bool ShouldBeNamed, const CodeBufferRegion* Previous)
+  : Previous {Previous}
+  , AllocatedSize(Size) {
   Ptr = static_cast<uint8_t*>(FEXCore::Allocator::VirtualAlloc(Size, true));
   LOGMAN_THROW_A_FMT(!!Ptr, "Couldn't allocate code buffer");
 
@@ -38,13 +39,11 @@ CodeBuffer::CodeBuffer(size_t Size, bool ShouldBeNamed)
   // Huge-pages reduce the amount of iTLB misses dramatically when it works.
   FEXCore::Allocator::VirtualTHPControl(Ptr, Size, FEXCore::Allocator::THPControl::Enable);
 
-  LookupCache = fextl::make_unique<GuestToHostMap>();
-
   CodeBufferEnd = Ptr + UsableSize();
   CodeBufferOffset = Ptr;
 }
 
-CodeBuffer::~CodeBuffer() {
+CodeBufferRegion::~CodeBufferRegion() {
   FEXCore::Allocator::VirtualFree(Ptr, AllocatedSize);
 }
 
@@ -57,6 +56,35 @@ SharedCodeBufferManager::SharedCodeBufferManager() {
   // `perf top` prefers VMA names over the JIT symbols file for some reason.
   // Breaks memory tracking when naming is enabled, but it's a debug feature so it isn't expected to be enabled by default.
   NameJITBuffers = !(GlobalJITNaming || LibraryJITNaming || BlockJITNaming);
+}
+
+CodeBuffer::CodeBuffer(size_t Size, bool ShouldBeNamed)
+  : CodeBufferRegion(Size, ShouldBeNamed)
+  , LookupCache {fextl::make_unique<GuestToHostMap>()}
+  , GenerationBytes {Size}
+  , NameJITBuffers {ShouldBeNamed} {}
+
+CodeBuffer::~CodeBuffer() = default;
+
+CodeBuffer::CodeBufferAllocation CodeBuffer::GrowAndAllocate(size_t Size, const CodeBufferRegion*& Added) {
+  std::lock_guard Lock {GrowthMutex};
+  auto* Active = ActiveRegion.load(std::memory_order_relaxed);
+  if (auto Allocation = Active->TryAllocate(Size); Allocation.BufferAllocationOffset) {
+    return Allocation;
+  }
+
+  // Double the generation's mapped space, up to its existing limit. Oversized blocks
+  // take the normal rollover path so no block or relocation spans a mapping boundary.
+  const size_t NewSize = std::min(GenerationBytes, MAX_CODE_SIZE - GenerationBytes);
+  if (NewSize == 0 || AlignUp(Size, 16) > NewSize - (Active->TotalAllocationSize() - Active->UsableSize())) {
+    return {};
+  }
+  auto& Region = AdditionalRegions.emplace_back(fextl::make_unique<CodeBufferRegion>(NewSize, NameJITBuffers, Active));
+  GenerationBytes += NewSize;
+  auto Allocation = Region->TryAllocate(Size);
+  Added = Region.get();
+  ActiveRegion.store(Region.get(), std::memory_order_release);
+  return Allocation;
 }
 
 fextl::shared_ptr<CodeBuffer> SharedCodeBufferManager::AllocateNew(size_t Size) {
@@ -87,11 +115,13 @@ fextl::shared_ptr<CodeBuffer> SharedCodeBufferManager::AllocateNew(size_t Size) 
   Latest = Buffer;
 
   OnCodeBufferAllocated(Buffer);
+  Published.store(Buffer.get(), std::memory_order_release);
 
   return Buffer;
 }
 
 fextl::shared_ptr<CodeBuffer> SharedCodeBufferManager::GetLatest() {
+  std::lock_guard Lock {GenerationMutex};
   if (!Latest) {
     AllocateNew(INITIAL_CODE_SIZE);
   }
@@ -99,17 +129,19 @@ fextl::shared_ptr<CodeBuffer> SharedCodeBufferManager::GetLatest() {
 }
 
 fextl::shared_ptr<CodeBuffer> SharedCodeBufferManager::StartLargerCodeBuffer() {
+  std::lock_guard Lock {GenerationMutex};
   if (!Latest) {
     // Allocate initial CodeBuffer and return it
-    return GetLatest();
+    return AllocateNew(INITIAL_CODE_SIZE);
   }
 
-  auto NewCodeBufferSize = GetLatest()->TotalAllocationSize();
+  auto NewCodeBufferSize = Latest->TotalAllocationSize();
   NewCodeBufferSize = std::min<size_t>(NewCodeBufferSize * 2, MAX_CODE_SIZE);
   return AllocateNew(NewCodeBufferSize);
 }
 
 fextl::shared_ptr<CodeBuffer> SharedCodeBufferManager::StartMaximalCodeBuffer() {
+  std::lock_guard Lock {GenerationMutex};
   return AllocateNew(MAX_CODE_SIZE);
 }
 } // namespace FEXCore::CPU

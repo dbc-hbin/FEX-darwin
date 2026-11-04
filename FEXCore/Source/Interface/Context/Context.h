@@ -455,7 +455,8 @@ public:
     bool NeedsAddGuestCodeRanges;
   };
   [[nodiscard]]
-  CompileCodeResult CompileCode(FEXCore::Core::InternalThreadState* Thread, uint64_t GuestRIP, uint64_t MaxInst = 0);
+  CompileCodeResult CompileCode(FEXCore::Core::InternalThreadState* Thread, uint64_t GuestRIP, uint64_t MaxInst,
+                                const std::optional<ExecutableFileSectionInfo>& Region);
   uintptr_t CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_t GuestRIP, uint64_t MaxInst = 0);
   uintptr_t CompileSingleStep(FEXCore::Core::CpuStateFrame* Frame, uint64_t GuestRIP);
 
@@ -501,7 +502,7 @@ public:
 
 protected:
   void UpdateAtomicTSOEmulationConfig() {
-    if (SupportsHardwareTSO) {
+    if (SupportsHardwareTSO || HostFeatures.ProcessFeatures.SupportsHardwareTSO) {
       // If the hardware supports TSO then we don't need to emulate it through atomics.
       AtomicTSOEmulationEnabled = false;
       VectorAtomicTSOEmulationEnabled = false;

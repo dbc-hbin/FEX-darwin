@@ -2,6 +2,7 @@
 #pragma once
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #if defined(ARCHITECTURE_arm64)
 #include <arm_acle.h>
 #endif
@@ -13,7 +14,9 @@ static inline uint32_t crc32(const T* Ptr, size_t Size) {
 #if defined(ARCHITECTURE_arm64)
 #define do_crc(type, suffix)                                               \
   while (Size >= sizeof(type)) {                                           \
-    Result = __crc32##suffix(Result, *reinterpret_cast<const type*>(Ptr)); \
+    type Value;                                                           \
+    std::memcpy(&Value, Ptr, sizeof(Value));                                \
+    Result = __crc32##suffix(Result, Value);                               \
     Ptr += sizeof(type);                                                   \
     Size -= sizeof(type);                                                  \
   }

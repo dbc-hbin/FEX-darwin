@@ -1457,10 +1457,13 @@ DEF_OP(FindLSB) {
   const auto Dst = GetReg(Node);
   const auto Src = GetReg(Op->Src);
 
-  // We assume the source is nonzero, so we can just rbit+clz without worrying
-  // about upper garbage for smaller types.
-  rbit(EmitSize, TMP1, Src);
-  clz(EmitSize, Dst, TMP1);
+  // For a nonzero narrow operand, upper garbage cannot affect the first set bit.
+  if (CTX->HostFeatures.SupportsCSSC) {
+    ctz(EmitSize, Dst, Src);
+  } else {
+    rbit(EmitSize, TMP1, Src);
+    clz(EmitSize, Dst, TMP1);
+  }
 }
 
 DEF_OP(FindMSB) {
@@ -1474,8 +1477,6 @@ DEF_OP(FindMSB) {
   const auto Dst = GetReg(Node);
   const auto Src = GetReg(Op->Src);
 
-  movz(ARMEmitter::Size::i64Bit, TMP1, IR::OpSizeAsBits(OpSize) - 1);
-
   if (OpSize == IR::OpSize::i16Bit) {
     lsl(EmitSize, Dst, Src, 16);
     clz(EmitSize, Dst, Dst);
@@ -1483,7 +1484,8 @@ DEF_OP(FindMSB) {
     clz(EmitSize, Dst, Src);
   }
 
-  sub(ARMEmitter::Size::i64Bit, Dst, TMP1, Dst);
+  // For a nonzero input, width - 1 - clz equals clz XOR (width - 1).
+  eor(EmitSize, Dst, Dst, IR::OpSizeAsBits(OpSize) - 1);
 }
 
 DEF_OP(FindTrailingZeroes) {
@@ -1496,6 +1498,17 @@ DEF_OP(FindTrailingZeroes) {
 
   const auto Dst = GetReg(Node);
   const auto Src = GetReg(Op->Src);
+
+  if (CTX->HostFeatures.SupportsCSSC) {
+    if (OpSize == IR::OpSize::i16Bit) {
+      // With bit 16 set, a zero low word returns 16 regardless of the upper bits.
+      orr(EmitSize, Dst, Src, 1U << 16);
+      ctz(EmitSize, Dst, Dst);
+    } else {
+      ctz(EmitSize, Dst, Src);
+    }
+    return;
+  }
 
   rbit(EmitSize, Dst, Src);
 

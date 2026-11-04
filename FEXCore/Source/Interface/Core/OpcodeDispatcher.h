@@ -880,6 +880,7 @@ public:
   void VectorBlend(OpcodeArgs, IR::OpSize ElementSize);
 
   void VectorVariableBlend(OpcodeArgs, IR::OpSize ElementSize);
+  void SetSelfPTestFlags(OpSize Size, Ref Bits);
   void PTestOpImpl(OpSize Size, Ref Dest, Ref Src);
   void PTestOp(OpcodeArgs);
 
@@ -929,6 +930,22 @@ public:
     return _VTBL1(OpSize::i128Bit, Src, LookupIndexes);
   }
 
+  AddressMode AVX128_DecodeMemoryAddress(const X86Tables::DecodedOp& Op, const X86Tables::DecodedOperand& Operand,
+                                         MemoryAccessType AccessType, bool IsLoad, unsigned Bytes);
+  void MapFixedSharedDataRead(AddressMode& A, unsigned Bytes) {
+#ifdef ARCHITECTURE_arm64ec
+    // A relocation, segment or register base cannot prove an absolute fixed-page read.
+    if (!A.Base && !A.Index && !A.Segment) {
+      const uint64_t VA = A.AddrSize == OpSize::i32Bit ? static_cast<uint32_t>(A.Offset) : static_cast<uint64_t>(A.Offset);
+      const uint64_t Offset = VA - Core::JITPointers::WindowsSharedPage;
+      if (Offset <= FEXCore::Utils::FEX_PAGE_SIZE - Bytes) {
+        A.Base = _LoadContextGPR(OpSize::i64Bit, offsetof(Core::CpuStateFrame, Pointers.WindowsSharedDataBase));
+        A.Offset = Offset;
+        A.AddrSize = OpSize::i64Bit;
+      }
+    }
+#endif
+  }
   RefPair AVX128_LoadSource_WithOpSize(const X86Tables::DecodedOp& Op, const X86Tables::DecodedOperand& Operand, uint32_t Flags,
                                        bool NeedsHigh, MemoryAccessType AccessType = MemoryAccessType::DEFAULT);
 
@@ -965,7 +982,6 @@ public:
   void AVX128_VBROADCAST(OpcodeArgs, IR::OpSize ElementSize);
   void AVX128_VPUNPCKL(OpcodeArgs, IR::OpSize ElementSize);
   void AVX128_VPUNPCKH(OpcodeArgs, IR::OpSize ElementSize);
-  void AVX128_MOVVectorUnaligned(OpcodeArgs);
   void AVX128_InsertCVTGPR_To_FPR(OpcodeArgs, IR::OpSize DstElementSize);
   void AVX128_CVTFPR_To_GPR(OpcodeArgs, IR::OpSize SrcElementSize, bool HostRoundingMode);
   void AVX128_VANDN(OpcodeArgs);
@@ -1184,7 +1200,30 @@ public:
     _StoreContext(Size, Class, Value, Offset);
   }
 
-  void FlushRegisterCache(bool SRAOnly = false, bool MMXOnly = false) {
+  static uint64_t RegisterForwardMask(X86Tables::DecodedOp Op) {
+    if (!Op->TableInfo || !(Op->TableInfo->Flags & X86Tables::InstFlags::FLAGS_CAN_FORWARD_REGISTERS) ||
+        (Op->Flags & X86Tables::DecodeFlags::FLAG_LOCK) || !Op->Dest.IsGPR()) {
+      return 0;
+    }
+    uint64_t Mask {};
+    auto AddOperand = [&](const X86Tables::DecodedOperand& Operand) {
+      if (!Operand.IsGPR()) {
+        return Operand.IsNone() || Operand.IsLiteral();
+      }
+      const auto Reg = Operand.Data.GPR.GPR;
+      if (Reg > X86State::REG_XMM_15) {
+        return false;
+      }
+      Mask |= 1ULL << (Reg < X86State::REG_XMM_0 ? GPR0Index + Reg : FPR0Index + Reg - X86State::REG_XMM_0);
+      return true;
+    };
+    if (!AddOperand(Op->Dest) || !std::all_of(std::begin(Op->Src), std::end(Op->Src), AddOperand)) {
+      return 0;
+    }
+    return Mask;
+  }
+
+  void FlushRegisterCache(bool SRAOnly = false, bool MMXOnly = false, uint64_t KeepSRA = 0) {
     // At block boundaries, fix up the carry flag.
     if (!SRAOnly) {
       RectifyCarryInvert(CFInvertedABI);
@@ -1225,7 +1264,7 @@ public:
       const uint64_t GPRMask = ((1ull << (AFIndex - GPR0Index + 1)) - 1) << GPR0Index;
       const uint64_t FPRMask = ((1ull << (FPR15Index - FPR0Index + 1)) - 1) << FPR0Index;
 
-      Mask &= (GPRMask | FPRMask);
+      Mask = (GPRMask | FPRMask) & ~KeepSRA;
       Bits &= Mask;
     }
 
@@ -1604,8 +1643,8 @@ private:
   }
 
   [[nodiscard]]
-  static bool IsNonTSOReg(MemoryAccessType Access, uint8_t Reg) {
-    return Access == MemoryAccessType::DEFAULT && Reg == X86State::REG_RSP;
+  bool IsNonTSOReg(MemoryAccessType Access, uint8_t Reg) const {
+    return Access == MemoryAccessType::DEFAULT && Reg == X86State::REG_RSP && ForceTSO != ForceTSOMode::ForceEnabled;
   }
 
   AddressMode DecodeAddress(const X86Tables::DecodedOp& Op, const X86Tables::DecodedOperand& Operand, MemoryAccessType AccessType, bool IsLoad);
@@ -2193,12 +2232,6 @@ private:
     RegCache.LastDefIndex[Index] = RegCache.Index;
   }
 
-  void InvalidateHighAVXRegisters() {
-    for (size_t i = 0; i < 16; ++i) {
-      InvalidateReg(AVXHigh0Index + i);
-    }
-  }
-
   void StoreRegister(uint8_t Reg, bool FPR, Ref Value) {
     StoreContext(Reg + (FPR ? FPR0Index : GPR0Index), Value);
   }
@@ -2640,13 +2673,18 @@ private:
     return _LoadMemAutoTSO(RegClass::FPR, Size, A, Align);
   }
 
-  AddressMode SelectPairAddressMode(AddressMode A, IR::OpSize Size) {
+  AddressMode SelectPairAddressMode(AddressMode A, IR::OpSize Size, bool SplitVector) {
     LOGMAN_THROW_A_FMT(Size != IR::OpSize::iUnsized, "Invalid size!");
     const auto SizeInt = IR::OpSizeToSize(Size);
     AddressMode Out {};
 
-    signed OffsetEl = A.Offset / SizeInt;
-    if (A.AddrSize == OpSize::i64Bit && (A.Offset % SizeInt) == 0 && OffsetEl >= -64 && OffsetEl < 64) {
+    const auto OffsetEl = A.Offset / SizeInt;
+    const bool Scaled = (A.Offset % SizeInt) == 0;
+    // LDP/STP take signed imm7. Two ordered Q accesses can use two signed imm9
+    // or unsigned scaled imm12 offsets, provided both halves are encodable.
+    const bool Fits = SplitVector ? ((A.Offset >= -256 && A.Offset <= 255 - SizeInt) || (Scaled && OffsetEl >= 0 && OffsetEl < 4095)) :
+                                    (Scaled && OffsetEl >= -64 && OffsetEl < 64);
+    if (A.AddrSize == OpSize::i64Bit && Fits) {
       Out.Offset = A.Offset;
       A.Offset = 0;
     }
@@ -2669,12 +2707,11 @@ private:
     const bool AtomicTSO = IsTSOEnabled(Class) && !A.NonTSO;
 
     // Use ldp if possible, otherwise fallback on two loads.
-    if (!AtomicTSO && !A.Segment && Size >= OpSize::i32Bit && Size <= OpSize::i128Bit) {
-      const auto B = SelectPairAddressMode(A, Size);
+    const auto B = SelectPairAddressMode(A, Size, AtomicTSO && Class == RegClass::FPR);
+    if (!AtomicTSO && Size >= OpSize::i32Bit && Size <= OpSize::i128Bit) {
       return LoadMemPair(Class, Size, B.Base, B.Offset);
     }
 
-    const auto B = SelectPairAddressMode(A, Size);
     const auto LowOffset = Constant(B.Offset);
     const auto HighOffset = Constant(B.Offset + IR::OpSizeToSize(Size));
     if (AtomicTSO) {
@@ -2710,11 +2747,10 @@ private:
     const bool AtomicTSO = IsTSOEnabled(Class) && !A.NonTSO;
 
     // Use stp if possible, otherwise fallback on two stores.
-    if (!AtomicTSO && !A.Segment && Size >= OpSize::i32Bit && Size <= OpSize::i128Bit) {
-      const auto B = SelectPairAddressMode(A, Size);
+    const auto B = SelectPairAddressMode(A, Size, AtomicTSO && Class == RegClass::FPR);
+    if (!AtomicTSO && Size >= OpSize::i32Bit && Size <= OpSize::i128Bit) {
       _StoreMemPair(Class, Size, Value1, Value2, B.Base, B.Offset);
     } else {
-      const auto B = SelectPairAddressMode(A, Size);
       const auto LowOffset = Constant(B.Offset);
       const auto HighOffset = Constant(B.Offset + SizeInt);
       if (AtomicTSO) {
@@ -2901,6 +2937,23 @@ constexpr inline void InstallToTable(auto& FinalTable, const auto& LocalTable) {
 #endif
 
       TableOp.OpcodeDispatcher.OpDispatch = Dispatcher;
+#ifdef _WIN32
+      // Classify once when constructing the decode tables. Floating-point operations,
+      // implicit memory accesses and control flow need their usual recovery points.
+      using B = OpDispatchBuilder;
+      if (Dispatcher == &B::Bind<&B::MOVGPROp, 0> || Dispatcher == &B::Bind<&B::MOVGPROp, 1> ||
+          Dispatcher == &B::SecondaryALUOp || Dispatcher == &B::Bind<&B::CMPOp, 0> || Dispatcher == &B::Bind<&B::CMPOp, 1> ||
+          Dispatcher == &B::Bind<&B::TESTOp, 0> || Dispatcher == &B::Bind<&B::TESTOp, 1> ||
+          Dispatcher == &B::Bind<&B::ALUOp, OP_ADD, OP_ATOMICFETCHADD, 0> || Dispatcher == &B::Bind<&B::ALUOp, OP_SUB, OP_ATOMICFETCHSUB, 0> ||
+          Dispatcher == &B::Bind<&B::ALUOp, OP_ANDWITHFLAGS, OP_ATOMICFETCHAND, 0> || Dispatcher == &B::Bind<&B::ALUOp, OP_OR, OP_ATOMICFETCHOR, 0> ||
+          Dispatcher == &B::Bind<&B::ALUOp, OP_XOR, OP_ATOMICFETCHXOR, 0> || Dispatcher == &B::MOVSXOp ||
+          Dispatcher == &B::BSWAPOp || Dispatcher == &B::MOVVectorAlignedOp || Dispatcher == &B::MOVVectorUnalignedOp ||
+          Dispatcher == &B::VectorXOROp || Dispatcher == &B::AVX128_VectorXOR || Dispatcher == &B::AVX128_VMOVAPS ||
+          Dispatcher == &B::AVX128_VANDN || Dispatcher == &B::Bind<&B::AVX128_VectorALU, OP_VAND, OpSize::i128Bit> ||
+          Dispatcher == &B::Bind<&B::AVX128_VectorALU, OP_VOR, OpSize::i128Bit>) {
+        TableOp.Flags |= X86Tables::InstFlags::FLAGS_CAN_FORWARD_REGISTERS;
+      }
+#endif
     }
   }
 }

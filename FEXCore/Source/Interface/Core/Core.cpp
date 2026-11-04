@@ -63,6 +63,7 @@ $end_info$
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstring>
 #include <fcntl.h>
 #include <functional>
 #include <limits>
@@ -527,6 +528,7 @@ static bool CanChangeCodeBytes(IR::IROps Op) {
   case IR::OP_VSTORENONTEMPORALPAIR:
   case IR::OP_PUSH:
   case IR::OP_PUSHTWO:
+  case IR::OP_REPSTRINGPAGE:
   case IR::OP_MEMSET:
   case IR::OP_MEMCPY:
   case IR::OP_CACHELINECLEAR:
@@ -604,8 +606,8 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
 
     const auto GPRSize = Thread->OpDispatcher->GetGPROpSize();
 #ifdef _WIN32
-    const bool CanElideDivRemainder = !ExtendedDebugInfo && MaxInst != 1 && !FEXCore::Config::Get_O0() &&
-                                    Config.SMCChecks != FEXCore::Config::CONFIG_SMC_FULL;
+    const bool CanCoalesceRegisters = !ExtendedDebugInfo && MaxInst != 1 && !FEXCore::Config::Get_O0() &&
+                                      Config.SMCChecks != FEXCore::Config::CONFIG_SMC_FULL;
 #endif
 
 #ifdef ZYDIS_DISASSEMBLER
@@ -632,14 +634,8 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
       }
 #endif
 
-      bool BlockInForceTSOValidRange = false;
-      auto InstForceTSOIt = ForceTSOInstructions.end();
-      if (ForceTSOValidRanges.Contains({Block.Entry, Block.Entry + Block.Size})) {
-        if (auto It = ForceTSOInstructions.lower_bound(Block.Entry); It != ForceTSOInstructions.end() && *It < Block.Entry + Block.Size) {
-          InstForceTSOIt = It;
-          BlockInForceTSOValidRange = true;
-        }
-      }
+      auto TSORange = ForceTSOValidRanges.Query(Block.Entry);
+      auto InstForceTSOIt = ForceTSOInstructions.lower_bound(Block.Entry);
 
       // Set the block entry point
       Thread->OpDispatcher->SetNewBlockIfChanged(Block.Entry);
@@ -661,7 +657,20 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
       // serializing or JIT-leaving instruction ends the segment.
       uint64_t BlockInstructionsLength {};
       IR::IROp_ValidateCode* SegmentValidate {};
-      size_t SegmentScanNode {};
+      uint64_t SegmentStart {};
+      auto FinishSegment = [&] {
+        auto Value = FEXCore::Utils::crc32(reinterpret_cast<const uint8_t*>(GetGuestBase() + SegmentStart), SegmentValidate->CodeLength);
+        auto CRC = Thread->OpDispatcher->GetOpHeader(SegmentValidate->crc);
+        if (WantsDiskCachePatching) {
+          auto Patchable = CRC->CW<IR::IROp_PatchableGuestCRC>();
+          Patchable->Value = Value;
+          Patchable->GuestSize = SegmentValidate->CodeLength;
+        } else {
+          CRC->CW<IR::IROp_Constant>()->Constant = Value;
+        }
+        SegmentValidate = nullptr;
+      };
+      const bool ValidateCode = Config.SMCChecks == FEXCore::Config::CONFIG_SMC_FULL || Block.ForceFullSMCDetection;
       for (size_t i = 0; i < InstsInBlock; ++i) {
         uint64_t InstAddress = Block.Entry + BlockInstructionsLength;
         const FEXCore::X86Tables::X86InstInfo* TableInfo {nullptr};
@@ -690,7 +699,7 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
         using namespace FEXCore::X86Tables::DecodeFlags;
         using Builder = FEXCore::IR::OpDispatchBuilder;
         const auto DivSize = GetSizeSrcFlags(DecodedInfo->Flags);
-        if (CanElideDivRemainder && !Block.ForceFullSMCDetection && !IsLocked && i + 1 < InstsInBlock &&
+        if (CanCoalesceRegisters && !Block.ForceFullSMCDetection && !IsLocked && i + 1 < InstsInBlock &&
             TableInfo && (TableInfo->OpcodeDispatcher.OpDispatch == &Builder::DIVOp ||
                           TableInfo->OpcodeDispatcher.OpDispatch == &Builder::IDIVOp) &&
             DecodedInfo->Dest.IsGPR() && (DivSize == SIZE_32BIT || DivSize == SIZE_64BIT)) {
@@ -707,21 +716,17 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
 #endif
         Thread->OpDispatcher->SetDivRemainderDead(DivRemainderDead);
 
-        // Do a partial register cache flush before every instruction. This
-        // prevents cross-instruction static register caching, while allowing
-        // context load/stores to be optimized within a block. Theoretically,
-        // this flush is not required for correctness, all mandatory flushes are
-        // included in instruction-specific handlers. Instead, this is a blunt
-        // heuristic to make the register cache less aggressive, as the current
-        // RA generates bad code in common cases with tied registers otherwise.
-        //
-        // However, it makes our exception handling behaviour more predictable.
-        // It is potentially correctness bearing in that sense, but that is a
-        // side effect here and (if that behaviour is required) we should handle
-        // that more explicitly later.
-        Thread->OpDispatcher->FlushRegisterCache(true);
+        // Windows suspends cooperatively. Forward only the next non-faulting
+        // instruction's operands, so unrelated values don't occupy dynamic
+        // registers and recovery points still see every fixed register.
+        uint64_t KeepSRA {};
+#ifdef _WIN32
+        if (CanCoalesceRegisters && !Block.ForceFullSMCDetection) {
+          KeepSRA = Builder::RegisterForwardMask(DecodedInfo);
+        }
+#endif
+        Thread->OpDispatcher->FlushRegisterCache(true, false, KeepSRA);
 
-        const bool ValidateCode = Config.SMCChecks == FEXCore::Config::CONFIG_SMC_FULL || Block.ForceFullSMCDetection;
         if (ValidateCode && SegmentValidate) {
           // Per-instruction validation used to end the IR block here. Keep its complete
           // flush so fault-visible state matches without the check.
@@ -732,38 +737,25 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
           Thread->OpDispatcher->_GuestOpcode(InstAddress - GuestRIP);
         }
 
-        if (ValidateCode) {
-          if (SegmentValidate) {
-            const uint64_t SegmentStart = InstAddress - SegmentValidate->CodeLength;
-            const uint64_t SegmentLength = SegmentValidate->CodeLength + DecodedInfo->InstSize;
-            if (SegmentLength > std::numeric_limits<uint8_t>::max() ||
-                (SegmentStart & FEXCore::Utils::FEX_PAGE_MASK) != ((InstAddress + DecodedInfo->InstSize - 1) & FEXCore::Utils::FEX_PAGE_MASK)) {
-              SegmentValidate = nullptr;
-            } else {
-              SegmentValidate->CodeLength = SegmentLength;
-              auto Value = FEXCore::Utils::crc32(reinterpret_cast<const uint8_t*>(GetGuestBase() + SegmentStart), SegmentLength);
-              auto CRC = Thread->OpDispatcher->GetOpHeader(SegmentValidate->crc);
-              if (WantsDiskCachePatching) {
-                auto Patchable = CRC->CW<IR::IROp_PatchableGuestCRC>();
-                Patchable->Value = Value;
-                Patchable->GuestSize = SegmentLength;
-              } else {
-                CRC->CW<IR::IROp_Constant>()->Constant = Value;
-              }
-            }
+        if (SegmentValidate) {
+          const uint64_t SegmentLength = SegmentValidate->CodeLength + DecodedInfo->InstSize;
+          if (SegmentLength > std::numeric_limits<uint8_t>::max() ||
+              (SegmentStart & FEXCore::Utils::FEX_PAGE_MASK) != ((InstAddress + DecodedInfo->InstSize - 1) & FEXCore::Utils::FEX_PAGE_MASK)) {
+            FinishSegment();
+          } else {
+            SegmentValidate->CodeLength = SegmentLength;
           }
         }
 
         if (ValidateCode && !SegmentValidate) {
-          auto ExistingCodePtr = reinterpret_cast<uint8_t*>(GetGuestBase() + InstAddress);
+          SegmentStart = InstAddress;
           auto InstAddressReg = Thread->OpDispatcher->_EntrypointOffset(GPRSize, InstAddress - GuestRIP);
-          auto Value = FEXCore::Utils::crc32(ExistingCodePtr, DecodedInfo->InstSize);
+          // Fill the unpooled CRC once the final segment length is known.
           IR::Ref CRC;
           if (WantsDiskCachePatching) {
-            CRC = Thread->OpDispatcher->_PatchableGuestCRC(IR::OpSize::i64Bit, Value, InstAddress, DecodedInfo->InstSize);
+            CRC = Thread->OpDispatcher->_PatchableGuestCRC(IR::OpSize::i64Bit, 0, InstAddress, DecodedInfo->InstSize);
           } else {
-            // Unpooled: the segment extends this constant in place.
-            CRC = Thread->OpDispatcher->_Constant(Value);
+            CRC = Thread->OpDispatcher->_Constant(0);
           }
           auto CodeChanged = Thread->OpDispatcher->_ValidateCode(CRC, InstAddressReg, DecodedInfo->InstSize);
           SegmentValidate = CodeChanged.first;
@@ -795,23 +787,26 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
           Thread->OpDispatcher->ResetHandledLock();
           Thread->OpDispatcher->ResetDecodeFailure();
           IR::ForceTSOMode ForceTSO = IR::ForceTSOMode::NoOverride;
-          if (BlockInForceTSOValidRange) {
-            if (InstForceTSOIt != ForceTSOInstructions.end() && *InstForceTSOIt == InstAddress) {
-              ForceTSO = IR::ForceTSOMode::ForceEnabled;
-            } else {
-              ForceTSO = IR::ForceTSOMode::ForceDisabled;
-            }
-          } else if (DecodedInfo->Flags & X86Tables::DecodeFlags::FLAG_FORCE_TSO) {
+          if (TSORange.Size && InstAddress >= TSORange.Interval.End) {
+            TSORange = ForceTSOValidRanges.Query(InstAddress);
+          }
+          // A range certifies its unmarked instructions, including runs with no marked PC.
+          // Never weaken an instruction spanning the boundary, or an explicit Unity override.
+          if ((DecodedInfo->Flags & X86Tables::DecodeFlags::FLAG_FORCE_TSO) ||
+              (InstForceTSOIt != ForceTSOInstructions.end() && *InstForceTSOIt == InstAddress)) {
             ForceTSO = IR::ForceTSOMode::ForceEnabled;
+          } else if (TSORange.Size && InstAddress >= TSORange.Interval.Offset &&
+                     DecodedInfo->InstSize <= TSORange.Interval.End - InstAddress) {
+            ForceTSO = IR::ForceTSOMode::ForceDisabled;
           }
 
           Thread->OpDispatcher->SetForceTSO(ForceTSO);
-          SegmentScanNode = Thread->OpDispatcher->GetAllocatedNodeCount();
+          const auto SegmentScanNode = SegmentValidate ? Thread->OpDispatcher->GetAllocatedNodeCount() : 0;
           std::invoke(Fn, Thread->OpDispatcher, DecodedInfo);
           if (SegmentValidate) {
             for (size_t Node = SegmentScanNode, End = Thread->OpDispatcher->GetAllocatedNodeCount(); Node < End; ++Node) {
               if (CanChangeCodeBytes(Thread->OpDispatcher->GetAllocatedNodeOp(Node))) {
-                SegmentValidate = nullptr;
+                FinishSegment();
                 break;
               }
             }
@@ -828,8 +823,9 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
             ++TotalInstructions;
 
             // Walk InstForceTSOIt forward past the handled instruction
-            InstForceTSOIt =
-              std::find_if(InstForceTSOIt, ForceTSOInstructions.end(), [&](auto Val) { return Val >= Block.Entry + BlockInstructionsLength; });
+            while (InstForceTSOIt != ForceTSOInstructions.end() && *InstForceTSOIt < Block.Entry + BlockInstructionsLength) {
+              ++InstForceTSOIt;
+            }
           }
         } else {
           // Invalid instruction
@@ -882,6 +878,9 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
           break;
         }
       }
+      if (SegmentValidate) {
+        FinishSegment();
+      }
     }
 
 #ifdef ZYDIS_DISASSEMBLER
@@ -921,13 +920,10 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
   };
 }
 
-ContextImpl::CompileCodeResult ContextImpl::CompileCode(FEXCore::Core::InternalThreadState* Thread, uint64_t GuestRIP, uint64_t MaxInst) {
-  if (SourcecodeResolver && Config.GDBSymbols()) {
-    auto MappedSection = SyscallHandler->LookupExecutableFileSection(Thread, GuestRIP);
-    if (MappedSection) {
-      MappedSection->FileInfo.SourcecodeMap =
-        SourcecodeResolver->GenerateMap(MappedSection->FileInfo.Filename, CodeMap::GetBaseFilename(MappedSection->FileInfo, false));
-    }
+ContextImpl::CompileCodeResult ContextImpl::CompileCode(FEXCore::Core::InternalThreadState* Thread, uint64_t GuestRIP, uint64_t MaxInst,
+                                                        const std::optional<ExecutableFileSectionInfo>& Region) {
+  if (SourcecodeResolver && Config.GDBSymbols() && Region) {
+    Region->FileInfo.SourcecodeMap = SourcecodeResolver->GenerateMap(Region->FileInfo.Filename, CodeMap::GetBaseFilename(Region->FileInfo, false));
   }
 
   // Generate IR + Meta Info
@@ -1007,12 +1003,12 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
     return HostCode;
   }
 
-  Thread->FrontendDecoder->SetupDecodeInstructionsAtEntry(Thread, GuestRIP, MaxInst);
-
-  std::optional<ExecutableFileSectionInfo> Region = SyscallHandler->LookupExecutableFileSection(Thread, GuestRIP);
+  const bool NeedSection = DiskCache.IsReadingDiskCache() || (CodeMapWriter && !CodeCache.IsGeneratingCache) ||
+                           Config.BlockJITNaming() || Config.LibraryJITNaming() || Config.GDBSymbols();
+  auto Region = Thread->FrontendDecoder->SetupDecodeInstructionsAtEntry(Thread, GuestRIP, MaxInst, NeedSection);
   std::optional<DiskCache::CodeHitData> Hit;
   std::optional<uint64_t> DiskCacheGuestCodeKey;
-  {
+  if (DiskCache.IsReadingDiskCache()) {
     FEXCORE_PROFILE_ACCUMULATION(Thread, AccumulatedDiskCacheLookupTime);
     Hit = DiskCache.Lookup(Thread, Region, GuestRIP, DiskCacheGuestCodeKey);
     if (Hit && !DiskCache.IsValidating()) {
@@ -1054,7 +1050,7 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
   // Accumulate a JIT count now, as even if another thread raced us, it should count as a compile.
   FEXCORE_PROFILE_INSTANT_INCREMENT(Thread, AccumulatedJITCount, 1);
 
-  auto [CompiledCode, DebugData, StartAddr, Length, NeedsAddGuestCodeRanges] = CompileCode(Thread, GuestRIP, MaxInst);
+  auto [CompiledCode, DebugData, StartAddr, Length, NeedsAddGuestCodeRanges] = CompileCode(Thread, GuestRIP, MaxInst, Region);
   auto CodePtr = CompiledCode.EntryPoints[GuestRIP];
   if (CodePtr == nullptr) {
     return 0;
@@ -1074,38 +1070,30 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
   if (Config.BlockJITNaming()) {
     auto FragmentBasePtr = CompiledCode.BlockBegin;
 
-    auto GuestRIPLookup = SyscallHandler->LookupExecutableFileSection(Thread, GuestRIP);
-
     if (DebugData->Subblocks.size()) {
       for (auto& Subblock : DebugData->Subblocks) {
         auto BlockBasePtr = FragmentBasePtr + Subblock.HostCodeOffset;
-        if (GuestRIPLookup) {
-          Symbols.Register(Thread->SymbolBuffer.get(), BlockBasePtr, CompiledCode.Size, GuestRIPLookup->FileInfo.Filename,
-                           GuestRIP - GuestRIPLookup->FileStartVA);
+        if (Region) {
+          Symbols.Register(Thread->SymbolBuffer.get(), BlockBasePtr, CompiledCode.Size, Region->FileInfo.Filename, GuestRIP - Region->FileStartVA);
         } else {
           Symbols.Register(Thread->SymbolBuffer.get(), BlockBasePtr, GuestRIP, Subblock.HostCodeSize);
         }
       }
     } else {
-      if (GuestRIPLookup) {
-        Symbols.Register(Thread->SymbolBuffer.get(), FragmentBasePtr, CompiledCode.Size, GuestRIPLookup->FileInfo.Filename,
-                         GuestRIP - GuestRIPLookup->FileStartVA);
+      if (Region) {
+        Symbols.Register(Thread->SymbolBuffer.get(), FragmentBasePtr, CompiledCode.Size, Region->FileInfo.Filename, GuestRIP - Region->FileStartVA);
       } else {
         Symbols.Register(Thread->SymbolBuffer.get(), FragmentBasePtr, GuestRIP, CompiledCode.Size);
       }
     }
   }
 
-  if (Config.LibraryJITNaming() || Config.GDBSymbols()) {
-    auto MappedSection = SyscallHandler->LookupExecutableFileSection(Thread, GuestRIP);
-    if (MappedSection) {
-      if (Config.LibraryJITNaming()) {
-        Symbols.RegisterNamedRegion(Thread->SymbolBuffer.get(), CodePtr, DebugData->HostCodeSize, MappedSection->FileInfo.Filename);
-      }
-
-      if (Config.GDBSymbols()) {
-        GDBJITRegister(MappedSection->FileInfo, MappedSection->FileStartVA, GuestRIP, (uintptr_t)CodePtr, *DebugData);
-      }
+  if (Region) {
+    if (Config.LibraryJITNaming()) {
+      Symbols.RegisterNamedRegion(Thread->SymbolBuffer.get(), CodePtr, DebugData->HostCodeSize, Region->FileInfo.Filename);
+    }
+    if (Config.GDBSymbols()) {
+      GDBJITRegister(Region->FileInfo, Region->FileStartVA, GuestRIP, (uintptr_t)CodePtr, *DebugData);
     }
   }
 
@@ -1165,8 +1153,8 @@ uintptr_t ContextImpl::CompileSingleStep(FEXCore::Core::CpuStateFrame* Frame, ui
   // Invalidate might take a unique lock on this, to guarantee that during invalidation no code gets compiled
   auto lk = GuardSignalDeferringSection<std::shared_lock>(CodeInvalidationMutex, Thread);
 
-  Thread->FrontendDecoder->SetupDecodeInstructionsAtEntry(Thread, GuestRIP, 1);
-  auto [CompiledCode, DebugData, StartAddr, Length, _] = CompileCode(Thread, GuestRIP, 1);
+  auto Region = Thread->FrontendDecoder->SetupDecodeInstructionsAtEntry(Thread, GuestRIP, 1, SourcecodeResolver && Config.GDBSymbols());
+  auto [CompiledCode, DebugData, StartAddr, Length, _] = CompileCode(Thread, GuestRIP, 1, Region);
   auto CodePtr = CompiledCode.EntryPoints[GuestRIP];
   if (CodePtr == nullptr) {
     return 0;
@@ -1295,7 +1283,7 @@ void ContextImpl::RemoveForceTSOInformation(uint64_t Address, uint64_t Size) {
   LogMan::Throw::AFmt(CodeInvalidationMutex.try_lock() == false, "CodeInvalidationMutex needs to be unique_locked here");
 
   ForceTSOValidRanges.Remove({Address, Address + Size});
-  ForceTSOInstructions.erase(ForceTSOInstructions.lower_bound(Address), ForceTSOInstructions.upper_bound(Address + Size));
+  ForceTSOInstructions.erase(ForceTSOInstructions.lower_bound(Address), ForceTSOInstructions.lower_bound(Address + Size));
 }
 
 void ContextImpl::MarkMonoBackpatcherBlock(uint64_t BlockEntry) {

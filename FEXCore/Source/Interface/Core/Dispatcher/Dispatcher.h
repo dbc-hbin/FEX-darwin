@@ -59,6 +59,12 @@ public:
     return ExitFunctionLinkerAddress;
   }
 
+#ifdef ARCHITECTURE_arm64ec
+  uint64_t GetNativeInlineCacheAddress() const {
+    return NativeInlineCacheAddress;
+  }
+#endif
+
   SignalDelegatorConfig MakeSignalDelegatorConfig() const;
 
 protected:
@@ -86,6 +92,9 @@ private:
   uint64_t ThreadDispatchRemoveCodeEntry {};
   uint64_t ExitFunctionLinkerAddress {};
   uint64_t InlineCacheFillerAddress {};
+#ifdef ARCHITECTURE_arm64ec
+  uint64_t NativeInlineCacheAddress {};
+#endif
   uint64_t SignalHandlerReturnAddress {};
   uint64_t SignalHandlerReturnAddressRT {};
   uint64_t GuestSignal_SIGILL {};

@@ -67,7 +67,8 @@ public:
   Decoder(FEXCore::Core::InternalThreadState* Thread);
   bool CheckIfCacheable(FEXCore::Core::InternalThreadState&, const uint8_t* InstStream, uint64_t PC, uint64_t MaxInst);
 
-  void SetupDecodeInstructionsAtEntry(FEXCore::Core::InternalThreadState* Thread, uint64_t PC, uint64_t MaxInst);
+  std::optional<ExecutableFileSectionInfo> SetupDecodeInstructionsAtEntry(FEXCore::Core::InternalThreadState* Thread, uint64_t PC,
+                                                                         uint64_t MaxInst, bool NeedSection = false);
   void DecodeLoop(const uint8_t* InstStream, uint64_t GuestPause = 0);
 
   const DecodedBlockInformation* GetDecodedBlockInfo() const {

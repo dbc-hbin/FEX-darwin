@@ -426,7 +426,7 @@ void CodeCache::Validate(const ExecutableFileSectionInfo& Section, fextl::set<ui
       .subspan(0, CachedCode.size_bytes());
 
   while (!GuestBlocks.empty()) {
-    auto [CompiledBlocks, _, _2, _3, _4] = ValidationCTX->CompileCode(ValidationThread.get(), *GuestBlocks.begin(), 0 /* TODO: Set MaxInst? */);
+    auto [CompiledBlocks, _, _2, _3, _4] = ValidationCTX->CompileCode(ValidationThread.get(), *GuestBlocks.begin(), 0, Section);
     for (auto& Entry : CompiledBlocks.EntryPoints) {
       GuestBlocks.erase(Entry.first);
     }

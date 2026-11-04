@@ -2,6 +2,7 @@
 
 #include "Common/CPUInfo.h"
 
+#include <FEXCore/Config/Config.h>
 #include <FEXCore/Core/Context.h>
 #include <FEXCore/Core/HostFeatures.h>
 #include <FEXCore/fextl/fmt.h>
@@ -94,6 +95,8 @@ FEXCore::HostFeatures CPUFeatures::FetchHostFeatures(bool IsWine, FEXCore::HostF
   // arm64ec supports synchronous faults without a double-fault dance.
   HostFeatures.ProcessFeatures.SupportsFaultFreeSynchronousFaults = HostType == FEXCore::HostFeatures::HostTypeEnum::Arm64ec;
 
+  FEX_CONFIG_OPT(TSOEnabled, TSOENABLED);
+  HostFeatures.ProcessFeatures.SupportsHardwareTSO = TSOEnabled() && UnixLib::TryEnableHardwareTSO();
   return HostFeatures;
 }
 

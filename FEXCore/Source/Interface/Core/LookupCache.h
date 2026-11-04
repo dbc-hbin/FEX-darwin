@@ -259,6 +259,7 @@ public:
 
           CurrentL1Entries <<= 1;
           L1PointerMask = CurrentL1Entries - 1;
+          CommitL1Window();
 
           // Update the thread's L1 pointer mask to increase how much cache it uses.
           // Since we're in C-code, this is safe to update here.
@@ -411,6 +412,8 @@ public:
   }
 
 private:
+  void CommitL1Window();
+
   void AddL1Entry(uint64_t GuestAddress, uint64_t HostCode) {
     auto& L1Entry = reinterpret_cast<LookupCacheEntry*>(L1Pointer)[L1Index(GuestAddress)];
     L1Entry.GuestCode = GuestAddress;

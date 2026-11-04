@@ -193,6 +193,12 @@ namespace FEXCore::CPU {
     const auto Vector1 = GetVReg(Op->Vector1);                                                                                \
     const auto Vector2 = GetVReg(Op->Vector2);                                                                                \
                                                                                                                               \
+    /* FPCR.NEP takes the rest of the 128-bit result from the first source of these arithmetic operations. */                 \
+    if (HostSupportsAFP && IROp->Size == IR::OpSize::i128Bit && ElementSize != IR::OpSize::i16Bit) {                          \
+      ScalarEmit(Dst, Vector1, Vector2);                                                                                      \
+      return;                                                                                                                 \
+    }                                                                                                                         \
+                                                                                                                              \
     VFScalarOperation(IROp->Size, ElementSize, Op->ZeroUpperBits, ScalarEmit, Dst, Vector1, Vector2);                         \
   }
 

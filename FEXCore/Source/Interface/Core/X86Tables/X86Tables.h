@@ -408,8 +408,10 @@ namespace InstFlags {
   constexpr InstFlagType FLAGS_SUPPORTS_LOCK = (1ULL << 31);
   constexpr InstFlagType FLAGS_LITERAL_PATCHABLE = (1ULL << 32);
   constexpr InstFlagType FLAGS_NO_PREFIX_ORDER = (1ULL << 33);
+  // The handler cannot fault or leave the JIT when every operand is a register or immediate.
+  constexpr InstFlagType FLAGS_CAN_FORWARD_REGISTERS = (1ULL << 34);
 
-  // Flags [57..34]: Undefined
+  // Flags [57..35]: Undefined
   // Flags [60..58]: Dst size
   constexpr InstFlagType FLAGS_SIZE_DST_OFF = 58;
   // Flags [63..61]: Src size
