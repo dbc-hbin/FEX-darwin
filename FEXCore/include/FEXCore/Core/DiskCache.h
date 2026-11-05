@@ -254,8 +254,8 @@ namespace DiskCache {
 
   // TODO: This header is in global installed header path, but uses internal headers.
   // Migrate this once that is fixed.
-  // Includes the Darwin bit-scan, x87 normalization and SIMD test lowerings.
-  static constexpr uint16_t FormatVersion = 0xA61A;
+  // Includes operand-width normalization for forwarded partial-register constants.
+  static constexpr uint16_t FormatVersion = 0xA61B;
   FEX_DEFAULT_VISIBILITY uint16_t GetFormatVersion();
 
   static constexpr uint32_t LOOKUP_KEY_MAX_BUCKET_DEPTH = 500;

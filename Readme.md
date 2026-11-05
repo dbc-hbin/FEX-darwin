@@ -125,8 +125,8 @@ These are not passing WoW64 or hardware-TSO activation results. Evidence:
 `build/local/hardware-tso-final-20261104/` and
 `build/local/hardware-tso-wine-core-20261104/`.
 
-Translated-code cache namespace `0xA61A` covers the current instruction selection and
-frame layout. Hardware-TSO and software-TSO contexts also have distinct cache identities.
+Translated-code cache namespace `0xA61B` also invalidates earlier translations of
+forwarded partial-register constants. Hardware-TSO and software-TSO contexts have distinct cache identities.
 Independent review found no actionable defect in the bounded string
 fixes; it does not constitute a fresh audit of every earlier optimization.
 
@@ -135,6 +135,7 @@ fixes; it does not constitute a fresh audit of every earlier optimization.
 - The compiler chooses software TSO per instruction. A PE metadata range covers only whole instructions. Marked PCs and Unity's explicit TSO flag take precedence, including vector and stack-relative accesses. The default policy applies outside certified ranges.
 - The split-AVX translator folds x64 displacements into Q-register pairs or their two ordered accesses. VEX.256 self-moves disappear, while VEX.128 self-moves retain the upper-half clear. Repeated upper clears reuse register-cache state. The 32-byte movemask combines both NEON halves before extracting the scalar result. AFP scalar arithmetic takes its preserved lanes from its first input.
 - On Windows, adjacent non-faulting register moves and integer operations can forward their GPR and XMM operands. The translator synchronizes fixed registers before faulting and control-flow instructions, single-step and full SMC checks.
+- Before promoting an 8/16-bit logical operation to a full-register operation, the compiler masks a forwarded constant to the operand width. This preserves the destination's upper bits while retaining register forwarding and widened logical operations. The local `apple_block_probe` covers byte/word XOR, OR and AND with full-width source constants; its byte XOR case reproduced the ZZZ startup corruption before the fix.
 - Fixed ARM64EC reads wholly inside the Windows shared data page use the current thread frame's Wine backing address. Dynamic addresses retain the exception handler. Stores still target the read-only guest address.
 - Forward REP MOVS and STOS select overlap handling before the copy loop. The wide loop processes 64-byte chunks up to the count and both guest page boundaries. Each completed chunk commits guest indices and count, so a fault or cooperative suspend sees the restart position.
 - JIT compilation looks up image data only for active consumers and records subblock names when requested. SMC calculates the expected CRC once per validation segment. On Darwin, JIT growth retains the generation's existing translations in append-only regions up to 128 MiB. Each generation owns its code, links and block map together.
