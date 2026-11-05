@@ -5060,7 +5060,9 @@ void OpDispatchBuilder::ALUOp(OpcodeArgs, FEXCore::IR::IROps ALUIROp, FEXCore::I
       (ALUIROp == IR::IROps::OP_XOR || ALUIROp == IR::IROps::OP_OR || ALUIROp == IR::IROps::OP_ANDWITHFLAGS)) {
 
     RoundedSize = ResultSize = GetGPROpSize();
-    LOGMAN_THROW_A_FMT(Const < (1ull << IR::OpSizeAsBits(Size)), "does not clobber");
+    // Forwarded register constants can retain the upper garbage allowed by the load.
+    Const &= (1ull << IR::OpSizeAsBits(Size)) - 1;
+    Src = Constant(Const);
 
     // For AND, we can play the same trick but we instead need the upper bits of
     // the constant to be all-1s instead of all-0s to preserve. We also can't
