@@ -458,10 +458,8 @@ inline Ref X87StackOptimization::LoadStackValueAtOffset_Slow(uint8_t Offset) {
   OrderedNode* TopOffsetAddress = GetOffsetTopAddressWithCache_Slow(Offset);
   auto Size = ReducedPrecisionMode ? OpSize::i64Bit : OpSize::i128Bit;
   if (!TopValueCache[Offset]) {
-    // TopOffsetAddress is `STATE + index * 16` from _FormContextAddress: a host pointer, so it takes
-    // the host-addressed form (identical to _LoadMemFPR unless a guest window is supported).
     TopValueCache[Offset] =
-      IREmit->_LoadMemHostFPR(Size, TopOffsetAddress, IREmit->_InlineConstant(MMBaseOffset()), Size, MemOffsetType::SXTX, 1);
+      IREmit->_LoadMemFPR(Size, TopOffsetAddress, IREmit->_InlineConstant(MMBaseOffset()), Size, MemOffsetType::SXTX, 1);
   }
   return TopValueCache[Offset];
 }
@@ -608,9 +606,8 @@ void X87StackOptimization::FlushCachedRegs() {
   for (size_t i = 0; i < FlushValuesPending.size(); i++) {
     if (FlushValuesPending[i]) {
       OrderedNode* TopOffsetAddress = GetOffsetTopAddressWithCache_Slow(i);
-      // Host-addressed, see LoadStackValueAtOffset_Slow.
-      IREmit->_StoreMemHostFPR(Size, TopValueCache[i], TopOffsetAddress, IREmit->_InlineConstant(MMBaseOffset()), Size,
-                               MemOffsetType::SXTX, 1);
+      IREmit->_StoreMemFPR(Size, TopValueCache[i], TopOffsetAddress, IREmit->_InlineConstant(MMBaseOffset()), Size,
+                           MemOffsetType::SXTX, 1);
       // store
       FlushValuesPending[i] = false;
     }

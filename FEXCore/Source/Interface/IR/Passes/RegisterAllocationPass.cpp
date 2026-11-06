@@ -629,8 +629,7 @@ void ConstrainedRAPass::Run(IREmitter* IREmit_) {
         // its own destination directly, since a failed load does not commit it.
         //
         // Likewise a faulting Pop leaves its in/out address unchanged: the
-        // post-indexed writeback (or the guest-window add after the load) is
-        // not committed. So when the address is the SRA register's own value
+        // post-indexed writeback is not committed. So when the address is the SRA register's own value
         // (an RMWHandle of a LoadRegister of that register, so the handle is a
         // no-op) and this Pop is the only fault point before that value's SRA
         // store, the Pop may advance the SRA register in place. Only one Pop

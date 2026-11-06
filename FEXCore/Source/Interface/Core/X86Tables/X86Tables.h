@@ -410,8 +410,9 @@ namespace InstFlags {
   constexpr InstFlagType FLAGS_NO_PREFIX_ORDER = (1ULL << 33);
   // The handler cannot fault or leave the JIT when every operand is a register or immediate.
   constexpr InstFlagType FLAGS_CAN_FORWARD_REGISTERS = (1ULL << 34);
+  constexpr InstFlagType FLAGS_FORWARD_IMPLICIT_RAX = (1ULL << 35);
 
-  // Flags [57..35]: Undefined
+  // Flags [57..36]: Undefined
   // Flags [60..58]: Dst size
   constexpr InstFlagType FLAGS_SIZE_DST_OFF = 58;
   // Flags [63..61]: Src size

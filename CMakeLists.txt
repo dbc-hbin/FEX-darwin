@@ -146,25 +146,6 @@ if (NOT (ARCHITECTURE_arm64 OR ARCHITECTURE_arm64ec OR ARCHITECTURE_x86_64))
     " If you believe this is in error, file an issue.")
 endif()
 
-# Madeira iOS host: 32-bit guest window (the Guest32Base option). A WoW64 process on the iOS host
-# cannot own the low 4 GiB, so its guest lives in a 4 GiB window elsewhere. Only the aarch64 WOW64
-# module needs this. It is never compiled into the ARM64EC module: there the generated IR and
-# config tables, and all code, stay exactly as they are without it.
-if (FEX_IOS_HOST_BUILD AND NOT ARCHITECTURE_arm64ec)
-  set(ENABLE_GUEST_WINDOW_DEFAULT TRUE)
-else()
-  set(ENABLE_GUEST_WINDOW_DEFAULT FALSE)
-endif()
-option(ENABLE_GUEST_WINDOW "Support running a 32-bit guest at a non-zero host base (iOS WoW64)" ${ENABLE_GUEST_WINDOW_DEFAULT})
-set(FEX_GENERATOR_FEATURES "")
-if (ENABLE_GUEST_WINDOW)
-  if (ARCHITECTURE_arm64ec)
-    message(FATAL_ERROR "ENABLE_GUEST_WINDOW is for 32-bit guests and cannot be enabled for the ARM64EC module")
-  endif()
-  add_compile_definitions(FEX_GUEST_WINDOW=1)
-  list(APPEND FEX_GENERATOR_FEATURES "--feature=GuestWindow")
-endif()
-
 if (BUILD_STEAM_SUPPORT)
   add_compile_definitions(FEX_STEAM_SUPPORT=1)
 endif()

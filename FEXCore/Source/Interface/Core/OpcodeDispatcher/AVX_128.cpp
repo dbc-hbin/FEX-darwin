@@ -28,9 +28,8 @@ AddressMode OpDispatchBuilder::AVX128_DecodeMemoryAddress(const X86Tables::Decod
     MapFixedSharedDataRead(A, Bytes);
   }
   if (!Is64BitMode) {
-    // Complete the wrapping EA once, then check the whole operand before its two linear subaccesses.
+    // Complete the wrapping EA once before its two linear subaccesses.
     Ref Base = LoadEffectiveAddress(this, A, GetGPROpSize(), true);
-    CheckGuestMemSpan(Op, Base, Constant(Bytes));
     return {.Base = Base, .AddrSize = OpSize::i64Bit, .NonTSO = A.NonTSO};
   }
   return A;

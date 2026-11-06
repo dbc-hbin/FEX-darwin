@@ -18,8 +18,8 @@ import struct
 import subprocess
 import sys
 
-COMMIT = "9fbdc00bd6401aff3b32d79e78ff98b8a13e4dcf"
-TAG = "FEX-2609.1"
+COMMIT = "c985199ed5032a871366572c3d6a4f80f12ae6e7"
+TAG = "FEX-2611-9-gc985199ed"
 REPOSITORY = "https://github.com/FEX-Emu/FEX.git"
 SUBMODULES = ("External/fmt", "External/range-v3", "External/rpmalloc",
               "External/unordered_dense", "External/xxhash", "Source/Common/cpp-optparse")
@@ -163,7 +163,6 @@ def main() -> int:
                  "-DMINGW_TRIPLE=" + triple, "-DENABLE_LTO=False", "-DBUILD_TESTING=False",
                  "-DCMAKE_SHARED_LINKER_FLAGS=-Wl,--section-alignment=16384",
                  "-DENABLE_JEMALLOC_GLIBC_ALLOC=False", "-DTUNE_CPU=none", "-DENABLE_CCACHE=False",
-                 "-DENABLE_GUEST_WINDOW=" + ("True" if variant == "wow64" else "False"),
                  "-DFEX_MINGW_PRESERVE_ALL=" + ("True" if args.preserve_all else "False"),
                  "-DPython_EXECUTABLE=" + sys.executable], variant + "-configure")
             run(["cmake", "--build", str(build), "--target", target, "--parallel", str(args.jobs)], variant + "-build")

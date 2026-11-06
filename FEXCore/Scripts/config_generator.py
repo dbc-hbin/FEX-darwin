@@ -433,12 +433,6 @@ def print_affects_codegen_options(options, unnamed_options):
 
     output_argloader.write("#endif\n")
 
-# Build features (--feature=<Name>): an option carrying "Feature": "<Name>" only exists in builds
-# that enable that feature. Without it the generated files are exactly what they would be if the
-# option were not in the JSON at all.
-EnabledFeatures = set(Arg.split("=", 1)[1] for Arg in sys.argv[1:] if Arg.startswith("--feature="))
-sys.argv = [Arg for Arg in sys.argv if not Arg.startswith("--feature=")]
-
 if (len(sys.argv) < 5):
     sys.exit()
 
@@ -453,9 +447,6 @@ json_file.close()
 json_object = json.loads(json_text)
 
 options = json_object["Options"]
-for group_name in options:
-    options[group_name] = {k: v for k, v in options[group_name].items()
-                           if "Feature" not in v or v["Feature"] in EnabledFeatures}
 unnamed_options = json_object["UnnamedOptions"]
 
 # Generate config include file

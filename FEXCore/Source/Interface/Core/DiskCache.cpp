@@ -275,11 +275,11 @@ namespace DiskCache {
         }
         IndexEntry NewEntry {this, IndexBlobCommon->cache_db_file_offset, IndexBlobCommon->size, IndexBlobExtra->GuestSize,
                              IndexBlobExtra->GuestHash};
-        NewEntry.GuestExtents.resize(IndexBlobExtra->GuestExtentsCount);
-        memcpy(NewEntry.GuestExtents.data(), GuestExtents, IndexBlobExtra->GuestExtentsCount * sizeof(uint32_t));
+        fextl::vector<uint32_t> Extents(IndexBlobExtra->GuestExtentsCount);
+        memcpy(Extents.data(), GuestExtents, IndexBlobExtra->GuestExtentsCount * sizeof(uint32_t));
         bool ExtentsValid = true;
-        for (uint32_t i = 0; i < NewEntry.GuestExtents.size(); i += 2) {
-          if ((uint64_t)NewEntry.GuestExtents[i] + NewEntry.GuestExtents[i + 1] > IndexBlobExtra->GuestSize) {
+        for (uint32_t i = 0; i < Extents.size(); i += 2) {
+          if ((uint64_t)Extents[i] + Extents[i + 1] > IndexBlobExtra->GuestSize) {
             ExtentsValid = false;
             break;
           }
@@ -287,6 +287,7 @@ namespace DiskCache {
         if (!ExtentsValid) {
           continue;
         }
+        NewEntry.GuestExtents = fextl::make_shared<fextl::vector<uint32_t>>(std::move(Extents));
         auto It = CacheIndex.find(IndexBlobCommon->hash);
         if (It == CacheIndex.end()) {
           CacheIndex.emplace(IndexBlobCommon->hash, IndexCacheHead {std::move(NewEntry), IndexBlobExtra->GuestFootprint, nullptr});
@@ -689,7 +690,7 @@ namespace DiskCache {
       if (!AnonCaching) {
         return std::nullopt;
       }
-      Thread->FrontendDecoder->DecodeLoop(reinterpret_cast<const uint8_t*>(CTX->GetGuestBase() + GuestRIP), AnonPrefixGuestBytes);
+      Thread->FrontendDecoder->DecodeLoop(reinterpret_cast<const uint8_t*>(GuestRIP), AnonPrefixGuestBytes);
       const auto* BlockInfo = Thread->FrontendDecoder->GetDecodedBlockInfo();
 
       XXH3_state_t HashState;
@@ -701,11 +702,11 @@ namespace DiskCache {
         uint64_t HashStart = SubBlock.Entry;
         // skip over masked in-block data and data/etc gaps between blocks
         for (auto& DataMask : SubBlock.DataMasks) {
-          XXH3_64bits_update(&HashState, reinterpret_cast<const uint8_t*>(CTX->GetGuestBase() + HashStart), DataMask.FieldAddress - HashStart);
+          XXH3_64bits_update(&HashState, reinterpret_cast<const uint8_t*>(HashStart), DataMask.FieldAddress - HashStart);
           HashStart = DataMask.FieldAddress + DataMask.ValueSize;
         }
         if (HashStart != SubBlock.Entry + SubBlock.Size) {
-          XXH3_64bits_update(&HashState, reinterpret_cast<const uint8_t*>(CTX->GetGuestBase() + HashStart), SubBlock.Size - (HashStart - SubBlock.Entry));
+          XXH3_64bits_update(&HashState, reinterpret_cast<const uint8_t*>(HashStart), SubBlock.Size - (HashStart - SubBlock.Entry));
         }
       }
       GuestCodeKey = XXH3_64bits_digest(&HashState);
@@ -730,12 +731,11 @@ namespace DiskCache {
     bool FirstHash = true; // 0 is probably a valid footprint hash so we need an extra bit there
     bool TriedMainEntry = false;
     IndexEntry MainEntry;
-    IndexEntry CandidateEntry;
     uint64_t MainEntryFootprint;
     // Eviction can erase or promote entries after IndexLock is released.
     fextl::vector<std::pair<uint64_t, IndexEntry>> MoreEntriesSnapshot;
     decltype(MoreEntriesSnapshot)::iterator MoreEntriesIt;
-    IndexEntry* EntryUnderReview;
+    const IndexEntry* EntryUnderReview;
     fextl::shared_ptr<fextl::vector<uint8_t>> BlobRef;
     std::optional<fextl::list<MemoryLRUKey>::iterator> LRUIter;
     uint64_t CurrentFootprint = 0;
@@ -754,8 +754,7 @@ namespace DiskCache {
       }
       MoreEntriesIt = MoreEntriesSnapshot.begin();
       if (MoreEntriesIt != MoreEntriesSnapshot.end()) {
-        CandidateEntry = MoreEntriesIt->second;
-        EntryUnderReview = &CandidateEntry;
+        EntryUnderReview = &MoreEntriesIt->second;
         BlobRef = EntryUnderReview->MemoryBlob;
         LRUIter = EntryUnderReview->LRUEntry;
         CurrentFootprint = MoreEntriesIt->first;
@@ -798,8 +797,7 @@ namespace DiskCache {
           }
         }
         if (!EntryUnderReview && MoreEntriesIt != MoreEntriesSnapshot.end()) {
-          CandidateEntry = MoreEntriesIt->second;
-          EntryUnderReview = &CandidateEntry;
+          EntryUnderReview = &MoreEntriesIt->second;
           BlobRef = EntryUnderReview->MemoryBlob;
           LRUIter = EntryUnderReview->LRUEntry;
           CurrentFootprint = MoreEntriesIt->first;
@@ -818,20 +816,15 @@ namespace DiskCache {
         continue;
       }
 
-      // if (Entry.GuestExtents.size()) {
-      //   LogMan::Msg::IFmt("lookup! length {:d}", Entry.GuestSize);
-      //   for(uint32_t i = 0; i < Entry.GuestExtents.size(); i+=2 ) {
-      //     LogMan::Msg::IFmt("extent {} {}", Entry.GuestExtents[i], Entry.GuestExtents[i]+Entry.GuestExtents[i+1]);
-      //   }
-      // }
       {
-        IndexEntry& Entry = *EntryUnderReview;
+        const IndexEntry& Entry = *EntryUnderReview;
+        const auto& Extents = *Entry.GuestExtents;
         // only renew the hash if the candidate footprint is different than previous
         if (FirstHash || LastFootprintHashed != CurrentFootprint) {
           XXH3_state_t HashState;
           XXH3_128bits_reset(&HashState);
-          for (uint32_t i = 0; i < Entry.GuestExtents.size(); i += 2) {
-            XXH3_128bits_update(&HashState, reinterpret_cast<uint8_t*>(CTX->GetGuestBase() + GuestRIP) + Entry.GuestExtents[i], Entry.GuestExtents[i + 1]);
+          for (uint32_t i = 0; i < Extents.size(); i += 2) {
+            XXH3_128bits_update(&HashState, reinterpret_cast<uint8_t*>(GuestRIP) + Extents[i], Extents[i + 1]);
           }
           LiveGuestHash = XXH3_128bits_digest(&HashState);
           LastFootprintHashed = CurrentFootprint;
@@ -845,12 +838,12 @@ namespace DiskCache {
           fextl::vector<uint8_t> GuestCode(Entry.GuestSize);
           if (Entry.Size >= Entry.GuestSize && Entry.DB && Entry.DB->ReadCacheBlob(Entry.Offset + Entry.Size - Entry.GuestSize, GuestCode)) {
             const uint8_t* CachedGuest = GuestCode.data();
-            const uint8_t* LiveGuest = reinterpret_cast<const uint8_t*>(CTX->GetGuestBase() + GuestRIP);
+            const uint8_t* LiveGuest = reinterpret_cast<const uint8_t*>(GuestRIP);
             uint64_t DiffCount = 0;
             uint64_t DiffOffset = 0;
-            for (uint32_t i = 0; i < Entry.GuestExtents.size(); i += 2) {
-              uint32_t Begin = Entry.GuestExtents[i];
-              uint32_t End = Begin + Entry.GuestExtents[i + 1];
+            for (uint32_t i = 0; i < Extents.size(); i += 2) {
+              uint32_t Begin = Extents[i];
+              uint32_t End = Begin + Extents[i + 1];
               bool PreviousByteDiff = false;
               for (uint32_t Offset = Begin; Offset < End; Offset++) {
                 if (LiveGuest[Offset] != CachedGuest[Offset]) {
@@ -888,12 +881,13 @@ namespace DiskCache {
       return std::nullopt;
     }
 
-    IndexEntry& Entry = *EntryUnderReview;
+    const IndexEntry& Entry = *EntryUnderReview;
+    const auto& Extents = *Entry.GuestExtents;
 
     fextl::vector<uint64_t> GuestPages;
-    for (uint32_t i = 0; i < Entry.GuestExtents.size(); i += 2) {
-      uint64_t FirstPage = (Entry.GuestExtents[i] + GuestRIP) & Utils::FEX_PAGE_MASK;
-      uint64_t LastPage = (Entry.GuestExtents[i] + GuestRIP + Entry.GuestExtents[i + 1] - 1) & Utils::FEX_PAGE_MASK;
+    for (uint32_t i = 0; i < Extents.size(); i += 2) {
+      uint64_t FirstPage = (Extents[i] + GuestRIP) & Utils::FEX_PAGE_MASK;
+      uint64_t LastPage = (Extents[i] + GuestRIP + Extents[i + 1] - 1) & Utils::FEX_PAGE_MASK;
       for (uint64_t Page = FirstPage; Page <= LastPage; Page += Utils::FEX_PAGE_SIZE) {
         if (GuestPages.size() == 0 || Page != GuestPages.back()) {
           GuestPages.push_back(Page);
@@ -1337,7 +1331,9 @@ namespace DiskCache {
 
     // blob done, publish to index as in-memory for now, flush to disk below
     struct IndexEntry NewEntry {nullptr, 0, (uint32_t)TotalSize, Header.GuestSize, Header.GuestHash, BlobRef};
-    NewEntry.GuestExtents = ExactGuestCodeExtents;
+    const fextl::shared_ptr<const fextl::vector<uint32_t>> GuestExtents =
+      fextl::make_shared<fextl::vector<uint32_t>>(std::move(ExactGuestCodeExtents));
+    NewEntry.GuestExtents = GuestExtents;
     {
       std::lock_guard Guard(IndexLock);
       auto It = Index.find(LookupKey);
@@ -1376,11 +1372,11 @@ namespace DiskCache {
     }
 
     fextl::vector<uint8_t> IndexBlob;
-    IndexBlob.resize(sizeof(IndexExtraBlobHeader) + ExactGuestCodeExtents.size() * sizeof(uint32_t));
+    IndexBlob.resize(sizeof(IndexExtraBlobHeader) + GuestExtents->size() * sizeof(uint32_t));
 
-    IndexExtraBlobHeader IndexBlobHeader {Header.GuestHash, GuestFootprint, Header.GuestSize, (uint32_t)ExactGuestCodeExtents.size()};
+    IndexExtraBlobHeader IndexBlobHeader {Header.GuestHash, GuestFootprint, Header.GuestSize, (uint32_t)GuestExtents->size()};
     memcpy(IndexBlob.data(), &IndexBlobHeader, sizeof(IndexExtraBlobHeader));
-    memcpy(IndexBlob.data() + sizeof(IndexExtraBlobHeader), ExactGuestCodeExtents.data(), ExactGuestCodeExtents.size() * sizeof(uint32_t));
+    memcpy(IndexBlob.data() + sizeof(IndexExtraBlobHeader), GuestExtents->data(), GuestExtents->size() * sizeof(uint32_t));
 
     bool StoreDisk = true;
 

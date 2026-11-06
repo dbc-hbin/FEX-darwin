@@ -1202,10 +1202,14 @@ public:
 
   static uint64_t RegisterForwardMask(X86Tables::DecodedOp Op) {
     if (!Op->TableInfo || !(Op->TableInfo->Flags & X86Tables::InstFlags::FLAGS_CAN_FORWARD_REGISTERS) ||
-        (Op->Flags & X86Tables::DecodeFlags::FLAG_LOCK) || !Op->Dest.IsGPR()) {
+        (Op->Flags & X86Tables::DecodeFlags::FLAG_LOCK)) {
       return 0;
     }
-    uint64_t Mask {};
+    const bool ImplicitRAX = Op->TableInfo->Flags & X86Tables::InstFlags::FLAGS_FORWARD_IMPLICIT_RAX;
+    if (!Op->Dest.IsGPR() && !(ImplicitRAX && Op->Dest.IsNone())) {
+      return 0;
+    }
+    uint64_t Mask = ImplicitRAX ? 1ULL << (GPR0Index + X86State::REG_RAX) : 0;
     auto AddOperand = [&](const X86Tables::DecodedOperand& Operand) {
       if (!Operand.IsGPR()) {
         return Operand.IsNone() || Operand.IsLiteral();
@@ -2596,8 +2600,6 @@ private:
     return DestIsMem(Op) && (Op->Flags & FEXCore::X86Tables::DecodeFlags::FLAG_LOCK) != 0;
   }
 
-  void CheckGuestMemSpan(const X86Tables::DecodedOp& Op, Ref Base, Ref Bytes, uint32_t SegmentFlags = 0);
-
   bool DestIsMem(FEXCore::X86Tables::DecodedOp Op) const {
     return !Op->Dest.IsGPR();
   }
@@ -2941,17 +2943,27 @@ constexpr inline void InstallToTable(auto& FinalTable, const auto& LocalTable) {
       // Classify once when constructing the decode tables. Floating-point operations,
       // implicit memory accesses and control flow need their usual recovery points.
       using B = OpDispatchBuilder;
-      if (Dispatcher == &B::Bind<&B::MOVGPROp, 0> || Dispatcher == &B::Bind<&B::MOVGPROp, 1> ||
-          Dispatcher == &B::SecondaryALUOp || Dispatcher == &B::Bind<&B::CMPOp, 0> || Dispatcher == &B::Bind<&B::CMPOp, 1> ||
-          Dispatcher == &B::Bind<&B::TESTOp, 0> || Dispatcher == &B::Bind<&B::TESTOp, 1> ||
-          Dispatcher == &B::Bind<&B::ALUOp, OP_ADD, OP_ATOMICFETCHADD, 0> || Dispatcher == &B::Bind<&B::ALUOp, OP_SUB, OP_ATOMICFETCHSUB, 0> ||
-          Dispatcher == &B::Bind<&B::ALUOp, OP_ANDWITHFLAGS, OP_ATOMICFETCHAND, 0> || Dispatcher == &B::Bind<&B::ALUOp, OP_OR, OP_ATOMICFETCHOR, 0> ||
-          Dispatcher == &B::Bind<&B::ALUOp, OP_XOR, OP_ATOMICFETCHXOR, 0> || Dispatcher == &B::MOVSXOp ||
+      const bool ImplicitRAX =
+        Dispatcher == &B::Bind<&B::CMPOp, 0, true> || Dispatcher == &B::Bind<&B::TESTOp, 0, true> ||
+        Dispatcher == &B::Bind<&B::ALUOp, OP_ADD, OP_ATOMICFETCHADD, 0, true> ||
+        Dispatcher == &B::Bind<&B::ALUOp, OP_SUB, OP_ATOMICFETCHSUB, 0, true> ||
+        Dispatcher == &B::Bind<&B::ALUOp, OP_ANDWITHFLAGS, OP_ATOMICFETCHAND, 0, true> ||
+        Dispatcher == &B::Bind<&B::ALUOp, OP_OR, OP_ATOMICFETCHOR, 0, true> ||
+        Dispatcher == &B::Bind<&B::ALUOp, OP_XOR, OP_ATOMICFETCHXOR, 0, true>;
+      if (ImplicitRAX || Dispatcher == &B::Bind<&B::MOVGPROp, 0> || Dispatcher == &B::Bind<&B::MOVGPROp, 1> ||
+          Dispatcher == &B::SecondaryALUOp || Dispatcher == &B::Bind<&B::CMPOp, 0, false> ||
+          Dispatcher == &B::Bind<&B::TESTOp, 0, false> ||
+          Dispatcher == &B::Bind<&B::ALUOp, OP_ADD, OP_ATOMICFETCHADD, 0, false> || Dispatcher == &B::Bind<&B::ALUOp, OP_SUB, OP_ATOMICFETCHSUB, 0, false> ||
+          Dispatcher == &B::Bind<&B::ALUOp, OP_ANDWITHFLAGS, OP_ATOMICFETCHAND, 0, false> || Dispatcher == &B::Bind<&B::ALUOp, OP_OR, OP_ATOMICFETCHOR, 0, false> ||
+          Dispatcher == &B::Bind<&B::ALUOp, OP_XOR, OP_ATOMICFETCHXOR, 0, false> || Dispatcher == &B::MOVSXOp ||
           Dispatcher == &B::BSWAPOp || Dispatcher == &B::MOVVectorAlignedOp || Dispatcher == &B::MOVVectorUnalignedOp ||
           Dispatcher == &B::VectorXOROp || Dispatcher == &B::AVX128_VectorXOR || Dispatcher == &B::AVX128_VMOVAPS ||
           Dispatcher == &B::AVX128_VANDN || Dispatcher == &B::Bind<&B::AVX128_VectorALU, OP_VAND, OpSize::i128Bit> ||
           Dispatcher == &B::Bind<&B::AVX128_VectorALU, OP_VOR, OpSize::i128Bit>) {
         TableOp.Flags |= X86Tables::InstFlags::FLAGS_CAN_FORWARD_REGISTERS;
+        if (ImplicitRAX) {
+          TableOp.Flags |= X86Tables::InstFlags::FLAGS_FORWARD_IMPLICIT_RAX;
+        }
       }
 #endif
     }

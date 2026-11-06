@@ -1795,7 +1795,6 @@ Ref OpDispatchBuilder::SHUFOpImpl(IR::OpSize DstSize, IR::OpSize ElementSize, Re
 
   const auto SingleLane = [&](Ref LHS, Ref RHS, uint32_t LaneShuffle) -> Ref {
     if (LHS == RHS && LaneShuffle == 0) {
-      // TODO: We can optimize significantly more shuffles when we know the sources match.
       // Special case broadcast element 0.
       return _VDupElement(DstSize, ElementSize, LHS, LaneShuffle & SelectionMask);
     }
@@ -1870,6 +1869,9 @@ Ref OpDispatchBuilder::SHUFOpImpl(IR::OpSize DstSize, IR::OpSize ElementSize, Re
         return _VZip2(OpSize::i128Bit, OpSize::i64Bit, LHS, DupRHS);
       }
       case 0b01'00'01'11: {
+        if (LHS == RHS) {
+          return Single128Bit4ByteVectorShuffle(LHS, LaneShuffle);
+        }
         // TODO: This doesn't generate optimal code.
         // RA doesn't understand that Src1 is dead after VInsElement due to SRA class differences.
         // With RA fixes this would be 2 instructions.
@@ -1878,6 +1880,9 @@ Ref OpDispatchBuilder::SHUFOpImpl(IR::OpSize DstSize, IR::OpSize ElementSize, Re
         return _VZip(OpSize::i128Bit, OpSize::i64Bit, InsLHS, RHS);
       }
       case 0b11'10'01'11: {
+        if (LHS == RHS) {
+          return Single128Bit4ByteVectorShuffle(LHS, LaneShuffle);
+        }
         // TODO: This doesn't generate optimal code.
         // RA doesn't understand that Src1 is dead after VInsElement due to SRA class differences.
         // With RA fixes this would be 2 instructions.
@@ -1891,6 +1896,9 @@ Ref OpDispatchBuilder::SHUFOpImpl(IR::OpSize DstSize, IR::OpSize ElementSize, Re
         return _VZip(OpSize::i128Bit, OpSize::i64Bit, RevLHS, RHS);
       }
       case 0b11'10'00'01: {
+        if (LHS == RHS) {
+          return Single128Bit4ByteVectorShuffle(LHS, LaneShuffle);
+        }
         // TODO: This doesn't generate optimal code.
         // RA doesn't understand that Src1 is dead after VInsElement due to SRA class differences.
         // With RA fixes this would be 2 instructions.
@@ -1898,9 +1906,15 @@ Ref OpDispatchBuilder::SHUFOpImpl(IR::OpSize DstSize, IR::OpSize ElementSize, Re
         auto RevLHS = _VRev64(OpSize::i128Bit, OpSize::i32Bit, LHS);
         return _VInsElement(OpSize::i128Bit, OpSize::i64Bit, 1, 1, RevLHS, RHS);
       }
+      case 0b00'00'10'10: {
+        if (LHS == RHS) {
+          auto Middle = _VExtr(OpSize::i128Bit, OpSize::i8Bit, RHS, LHS, 4);
+          return _VTrn2(OpSize::i128Bit, ElementSize, Middle, Middle);
+        }
+        [[fallthrough]];
+      }
       case 0b00'00'00'00:
       case 0b00'00'01'01:
-      case 0b00'00'10'10:
       case 0b00'00'11'11:
       case 0b01'01'00'00:
       case 0b01'01'01'01:
@@ -1915,6 +1929,9 @@ Ref OpDispatchBuilder::SHUFOpImpl(IR::OpSize DstSize, IR::OpSize ElementSize, Re
       case 0b11'11'10'10:
       case 0b11'11'11'11: {
         // Duplicate element in upper and lower across each 64-bit segment.
+        if (LHS == RHS && (LaneShuffle & 0b11) == ((LaneShuffle >> 4) & 0b11)) {
+          return _VDupElement(OpSize::i128Bit, ElementSize, LHS, LaneShuffle & 0b11);
+        }
         auto DupSrc1 = _VDupElement(OpSize::i128Bit, ElementSize, LHS, LaneShuffle & 0b11);
         auto DupSrc2 = _VDupElement(OpSize::i128Bit, ElementSize, RHS, (LaneShuffle >> 4) & 0b11);
         return _VZip(OpSize::i128Bit, OpSize::i64Bit, DupSrc1, DupSrc2);
@@ -2977,7 +2994,6 @@ void OpDispatchBuilder::AVXVFCMPOp(OpcodeArgs, IR::OpSize ElementSize) {
 
 void OpDispatchBuilder::FXSaveOp(OpcodeArgs) {
   Ref Mem = MakeSegmentAddress(Op, Op->Dest);
-  CheckGuestMemSpan(Op, Mem, Constant(512));
 
   SaveX87State(Op, Mem);
   SaveSSEState(Mem);
@@ -2996,18 +3012,6 @@ void OpDispatchBuilder::XSaveOpImpl(OpcodeArgs) {
   // NOTE: Mask should be EAX and EDX concatenated, but we only need to test
   //       for features that are in the lower 32 bits, so EAX only is sufficient.
   const auto OpSize = GetGPROpSize();
-
-#ifdef FEX_GUEST_WINDOW
-  if (!Is64BitMode) {
-    Ref Base = XSaveBase(Op);
-    Ref Bytes = Constant(576);
-    if (CTX->HostFeatures.SupportsAVX()) {
-      Ref AVXRequested = _Bfe(OpSize, 1, 2, LoadGPRRegister(X86State::REG_RAX));
-      Bytes = _Select(OpSize::i64Bit, OpSize, CondClass::NEQ, AVXRequested, Constant(0), Constant(704), Bytes);
-    }
-    CheckGuestMemSpan(Op, Base, Bytes);
-  }
-#endif
 
   const auto StoreIfFlagSet = [this, OpSize](uint32_t BitIndex, auto fn, uint32_t FieldSize = 1) {
     Ref Mask = LoadGPRRegister(X86State::REG_RAX);
@@ -3189,7 +3193,6 @@ Ref OpDispatchBuilder::GetMXCSR() {
 
 void OpDispatchBuilder::FXRStoreOp(OpcodeArgs) {
   Ref Mem = MakeSegmentAddress(Op, Op->Src[0]);
-  CheckGuestMemSpan(Op, Mem, Constant(512));
 
   RestoreX87State(Op, Mem);
   RestoreSSEState(Mem);
@@ -3200,20 +3203,6 @@ void OpDispatchBuilder::FXRStoreOp(OpcodeArgs) {
 
 void OpDispatchBuilder::XRstorOpImpl(OpcodeArgs) {
   const auto OpSize = GetGPROpSize();
-
-#ifdef FEX_GUEST_WINDOW
-  if (!Is64BitMode) {
-    Ref Base = XSaveBase(Op);
-    CheckGuestMemSpan(Op, Base, Constant(576));
-    if (CTX->HostFeatures.SupportsAVX()) {
-      Ref Mask = _LoadMemGPR(OpSize::i64Bit, Base, Constant(512), OpSize::i64Bit, MemOffsetType::SXTX, 1);
-      Mask = _And(OpSize, Mask, LoadGPRRegister(X86State::REG_RAX));
-      Ref AVXActive = _Bfe(OpSize, 1, 2, Mask);
-      Ref Bytes = _Select(OpSize::i64Bit, OpSize, CondClass::NEQ, AVXActive, Constant(0), Constant(704), Constant(576));
-      CheckGuestMemSpan(Op, Base, Bytes);
-    }
-  }
-#endif
 
   // XRSTOR accesses the header even for an empty request. Pair loads retain
   // their faulting access when both results are unused.
@@ -3278,7 +3267,7 @@ void OpDispatchBuilder::XRstorOpImpl(OpcodeArgs) {
   {
     // MXCSR is restored for a requested SSE/AVX component even when its
     // XSTATE_BV bit is clear. Unsupported AVX requests do not select MXCSR.
-    Ref Requested = _And(OpSize, LoadGPRRegister(X86State::REG_RAX), Constant(CTX->HostFeatures.SupportsAVX ? 6 : 2));
+    Ref Requested = _And(OpSize, LoadGPRRegister(X86State::REG_RAX), Constant(CTX->HostFeatures.SupportsAVX() ? 6 : 2));
     auto RequestedJump = CondJump(Requested, CondClass::NEQ);
     auto RestoreBlock = CreateNewCodeBlockAfter(GetCurrentBlock());
     auto ExitBlock = CreateNewCodeBlockAfter(RestoreBlock);
@@ -5969,7 +5958,6 @@ void OpDispatchBuilder::VPGATHER(OpcodeArgs, OpSize AddrElementSize) {
 
   const auto DefaultSegment = BaseReg == X86State::REG_RBP || BaseReg == X86State::REG_RSP
     ? X86Tables::DecodeFlags::FLAG_SS_PREFIX : X86Tables::DecodeFlags::FLAG_DS_PREFIX;
-  const uint32_t SegmentFlags = (Op->Flags & X86Tables::DecodeFlags::FLAG_SEGMENTS) ?: DefaultSegment;
   if (Split && Is64BitMode) {
     // One op commits each lane to the flushed guest registers, so a fault keeps x86 partial state without block splits.
     FlushRegisterCache();
@@ -6009,7 +5997,6 @@ void OpDispatchBuilder::VPGATHER(OpcodeArgs, OpSize AddrElementSize) {
     }
     if (AddrSize != OpSize::i64Bit) Offset = _Bfe(OpSize::i64Bit, IR::OpSizeAsBits(AddrSize), 0, Offset);
     Ref Address = AppendSegmentOffset(Offset, Op->Flags, DefaultSegment);
-    CheckGuestMemSpan(Op, Address, Constant(ElementBytes), SegmentFlags);
     Ref Value = _LoadMemGPRAutoTSO(ElementSize, Address);
     StoreHalf(DestReg, DataHalf, _VInsGPR(OpSize::i128Bit, ElementSize, DataLane, LoadHalf(DestReg, DataHalf), Value));
     StoreHalf(MaskReg, DataHalf, _VInsGPR(OpSize::i128Bit, ElementSize, DataLane, LoadHalf(MaskReg, DataHalf), Constant(0)));

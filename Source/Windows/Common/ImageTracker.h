@@ -38,7 +38,7 @@ FEXCore::CodeMapFileId ComputeCodeMapId(std::string_view FileName, uint32_t Time
  */
 class ImageTracker : public FEXCore::CodeMapOpener {
 public:
-  ImageTracker(FEXCore::Context::Context& CTX, bool IsGeneratingCache, uint64_t GuestBase = 0);
+  ImageTracker(FEXCore::Context::Context& CTX, bool IsGeneratingCache);
   FEXCore::ExecutableFileSectionInfo HandleImageMap(std::string_view Path, uint64_t Address, bool MainImage);
   void HandleImageUnmap(uint64_t Address, uint64_t Size);
 
@@ -72,7 +72,6 @@ private:
 
   std::string ActiveCodeMapPath;
   bool IsGeneratingCache;
-  const uint64_t GuestBase;
 };
 
 } // namespace FEX::Windows

@@ -1,6 +1,7 @@
 # FEX-darwin
 
-Darwin/Wine integration of [FEX](https://github.com/FEX-Emu/FEX), based on `FEX-2609.1`.
+Darwin/Wine integration of [FEX](https://github.com/FEX-Emu/FEX), based on
+`FEX-2611-9-gc985199ed` (`c985199ed5032a871366572c3d6a4f80f12ae6e7`).
 Builds the x64 ARM64EC emulator (`xtajit64.dll`) and x86 WoW64 emulator (`xtajit.dll`)
 for ARM64-native Wine on macOS. Darwin modifications are licensed under [MIT](LICENSE);
 upstream FEX notices are retained in [LICENSE.upstream](LICENSE.upstream).
@@ -10,19 +11,64 @@ upstream FEX notices are retained in [LICENSE.upstream](LICENSE.upstream).
 - Shared-data reads: emulate relocated `KUSER_SHARED_DATA` loads, including REP-copy writeback.
 - JIT write scopes: restore nested Darwin JIT write-protection state, toggled inline from the commpage after a startup self-test against Wine's unix call.
 - Native JIT allocation: use Wine's Darwin executable-memory allocator and 16KB PE alignment.
-- WoW64 guest window: translate 32-bit guest addresses; core adapted from [willfaust/FEX PR #2](https://github.com/willfaust/FEX/pull/2) (MIT).
-- WoW64 integration: preserve guest pointer identity, fault-safe PUSH state and whole-process code invalidation.
+- WoW64 integration: use identity-mapped guest addresses, preserve fault-safe PUSH state and whole-process code invalidation. Completed effective addresses wrap to their address size; additional accesses within an operand remain linear.
 - Call/return guards: use 16KB guard pages on Darwin.
 - Fault/context correctness: retain REP/gather progress, honor XRSTOR requests and preserve extended state through paired Wine APC/thread-context paths.
-- String instructions: honor address-sized REP counts and LODS source-segment overrides, reject multi-byte WoW64 operands crossing the 4GiB guest window, and distinguish ES access violations from SS stack faults.
+- String instructions: honor address-sized REP counts and LODS source-segment overrides, and distinguish ES access violations from SS stack faults.
 
-Selected upstream backports add thread-termination fixes, PCMPXSTRX lowering and disk-cache optimizations.
-Local cache fixes cover address translation, locking, size limits, retry after failure/eviction and Unicode cleanup.
+The upstream rebase includes thread-termination fixes, PCMPXSTRX lowering and disk-cache optimizations.
+Local cache fixes cover locking, size limits, retry after failure/eviction and Unicode cleanup.
+Indexed cache entries share immutable guest extents while snapshots retain file-mapping ownership.
+The retired nonzero guest window no longer reserves host registers or adds address-conversion IR.
 Disk caching is opt-in; the memory LRU defaults to 0 bytes and the main-file cap to 1GiB, excluding the index.
 Original patches, upstream commit IDs and extraction hashes are in [Darwin/provenance.json](Darwin/provenance.json).
-The patches are already integrated; do not apply them again.
+The patches are historical provenance, not an apply queue for the current upstream.
+The integration already includes the retained changes; retired guest-window patches must not be reapplied.
 
 ## Current validation
+
+The November 6 rebase and debloat integration is checked under
+`build/local/main-upstream-20261106T145146Z/`, with the final DLLs in
+`native-build-final/`. Both native-built emulator DLLs pass
+the PE architecture, exports, imports, CHPE, builtin-marker and 16KB-alignment audits.
+Native CPU tests cover 146 scalar/vector/shared-page cases, nested JIT write scopes
+and the hardware-TSO policy/cache identity. Cache ownership, publication and pruning
+checks pass with ASan/UBSan.
+
+The retained Wine 11.18 runtime lacks the main branch's native JIT-protection hooks.
+Its automatic writable-code SMC path is therefore unavailable. Explicit
+`FEX_SMCCHECKS=full` passes 25 SMC cases and cross-process memory-notification
+checks in each guest ABI. In that mode, Windows
+Chromium 157.0.8103.38 passes TurboFan optimization, deoptimization, reoptimization,
+integer checksum and WebAssembly execution checks. Observed host images are native
+ARM64 and the physical emulator file hash matches the audited build. Wine maps
+the logical names `xtajit64.dll` and `xtajit.dll` to `libarm64ecfex.dll` and
+`libwow64fex.dll` respectively. Only the `verified-*` runtime receipts use the
+corrected physical-file staging; earlier runtime receipts under this directory
+do not validate the new DLLs. Guest runs also compare the mapped PE text-section
+layout with that physical file.
+
+The guest matrix also passes x64/x86 JIT growth, cold/warm disk caches and mixed
+cache extents, 4,096 shuffle cases, default/single-instruction DIV checks,
+ARM64EC target remapping, shared-data and call/return checks. The guard/commit
+fixture was rebuilt against the current private thread layout and confirms
+16KB guards, lazy commitment, growth and invalidation. The 32-bit REP fixture
+passes 26,065 cases in each of default, memcpy-TSO and vector-TSO modes. The
+bit-index regression passes with software TSO, TSO disabled and full SMC,
+including signed offsets and locked updates. Native-backed cache
+mapping checks pass 14 cases per guest ABI, including ownership, append fallback
+and failed section/view creation. Existing Wine 11.18
+failures remain in REP fault flags, YMM context transport, x64 full-SMC fault-time
+RDX recovery and both ABIs' O0 startup; the prior accepted build has the same
+failure signatures. The cross-4GiB operand fixture cannot run because Wine rejects
+its required native mapping with `STATUS_CONFLICTING_ADDRESSES`; those fault
+semantics remain unverified. This validation does not establish game FPS, hardware-TSO
+activation or compatibility with mismatched Wine UnixLib helpers.
+
+### Historical validation before the rebase
+
+The measurements below describe earlier builds, not fresh performance measurements
+of the rebased code.
 
 The M5 Pro build in `build/local/darwin-extra-20261104/` passed both DLL audits.
 Wine 11.17 passed 57 x64 and WoW64 runs. Wine 11.20 passed three x64 runs.
@@ -125,13 +171,16 @@ These are not passing WoW64 or hardware-TSO activation results. Evidence:
 `build/local/hardware-tso-final-20261104/` and
 `build/local/hardware-tso-wine-core-20261104/`.
 
-Translated-code cache namespace `0xA61B` also invalidates earlier translations of
+That build's translated-code cache namespace `0xA61B` invalidated earlier translations of
 forwarded partial-register constants. Hardware-TSO and software-TSO contexts have distinct cache identities.
 Independent review found no actionable defect in the bounded string
 fixes; it does not constitute a fresh audit of every earlier optimization.
 
 ## Apple Silicon translation paths
 
+- Cache namespace `0xA620` separates the rebased translator and identity-address layout from earlier generated code. Hardware TSO is part of the process-feature cache identity.
+- For 32-bit synthetic subaccesses, scalar TSO loads/stores materialize the complete linear address before accessing memory; their ARM instructions cannot encode a register offset. Locked bit updates also retain the signed offset in 64-bit address arithmetic.
+- Same-input shuffle lowering uses broadcasts and the selected EXTR/TRN2 and lane-permutation paths. DIV omits remainder calculation only when the following instructions provably overwrite RDX before it can be observed; native long division retains its required writable scratch register.
 - The compiler chooses software TSO per instruction. A PE metadata range covers only whole instructions. Marked PCs and Unity's explicit TSO flag take precedence, including vector and stack-relative accesses. The default policy applies outside certified ranges.
 - The split-AVX translator folds x64 displacements into Q-register pairs or their two ordered accesses. VEX.256 self-moves disappear, while VEX.128 self-moves retain the upper-half clear. Repeated upper clears reuse register-cache state. The 32-byte movemask combines both NEON halves before extracting the scalar result. AFP scalar arithmetic takes its preserved lanes from its first input.
 - On Windows, adjacent non-faulting register moves and integer operations can forward their GPR and XMM operands. The translator synchronizes fixed registers before faulting and control-flow instructions, single-step and full SMC checks.
@@ -160,7 +209,7 @@ Wine must expose native ARM64 and ARM64EC-callable implementations, following it
 existing private ntdll export conventions.
 
 FEX accepts only `TRUE`, selects the ordering policy before disk-cache initialization,
-and includes the guarantee in the host-feature cache hash. A present hook returning
+and includes the guarantee in the process-feature cache hash. A present hook returning
 anything else retains software TSO without falling through to the UnixLib setter.
 An absent hook retains the existing UnixLib path; older Darwin Wine without that
 library continues using software TSO. `FEX_TSOENABLED=0` retains its existing explicit
@@ -184,7 +233,10 @@ python3 Darwin/build.py --output build/local/darwin01 --jobs 8
 Use a fresh build directory. The builder audits both DLLs; outputs and provenance are under
 `build/local/darwin01/`.
 
-Wine must provide the shared-data, JIT write-protection, native JIT allocation and WoW64 guest-window hooks.
+Wine must provide the shared-data, JIT write-protection and native JIT allocation hooks.
+WoW64 no longer requires a guest-window hook. Optional UnixLib helpers must match
+the current upstream ABI: older Hadron helpers use slot 8 for a JIT query, whereas
+current FEX uses it for `CheckSupportsTPIDRRO_CPU`. They are not interchangeable.
 Wine changes and graphics backends are separate from this repository. This is not a standalone macOS or Linux loader.
 
 Upstream architecture and development documentation: [FEX wiki](https://wiki.fex-emu.com/) and [source outline](docs/SourceOutline.md).

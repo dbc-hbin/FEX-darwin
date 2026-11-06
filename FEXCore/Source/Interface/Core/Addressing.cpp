@@ -62,8 +62,12 @@ AddressMode SelectAddressMode(IREmitter* IREmit, const AddressMode& A, IR::OpSiz
   }
   if (Is32Bit && A.AddrSize == OpSize::i64Bit) {
     // Synthetic structure offsets must never pass through another 32-bit wrap.
+    if (AtomicTSO && !Vector) {
+      // Scalar TSO instructions cannot encode a register offset.
+      return {.Base = LoadEffectiveAddress(IREmit, A, OpSize::i64Bit, true), .Index = IREmit->Invalid()};
+    }
     auto Offset = A;
-    Offset.Base = IREmit->Invalid();
+    Offset.Base = nullptr;
     return {.Base = A.Base, .Index = LoadEffectiveAddress(IREmit, Offset, OpSize::i64Bit, true),
             .IndexType = MemOffsetType::SXTX, .IndexScale = 1};
   }

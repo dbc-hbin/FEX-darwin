@@ -24,7 +24,7 @@ namespace FEX::Windows {
  */
 class InvalidationTracker {
 public:
-  InvalidationTracker(FEXCore::Context::Context& CTX, const std::unordered_map<DWORD, FEXCore::Core::InternalThreadState*>& Threads, uint64_t GuestBase = 0);
+  InvalidationTracker(FEXCore::Context::Context& CTX, const std::unordered_map<DWORD, FEXCore::Core::InternalThreadState*>& Threads);
   void HandleMemoryProtectionNotification(uint64_t Address, uint64_t Size, ULONG Prot);
   void HandleProcessExecuteFlagsChange(ULONG Flags);
   void HandleImageMap(std::string_view Name, uint64_t Address);
@@ -179,7 +179,6 @@ private:
   std::shared_mutex IntervalsLock;
   FEXCore::Context::Context& CTX;
   const std::unordered_map<DWORD, FEXCore::Core::InternalThreadState*>& Threads;
-  const uint64_t GuestBase;
   bool SMCDetectionDisabled {false};                    // Protected by IntervalsLock
   bool WritableCodeValidated {false};
   bool DEPDisabled {false};                             // Protected by IntervalsLock

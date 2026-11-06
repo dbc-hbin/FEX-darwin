@@ -64,8 +64,7 @@ void OpDispatchBuilder::SyscallOp(OpcodeArgs, bool IsSyscallInst) {
 
 void OpDispatchBuilder::ThunkOp(OpcodeArgs) {
   const auto GPRSize = GetGPROpSize();
-  // The SHA256 literal follows the thunk opcode in guest code, so reading it is a guest read.
-  uint8_t* sha256 = (uint8_t*)(CTX->GetGuestBase() + Op->PC + 2);
+  uint8_t* sha256 = (uint8_t*)(Op->PC + 2);
 
   if (Is64BitMode) {
     // x86-64 ABI puts the function argument in RDI
@@ -909,7 +908,6 @@ void OpDispatchBuilder::JUMPFARIndirectOp(OpcodeArgs) {
   // No way to use this effectively in multiblock
   Ref Src = MakeSegmentAddress(Op, Op->Dest);
   AddressMode SrcCS = {.Base = Src, .Offset = 4, .AddrSize = OpSize::i64Bit};
-  CheckGuestMemSpan(Op, Src, Constant(6));
   auto RIPOffset = _LoadMemGPRAutoTSO(OpSize::i32Bit, Src, OpSize::i8Bit);
   auto NewSegmentCS = _LoadMemGPRAutoTSO(OpSize::i16Bit, SrcCS, OpSize::i8Bit);
 
@@ -931,7 +929,6 @@ void OpDispatchBuilder::CALLFARIndirectOp(OpcodeArgs) {
 
   Ref Src = MakeSegmentAddress(Op, Op->Dest);
   AddressMode SrcCS = {.Base = Src, .Offset = 4, .AddrSize = OpSize::i64Bit};
-  CheckGuestMemSpan(Op, Src, Constant(6));
   auto RIPOffset = _LoadMemGPRAutoTSO(OpSize::i32Bit, Src, OpSize::i8Bit);
   auto NewSegmentCS = _LoadMemGPRAutoTSO(OpSize::i16Bit, SrcCS, OpSize::i8Bit);
   auto CurrentCS = _LoadContextGPR(OpSize::i16Bit, offsetof(FEXCore::Core::CPUState, cs_idx));
@@ -2553,7 +2550,7 @@ void OpDispatchBuilder::BTOp(OpcodeArgs, uint32_t SrcIndex, BTAction Action) {
 
       if (DestIsLockedMem(Op)) {
         HandledLock = true;
-        Value = _AtomicFetchCLR(OpSize::i8Bit, BitMask, LoadEffectiveAddress(this, Address, GetGPROpSize(), true));
+        Value = _AtomicFetchCLR(OpSize::i8Bit, BitMask, LoadEffectiveAddress(this, Address, OpSize::i64Bit, true));
       } else {
         Value = _LoadMemGPRAutoTSO(OpSize::i8Bit, Address, OpSize::i8Bit);
 
@@ -2568,7 +2565,7 @@ void OpDispatchBuilder::BTOp(OpcodeArgs, uint32_t SrcIndex, BTAction Action) {
 
       if (DestIsLockedMem(Op)) {
         HandledLock = true;
-        Value = _AtomicFetchOr(OpSize::i8Bit, BitMask, LoadEffectiveAddress(this, Address, GetGPROpSize(), true));
+        Value = _AtomicFetchOr(OpSize::i8Bit, BitMask, LoadEffectiveAddress(this, Address, OpSize::i64Bit, true));
       } else {
         Value = _LoadMemGPRAutoTSO(OpSize::i8Bit, Address, OpSize::i8Bit);
 
@@ -2583,7 +2580,7 @@ void OpDispatchBuilder::BTOp(OpcodeArgs, uint32_t SrcIndex, BTAction Action) {
 
       if (DestIsLockedMem(Op)) {
         HandledLock = true;
-        Value = _AtomicFetchXor(OpSize::i8Bit, BitMask, LoadEffectiveAddress(this, Address, GetGPROpSize(), true));
+        Value = _AtomicFetchXor(OpSize::i8Bit, BitMask, LoadEffectiveAddress(this, Address, OpSize::i64Bit, true));
       } else {
         Value = _LoadMemGPRAutoTSO(OpSize::i8Bit, Address, OpSize::i8Bit);
 
@@ -3325,14 +3322,12 @@ void OpDispatchBuilder::StringMemOp(OpcodeArgs, bool Copy) {
     Ref Value;
     if (Copy) {
       Ref Src = AppendSegmentOffset(SrcOffset, Op->Flags, X86Tables::DecodeFlags::FLAG_DS_PREFIX);
-      if (Size != OpSize::i8Bit) CheckGuestMemSpan(Op, Src, Constant(IR::OpSizeToSize(Size)));
       Value = CTX->IsMemcpyAtomicTSOEnabled() ? _LoadMemGPRAutoTSO(Size, Src)
         : _LoadMem(RegClass::GPR, Size, Src, Invalid(), OpSize::i8Bit, MemOffsetType::SXTX, 1);
     } else {
       Value = LoadGPRRegister(X86State::REG_RAX, Size, 0, true);
     }
     Ref Dest = AppendSegmentOffset(DstOffset, 0, X86Tables::DecodeFlags::FLAG_ES_PREFIX, true);
-    if (Size != OpSize::i8Bit) CheckGuestMemSpan(Op, Dest, Constant(IR::OpSizeToSize(Size)), X86Tables::DecodeFlags::FLAG_ES_PREFIX);
     if (CTX->IsMemcpyAtomicTSOEnabled()) {
       _StoreMemGPRAutoTSO(Size, Dest, Value);
     } else {
@@ -3519,11 +3514,9 @@ void OpDispatchBuilder::RepCompareOp(OpcodeArgs, bool Cmps) {
     Ref Src_RDI = LoadGPRRegister(X86State::REG_RDI, AddrSize);
     Ref Src_RSI = Cmps ? LoadGPRRegister(X86State::REG_RSI, AddrSize) : Invalid();
     Ref Dest = AppendSegmentOffset(Src_RDI, 0, X86Tables::DecodeFlags::FLAG_ES_PREFIX, true);
-    if (ElementBytes > 1) CheckGuestMemSpan(Op, Dest, Constant(ElementBytes), X86Tables::DecodeFlags::FLAG_ES_PREFIX);
     Ref Mem = _LoadMemGPRAutoTSO(Size, Dest, Size);
     if (Cmps) {
       Ref SrcAddress = AppendSegmentOffset(Src_RSI, Op->Flags, X86Tables::DecodeFlags::FLAG_DS_PREFIX);
-      if (ElementBytes > 1) CheckGuestMemSpan(Op, SrcAddress, Constant(ElementBytes));
       Ref Src = _LoadMemGPRAutoTSO(Size, SrcAddress, Size);
       CalculateFlags_SUB(Size, Src, Mem);
     } else {
@@ -3791,9 +3784,7 @@ void OpDispatchBuilder::CMPSOp(OpcodeArgs) {
     Ref Dest_RSI = AppendSegmentOffset(Src_RSI, Op->Flags, X86Tables::DecodeFlags::FLAG_DS_PREFIX);
     Ref Dest_RDI = AppendSegmentOffset(Src_RDI, 0, X86Tables::DecodeFlags::FLAG_ES_PREFIX, true);
 
-    if (Size != OpSize::i8Bit) CheckGuestMemSpan(Op, Dest_RDI, Constant(IR::OpSizeToSize(Size)), X86Tables::DecodeFlags::FLAG_ES_PREFIX);
     auto Src1 = _LoadMemGPRAutoTSO(Size, Dest_RDI, Size);
-    if (Size != OpSize::i8Bit) CheckGuestMemSpan(Op, Dest_RSI, Constant(IR::OpSizeToSize(Size)));
     auto Src2 = _LoadMemGPRAutoTSO(Size, Dest_RSI, Size);
 
     CalculateFlags_SUB(OpSizeFromSrc(Op), Src2, Src1);
@@ -3834,7 +3825,6 @@ void OpDispatchBuilder::LODSOp(OpcodeArgs) {
     Ref Src_RSI = LoadGPRRegister(X86State::REG_RSI, AddrSize);
     Ref Dest_RSI = AppendSegmentOffset(Src_RSI, Op->Flags, X86Tables::DecodeFlags::FLAG_DS_PREFIX);
 
-    if (Size != OpSize::i8Bit) CheckGuestMemSpan(Op, Dest_RSI, Constant(IR::OpSizeToSize(Size)));
     auto Src = _LoadMemGPRAutoTSO(Size, Dest_RSI, Size);
 
     StoreGPRResultWithZExtSemantics(X86State::REG_RAX, Src, Size);
@@ -3851,7 +3841,7 @@ void OpDispatchBuilder::LODSOp(OpcodeArgs) {
     // Calculate flags early. because end of block
     CalculateDeferredFlags();
 
-    ForeachDirection([this, Size, AddrSize](int32_t PtrDir) {
+    ForeachDirection([this, Size, AddrSize, Op](int32_t PtrDir) {
       // XXX: Theoretically LODS could be optimized to
       // RSI += {-}(RCX * Size)
       // RAX = [RSI - Size]
@@ -3883,7 +3873,6 @@ void OpDispatchBuilder::LODSOp(OpcodeArgs) {
         Ref Src_RSI = LoadGPRRegister(X86State::REG_RSI, AddrSize);
         Ref Dest_RSI = AppendSegmentOffset(Src_RSI, Op->Flags, X86Tables::DecodeFlags::FLAG_DS_PREFIX);
 
-        if (Size != OpSize::i8Bit) CheckGuestMemSpan(Op, Dest_RSI, Constant(IR::OpSizeToSize(Size)));
         auto Src = _LoadMemGPRAutoTSO(Size, Dest_RSI, Size);
 
         StoreGPRResultWithZExtSemantics(X86State::REG_RAX, Src, Size);
@@ -3927,7 +3916,6 @@ void OpDispatchBuilder::SCASOp(OpcodeArgs) {
     Ref Dest_RDI = AppendSegmentOffset(Src_RDI, 0, X86Tables::DecodeFlags::FLAG_ES_PREFIX, true);
 
     auto Src1 = LoadGPRRegister(X86State::REG_RAX, Size, 0, true);
-    if (Size != OpSize::i8Bit) CheckGuestMemSpan(Op, Dest_RDI, Constant(IR::OpSizeToSize(Size)), X86Tables::DecodeFlags::FLAG_ES_PREFIX);
     auto Src2 = _LoadMemGPRAutoTSO(Size, Dest_RDI, Size);
 
     CalculateFlags_SUB(OpSizeFromSrc(Op), Src1, Src2);
@@ -4517,9 +4505,7 @@ void OpDispatchBuilder::UpdatePrefixFromSegment(Ref Segment, uint32_t SegmentReg
   // Fun quirk, if we mask the selector then it is premultiplied by 8 which we need to do for accessing anyway.
   auto SegmentOffset = _And(OpSize::i32Bit, Segment, _Constant(0xfff8));
   Ref SegmentBase = _LoadContextGPRIndexed(GDT, OpSize::i64Bit, offsetof(FEXCore::Core::CPUState, segment_arrays[0]), 8);
-  // segment_arrays holds host pointers to FEXCore's own descriptor tables, so the descriptor read is
-  // host-addressed; only the segment base extracted below is a guest value.
-  Ref NewSegment = _LoadMemHostGPR(OpSize::i64Bit, SegmentBase, SegmentOffset, OpSize::i8Bit, MemOffsetType::UXTW, 1);
+  Ref NewSegment = _LoadMemGPR(OpSize::i64Bit, SegmentBase, SegmentOffset, OpSize::i8Bit, MemOffsetType::UXTW, 1);
   CheckLegacySegmentWrite(NewSegment, SegmentReg);
 
   // Extract the 32-bit base from the GDT segment.
@@ -4746,22 +4732,6 @@ AddressMode OpDispatchBuilder::DecodeAddress(const X86Tables::DecodedOp& Op, con
 }
 
 
-void OpDispatchBuilder::CheckGuestMemSpan(const X86Tables::DecodedOp& Op, Ref Base, Ref Bytes, uint32_t SegmentFlags) {
-#ifdef FEX_GUEST_WINDOW
-  if (!Is64BitMode) {
-    if (MMXState == MMXState_X87) _SyncStackToSlow();
-    FlushRegisterCache();
-    // A stack-segment access reports #SS; compare the whole segment field, since ES (0b001) shares a bit with SS (0b011).
-    const auto Segment = (SegmentFlags ? SegmentFlags : Op->Flags) & X86Tables::DecodeFlags::FLAG_SEGMENTS;
-    _CheckGuestMemSpan(Base, Bytes, GetRelocatedPC(Op, -Op->InstSize),
-                      {.ErrorRegister = 0, .Signal = SIGSEGV,
-                       .TrapNumber = static_cast<uint8_t>(Segment == X86Tables::DecodeFlags::FLAG_SS_PREFIX ? X86State::X86_TRAPNO_SS
-                                                                                                             : X86State::X86_TRAPNO_GP),
-                       .si_code = 2}); // SEGV_ACCERR: memory limit, not a privileged instruction.
-  }
-#endif
-}
-
 Ref OpDispatchBuilder::LoadSource_WithOpSize(RegClass Class, const X86Tables::DecodedOp& Op, const X86Tables::DecodedOperand& Operand,
                                              IR::OpSize OpSize, uint32_t Flags, const LoadSourceOptions& Options) {
   auto [Align, LoadData, ForceLoad, AccessType, AllowUpperGarbage] = Options;
@@ -4802,7 +4772,6 @@ Ref OpDispatchBuilder::LoadSource_WithOpSize(RegClass Class, const X86Tables::De
     MapFixedSharedDataRead(A, OpSizeToSize(OpSize));
     if (OpSize == OpSize::f80Bit) {
       Ref MemSrc = LoadEffectiveAddress(this, A, GetGPROpSize(), true);
-      CheckGuestMemSpan(Op, MemSrc, Constant(10));
       if (CTX->HostFeatures.SupportsSVE()) {
         Result = _LoadMemX87SVEOptPredicate(OpSize::i128Bit, OpSize::i16Bit, MemSrc);
       } else {
@@ -4943,7 +4912,6 @@ void OpDispatchBuilder::StoreResult_WithOpSize(RegClass Class, FEXCore::X86Table
 
   if (OpSize == OpSize::f80Bit) {
     Ref MemStoreDst = LoadEffectiveAddress(this, A, GetGPROpSize(), true);
-    CheckGuestMemSpan(Op, MemStoreDst, Constant(10));
     if (CTX->HostFeatures.SupportsSVE()) {
       _StoreMemX87SVEOptPredicate(OpSize::i128Bit, OpSize::i16Bit, Src, MemStoreDst);
     } else {

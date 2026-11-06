@@ -89,10 +89,6 @@ ContextImpl::ContextImpl(const FEXCore::HostFeatures& Features)
   if (!Config.Is64BitMode()) {
     // When operating in 32-bit mode, the virtual memory we care about is only the lower 32-bits.
     Config.VirtualMemSize = 1ULL << 32;
-#ifdef FEX_GUEST_WINDOW
-    Config.GuestBase = Config.Guest32BaseOption();
-    LOGMAN_THROW_A_FMT((Config.GuestBase & 0xffffffffULL) == 0, "GUEST32BASE must be 4 GiB aligned");
-#endif
   }
 
   if (Config.BlockJITNaming() || Config.GlobalJITNaming() || Config.LibraryJITNaming()) {
@@ -566,7 +562,7 @@ static void IRDumper(FEXCore::Core::InternalThreadState* Thread, IR::IREmitter* 
 }
 
 bool ContextImpl::CheckIfBlockIsCacheable(FEXCore::Core::InternalThreadState& Thread, uint64_t GuestRIP, uint64_t MaxInst) {
-  return Thread.FrontendDecoder->CheckIfCacheable(Thread, reinterpret_cast<const uint8_t*>(GetGuestBase() + GuestRIP), GuestRIP, MaxInst);
+  return Thread.FrontendDecoder->CheckIfCacheable(Thread, reinterpret_cast<const uint8_t*>(GuestRIP), GuestRIP, MaxInst);
 }
 
 ContextImpl::GenerateIRResult
@@ -594,7 +590,7 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
   }
 
   if (!HasCustomIR) {
-    const auto* GuestCode = reinterpret_cast<const uint8_t*>(GetGuestBase() + GuestRIP);
+    const auto* GuestCode = reinterpret_cast<const uint8_t*>(GuestRIP);
 
     Thread->FrontendDecoder->DecodeLoop(GuestCode);
 
@@ -659,7 +655,7 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
       IR::IROp_ValidateCode* SegmentValidate {};
       uint64_t SegmentStart {};
       auto FinishSegment = [&] {
-        auto Value = FEXCore::Utils::crc32(reinterpret_cast<const uint8_t*>(GetGuestBase() + SegmentStart), SegmentValidate->CodeLength);
+        auto Value = FEXCore::Utils::crc32(reinterpret_cast<const uint8_t*>(SegmentStart), SegmentValidate->CodeLength);
         auto CRC = Thread->OpDispatcher->GetOpHeader(SegmentValidate->crc);
         if (WantsDiskCachePatching) {
           auto Patchable = CRC->CW<IR::IROp_PatchableGuestCRC>();
@@ -681,7 +677,7 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
 
 #ifdef ZYDIS_DISASSEMBLER
         if (FEXCore::Config::Get_X86DISASSEMBLE()) {
-          const uint8_t* InstBytes = reinterpret_cast<const uint8_t*>(GetGuestBase() + InstAddress);
+          const uint8_t* InstBytes = reinterpret_cast<const uint8_t*>(InstAddress);
           ZydisDisassembledInstruction ZydisInst;
           if (ZYAN_SUCCESS(ZydisDisassembleIntel(ZydisMachineMode, InstAddress, InstBytes, DecodedInfo->InstSize, &ZydisInst))) {
             LogMan::Msg::IFmt("    {:#x}: {}", InstAddress, ZydisInst.text);
@@ -709,8 +705,20 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
               Next.Dest.Data.GPR.GPR == FEXCore::X86State::REG_RDX &&
               (NextSize == SIZE_32BIT || NextSize == SIZE_64BIT)) {
             const auto NextFn = Next.TableInfo->OpcodeDispatcher.OpDispatch;
-            DivRemainderDead = (NextFn == &Builder::Bind<&Builder::MOVGPROp, 0> && Next.Src[0].IsLiteral()) ||
-                               (NextFn == &Builder::Bind<&Builder::MOVGPROp, 1> && Next.Src[1].IsLiteral());
+            if (NextFn == &Builder::Bind<&Builder::MOVGPROp, 0> || NextFn == &Builder::Bind<&Builder::MOVGPROp, 1>) {
+              const auto& Src = Next.Src[NextFn == &Builder::Bind<&Builder::MOVGPROp, 1> ? 1 : 0];
+              // A register move may consume the quotient or divisor, but must
+              // not consume the remainder it is supposed to kill.
+              DivRemainderDead = Src.IsLiteral() ||
+                                 (Src.IsGPR() && Src.Data.GPR.GPR < FEXCore::X86State::REG_XMM_0 &&
+                                  Src.Data.GPR.GPR != FEXCore::X86State::REG_RDX);
+            } else if (Next.Src[0].IsGPR() && Next.Dest.Data.GPR == Next.Src[0].Data.GPR) {
+              // Both the value and defined flags of these self operations are
+              // independent of the old RDX. Keep their normal flag lowering.
+              DivRemainderDead =
+                NextFn == &Builder::Bind<&Builder::ALUOp, IR::OP_XOR, IR::OP_ATOMICFETCHXOR, 0, false> ||
+                NextFn == &Builder::Bind<&Builder::ALUOp, IR::OP_SUB, IR::OP_ATOMICFETCHSUB, 0, false>;
+            }
           }
         }
 #endif
@@ -1119,7 +1127,7 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
       if (DebugData && DebugData->Relocations) {
         Relocations = *DebugData->Relocations;
       }
-      std::span<const uint8_t> GuestCode = {reinterpret_cast<const uint8_t*>(GetGuestBase() + StartAddr), Length};
+      std::span<const uint8_t> GuestCode = {reinterpret_cast<const uint8_t*>(StartAddr), Length};
       const Frontend::Decoder::DecodedBlockInformation* BlockInfo =
         NeedsAddGuestCodeRanges ? Thread->FrontendDecoder->GetDecodedBlockInfo() : nullptr;
       DiskCache.Store(Thread, Region, GuestRIP, *DiskCacheGuestCodeKey, GuestCode, CompiledCode, Relocations, BlockInfo);
@@ -1307,9 +1315,9 @@ void ContextImpl::MonoBackpatcherWrite(FEXCore::Core::CpuStateFrame* Frame, uint
     auto lk = GuardSignalDeferringSection(CTX->CodeInvalidationMutex, Thread);
 
     if (Size == 8) {
-      *reinterpret_cast<uint64_t*>(CTX->GetGuestBase() + Address) = Value;
+      *reinterpret_cast<uint64_t*>(Address) = Value;
     } else if (Size == 4) {
-      *reinterpret_cast<uint32_t*>(CTX->GetGuestBase() + Address) = Value;
+      *reinterpret_cast<uint32_t*>(Address) = Value;
     } else {
       ERROR_AND_DIE_FMT("Unexpected write size for backpatcher: {}", Size);
     }

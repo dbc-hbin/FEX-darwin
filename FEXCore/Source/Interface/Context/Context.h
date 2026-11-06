@@ -348,19 +348,6 @@ public:
     uint64_t VirtualMemSize {1ULL << 36};
     uint64_t TSCScale = 0;
 
-#ifdef FEX_GUEST_WINDOW
-    // Host address that guest address 0 lives at ("the guest window"), 32-bit mode only.
-    // Resolved once in the ContextImpl constructor from the GUEST32BASE option and forced to 0 in
-    // 64-bit mode. Zero means the guest address space is identity mapped.
-    //
-    // When non-zero the JIT pins REG_GUEST_BASE to this value and forms host addresses as
-    // `GuestBase + zext32(EA)`. Everything that is not a dereferenced pointer - guest RIP,
-    // LookupCache keys, VirtualMemSize, segment bases, InvalidateGuestCodeRange - stays in the
-    // guest namespace. Read it through ContextImpl::GetGuestBase(), which is a constant 0 in
-    // builds without FEX_GUEST_WINDOW.
-    uint64_t GuestBase {0};
-#endif
-
     // Used if the JIT needs to have its interrupt fault code emitted.
     bool NeedsPendingInterruptFaultCheck {false};
 
@@ -368,9 +355,6 @@ public:
     FEX_CONFIG_OPT(SingleStepConfig, SINGLESTEP);
     FEX_CONFIG_OPT(GdbServer, GDBSERVER);
     FEX_CONFIG_OPT(Is64BitMode, IS64BIT_MODE);
-#ifdef FEX_GUEST_WINDOW
-    FEX_CONFIG_OPT(Guest32BaseOption, GUEST32BASE);
-#endif
     FEX_CONFIG_OPT(TSOEnabled, TSOENABLED);
     FEX_CONFIG_OPT(VectorTSOEnabled, VECTORTSOENABLED);
     FEX_CONFIG_OPT(MemcpySetTSOEnabled, MEMCPYSETTSOENABLED);
@@ -395,18 +379,6 @@ public:
     return Config.SoftwareRNG() && HostRNGAvailable;
   }
   bool HostRNGAvailable {};
-
-  // Host address of guest address 0, see Config.GuestBase. A constant 0 when the build has no
-  // guest-window support, so `GetGuestBase() + GuestAddress` compiles to exactly `GuestAddress`.
-#ifdef FEX_GUEST_WINDOW
-  uint64_t GetGuestBase() const {
-    return Config.GuestBase;
-  }
-#else
-  static constexpr uint64_t GetGuestBase() {
-    return 0;
-  }
-#endif
 
   FEXCore::Utils::WritePriorityMutex::Mutex CodeInvalidationMutex {};
 

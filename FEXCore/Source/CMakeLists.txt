@@ -154,7 +154,7 @@ add_custom_command(
   DEPENDS "${INPUT_NAME}"
   DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/../Scripts/json_ir_generator.py"
   COMMAND "python3" "${CMAKE_CURRENT_SOURCE_DIR}/../Scripts/json_ir_generator.py"
-    "${INPUT_NAME}" "${OUTPUT_NAME}" "${OUTPUT_DISPATCHER_NAME}" ${FEX_GENERATOR_FEATURES})
+    "${INPUT_NAME}" "${OUTPUT_NAME}" "${OUTPUT_DISPATCHER_NAME}")
 
 set_source_files_properties(${OUTPUT_NAME} PROPERTIES GENERATED TRUE)
 
@@ -192,7 +192,7 @@ add_custom_command(
   DEPENDS "${INPUT_CONFIG_NAME}"
   DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/../Scripts/config_generator.py"
   COMMAND "python3" "${CMAKE_CURRENT_SOURCE_DIR}/../Scripts/config_generator.py"
-    "${INPUT_CONFIG_NAME}" "${OUTPUT_CONFIG_NAME}" "${OUTPUT_MAN_NAME}" "${OUTPUT_CONFIG_OPTION_NAME}" ${FEX_GENERATOR_FEATURES})
+    "${INPUT_CONFIG_NAME}" "${OUTPUT_CONFIG_NAME}" "${OUTPUT_MAN_NAME}" "${OUTPUT_CONFIG_OPTION_NAME}")
 
 add_custom_command(
   OUTPUT "${OUTPUT_MAN_NAME_COMPRESS}"

@@ -137,7 +137,6 @@ void OpDispatchBuilder::FST(OpcodeArgs, IR::OpSize Width) {
   AddressMode A = DecodeAddress(Op, Op->Dest, MemoryAccessType::DEFAULT, false);
 
   Ref Mem = LoadEffectiveAddress(this, A, GetGPROpSize(), true);
-  CheckGuestMemSpan(Op, Mem, Constant(IR::OpSizeToSize(Width)));
   _StoreStackMem(SourceSize, Width, Mem, Invalid(), OpSize::iInvalid, MemOffsetType::SXTX, 1);
 
   if (Op->TableInfo->Flags & X86Tables::InstFlags::FLAGS_POP) {
@@ -397,7 +396,6 @@ void OpDispatchBuilder::X87FNSTENV(OpcodeArgs) {
   const auto Size = OpSizeFromSrc(Op);
   Ref Mem = LoadSourceGPR(Op, Op->Dest, Op->Flags, {.LoadData = false});
   Mem = AppendSegmentOffset(Mem, Op->Flags);
-  CheckGuestMemSpan(Op, Mem, Constant(IR::OpSizeToSize(Size) * 7));
 
   // Before we store anything we need to sync our stack to the registers.
   _SyncStackToSlow();
@@ -460,7 +458,6 @@ void OpDispatchBuilder::X87LDENV(OpcodeArgs) {
   const auto Size = OpSizeFromSrc(Op);
   Ref Mem = LoadSourceGPR(Op, Op->Src[0], Op->Flags, {.LoadData = false});
   Mem = AppendSegmentOffset(Mem, Op->Flags);
-  CheckGuestMemSpan(Op, Mem, Constant(IR::OpSizeToSize(Size) * 7));
   _StackForceSlow();
 
   auto NewFCW = _LoadMemGPR(OpSize::i16Bit, Mem, OpSize::i16Bit);
@@ -496,7 +493,6 @@ void OpDispatchBuilder::X87FNSAVE(OpcodeArgs) {
   // 4 bytes : data pointer selector
   const auto Size = OpSizeFromDst(Op);
   Ref Mem = MakeSegmentAddress(Op, Op->Dest);
-  CheckGuestMemSpan(Op, Mem, Constant(IR::OpSizeToSize(Size) * 7 + 80));
   _SyncStackToSlow();
   Ref Top = GetX87Top();
   {
@@ -564,7 +560,6 @@ void OpDispatchBuilder::X87FNSAVE(OpcodeArgs) {
 void OpDispatchBuilder::X87FRSTOR(OpcodeArgs) {
   const auto Size = OpSizeFromSrc(Op);
   Ref Mem = MakeSegmentAddress(Op, Op->Src[0]);
-  CheckGuestMemSpan(Op, Mem, Constant(IR::OpSizeToSize(Size) * 7 + 80));
   _StackForceSlow();
 
   auto NewFCW = _LoadMemGPR(OpSize::i16Bit, Mem, OpSize::i16Bit);

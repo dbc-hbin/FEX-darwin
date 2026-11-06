@@ -65,7 +65,7 @@ namespace DiskCache {
     uint32_t GuestSize;
     XXH128_hash_t GuestHash;
     fextl::shared_ptr<fextl::vector<uint8_t>> MemoryBlob;
-    fextl::vector<uint32_t> GuestExtents;
+    fextl::shared_ptr<const fextl::vector<uint32_t>> GuestExtents;
     std::optional<fextl::list<MemoryLRUKey>::iterator> LRUEntry;
   };
 
@@ -252,10 +252,9 @@ namespace DiskCache {
   };
 
   static constexpr uint16_t AnonPrefixGuestBytes = 64;
-  // The current version of the diskcache.
-  // This must be changed any time codegen changes occur!
-  // Be aware of the impact of changing this frequently!
-  static constexpr uint16_t FormatVersion = 0xA61B;
+  // Darwin code generation uses a separate cache namespace from upstream.
+  // FEX-2611, identity addresses and measured shuffle/DIV lowering.
+  static constexpr uint16_t FormatVersion = 0xA620;
 
   static constexpr uint32_t LOOKUP_KEY_MAX_BUCKET_DEPTH = 500;
 

@@ -58,24 +58,8 @@ DEF_OP(Fence) {
 
 DEF_OP(Break) {
   auto Op = IROp->C<IR::IROp_Break>();
-  EmitSynchronousFault(Op->Reason, GetZeroableReg(Op->FaultAddress));
-}
-
-DEF_OP(CheckGuestMemSpan) {
-  const auto Op = IROp->C<IR::IROp_CheckGuestMemSpan>();
-  ARMEmitter::ForwardLabel Valid;
-  // Flag-neutral: guest arithmetic flags may still reside in NZCV.
-  mov(ARMEmitter::Size::i32Bit, TMP1, GetReg(Op->Addr));
-  add(ARMEmitter::Size::i64Bit, TMP1, TMP1, GetReg(Op->Bytes));
-  sub(ARMEmitter::Size::i64Bit, TMP1, TMP1, 1);
-  lsr(ARMEmitter::Size::i64Bit, TMP1, TMP1, 32);
-  cbz(ARMEmitter::Size::i64Bit, TMP1, &Valid);
-  str(GetReg(Op->RIP).X(), STATE, offsetof(FEXCore::Core::CPUState, rip));
-  EmitSynchronousFault(Op->Reason, ARMEmitter::Reg::zr);
-  Bind(&Valid);
-}
-
-void Arm64JITCore::EmitSynchronousFault(const IR::BreakDefinition& Reason, ARMEmitter::Register FaultAddress) {
+  const auto& Reason = Op->Reason;
+  const auto FaultAddress = GetZeroableReg(Op->FaultAddress);
 
   // First we must reset the stack
   ResetStack();

@@ -1400,11 +1400,7 @@ const Decoder::DecodeStream Decoder::AdjustAddrForSpecialRegion(const uint8_t* _
   }
 
   return DecodeStream {
-#ifdef FEX_GUEST_WINDOW
-    .InstStream = reinterpret_cast<const uint8_t*>(RIP),
-#else
     .InstStream = _InstStream - EntryPoint + RIP,
-#endif
     .AdjustedInstStream = _InstStream - EntryPoint + RIP,
   };
 }
