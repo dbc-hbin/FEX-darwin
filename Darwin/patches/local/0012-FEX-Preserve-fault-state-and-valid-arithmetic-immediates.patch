@@ -1,0 +1,78 @@
+Subject: [PATCH] FEX: Preserve fault state and valid arithmetic immediates
+
+Base-commit: 14c92681f4d62cf84d901460e0358de09c8847a7
+Prerequisite: the preceding seventeen patches in Darwin/patches/series.
+
+Keep committed fixed-register stores before potentially faulting consumers.
+Build ADD/SUB through their arithmetic flag builders instead of deriving them
+from a logical operation whose inline immediate domain differs. Invalidate
+older generated code with Darwin cache namespace 0xA624.
+
+MIT License
+
+Copyright (c) 2026 dbc-hbin (Darwin modifications)
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+
+---
+diff --git a/FEXCore/Source/Interface/Core/DiskCache.h b/FEXCore/Source/Interface/Core/DiskCache.h
+index f5933cf0c..9038868b1 100644
+--- a/FEXCore/Source/Interface/Core/DiskCache.h
++++ b/FEXCore/Source/Interface/Core/DiskCache.h
+@@ -255,8 +255,8 @@ namespace DiskCache {
+ 
+   static constexpr uint16_t AnonPrefixGuestBytes = 64;
+   // Darwin code generation uses a separate cache namespace from upstream.
+-  // Shared division remainder lowering and simplified Darwin translation.
+-  static constexpr uint16_t FormatVersion = 0xA623;
++  // Preserve committed guest state at faults and valid arithmetic immediates.
++  static constexpr uint16_t FormatVersion = 0xA624;
+ 
+   static constexpr uint32_t LOOKUP_KEY_MAX_BUCKET_DEPTH = 500;
+ 
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp b/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
+index 2c9405b0b..bfde94922 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
+@@ -5002,7 +5002,7 @@ void OpDispatchBuilder::ALUOp(OpcodeArgs, FEXCore::IR::IROps ALUIROp, FEXCore::I
+     Result = _Not(OpSize, Dest);
+   } else if (IsConst && Const == Mask && !DestIsLockedMem(Op) && ALUIROp == IR::IROps::OP_AND) {
+     Result = Dest;
+-  } else {
++  } else if (ALUIROp != IR::IROps::OP_ADD && ALUIROp != IR::IROps::OP_SUB) {
+     DeriveOp(ALUOp, ALUIROp, _AndWithFlags(OpSize, Dest, Src));
+     Result = ALUOp;
+   }
+diff --git a/FEXCore/Source/Interface/IR/Passes/RegisterAllocationPass.cpp b/FEXCore/Source/Interface/IR/Passes/RegisterAllocationPass.cpp
+index d3fd14220..39b3e6983 100644
+--- a/FEXCore/Source/Interface/IR/Passes/RegisterAllocationPass.cpp
++++ b/FEXCore/Source/Interface/IR/Passes/RegisterAllocationPass.cpp
+@@ -468,7 +468,10 @@ static bool KillMove(const IROp_Header* LastOp, IROp_Header* IROp, Ref LastNode,
+     }
+   }
+ 
+-  return LastOp->Op == OP_STOREREGISTER;
++  // A faulting consumer must expose the already committed guest register.
++  // These two memory operations lack HasSideEffects, like the SRA epoch barriers below.
++  return LastOp->Op == OP_STOREREGISTER && !IR::HasSideEffects(IROp->Op) &&
++         IROp->Op != OP_LOADMEMX87SVEOPTPREDICATE && IROp->Op != OP_VBROADCASTFROMMEM;
+ }
+ 
+ static bool IsSignext(const IROp_Header* IROp, OrderedNodeWrapper Src, OpSize Size) {

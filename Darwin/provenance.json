@@ -96,7 +96,18 @@
     {
       "path": "arknights-macos-runtime/0001-arm64ec-restore-carried-eflags.patch",
       "sha256": "6f4ebc271f043deac6a6938a1980fbe77bb34f09160a1079dabd40982b03d89b"
+    },
+    {
+      "path": "local/0012-FEX-Preserve-fault-state-and-valid-arithmetic-immediates.patch",
+      "sha256": "94ffb080bd2cceb244152c43f33ebf94ea7af93dd4dc3dcb44550f5597c4c412"
     }
   ],
-  "appliedSourceTree": "7f0dbe825787d8c43e6442af8581164de3b9e8cb"
+  "wineCompanionPatches": [
+    {
+      "path": "wine/0001-ntdll-preserve-carried-eflags-on-continuation.patch",
+      "sha256": "59c9df233907338c9e22e85a48bfae66acccc6a53beccad678f72d27fe4c564f",
+      "base": "Wine 11.20 with paired PF/AF/DF transport"
+    }
+  ],
+  "appliedSourceTree": "ca8a669addd2c9c257a1ad19c9aeee7f6ea80d43"
 }

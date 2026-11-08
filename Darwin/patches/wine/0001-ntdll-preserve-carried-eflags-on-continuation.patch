@@ -1,0 +1,40 @@
+Subject: [PATCH] ntdll: Preserve carried EFLAGS in emulated continuation contexts
+
+Apply after the paired PF/AF/DF transport patch on Wine 11.20.
+Keep packet bits in software contexts for emulated PCs; existing native
+PSTATE sanitization remains unchanged.
+
+---
+diff --git a/dlls/ntdll/unix/signal_arm64.c b/dlls/ntdll/unix/signal_arm64.c
+index 417d6fa73..0c0fe362b 100644
+--- a/dlls/ntdll/unix/signal_arm64.c
++++ b/dlls/ntdll/unix/signal_arm64.c
+@@ -450,7 +450,12 @@ NTSTATUS WINAPI NtSetContextThread( HANDLE handle, const CONTEXT *context )
+         frame->sp    = context->Sp;
+         frame->pc    = context->Pc;
+         frame->cpsr  = context->Cpsr & cpsr_user_mask;
+-        if (is_emulated_code( frame->pc )) flags |= RESTORE_FLAGS_EMULATION;
++        if (is_emulated_code( frame->pc ))
++        {
++            /* Keep PF/AF/DF in the software context passed back to FEX. */
++            frame->cpsr |= context->Cpsr & 0x0c080000;
++            flags |= RESTORE_FLAGS_EMULATION;
++        }
+         else frame->restore_flags &= ~RESTORE_FLAGS_EMULATION;
+     }
+     if (flags & CONTEXT_FLOATING_POINT)
+diff --git a/dlls/ntdll/unix/thread.c b/dlls/ntdll/unix/thread.c
+index c8ac3ea53..a17743a62 100644
+--- a/dlls/ntdll/unix/thread.c
++++ b/dlls/ntdll/unix/thread.c
+@@ -594,6 +594,10 @@ static NTSTATUS context_to_server( struct context_data *to, USHORT to_machine, c
+             to->ctl.arm64_regs.sp     = from->Sp;
+             to->ctl.arm64_regs.pc     = from->Pc;
+             to->ctl.arm64_regs.pstate = from->Cpsr & cpsr_user_mask;
++#ifdef __aarch64__
++            /* Suspension and cross-thread contexts also carry the saved FEX flags. */
++            if (is_emulated_code( from->Pc )) to->ctl.arm64_regs.pstate |= from->Cpsr & 0x0c080000;
++#endif
+         }
+         if (flags & CONTEXT_ARM64_INTEGER)
+         {

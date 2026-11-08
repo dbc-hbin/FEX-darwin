@@ -15,3 +15,4 @@ local/0009-FEX-Optimize-Hadron-JIT-memory-and-invalidation.patch
 local/0010-Windows-Optimize-disk-cache-and-TSO-identity.patch
 local/0011-FEX-Fix-scalar-TSO-bit-index-addresses.patch
 arknights-macos-runtime/0001-arm64ec-restore-carried-eflags.patch
+local/0012-FEX-Preserve-fault-state-and-valid-arithmetic-immediates.patch
