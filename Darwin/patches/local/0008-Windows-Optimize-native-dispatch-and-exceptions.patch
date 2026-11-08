@@ -1,0 +1,1245 @@
+Subject: [PATCH 6/9] Native ARM64EC dispatch, call-return stacks and exceptions
+
+Base-commit: 14c92681f4d62cf84d901460e0358de09c8847a7
+Prerequisites: five pinned Hadron patches, local/0001 and local/0002,
+and all earlier numbered patches in this series.
+
+Apply local/0003 through local/0011 in Portfile order before building.
+Shared declarations and frontend/backend changes cross patch boundaries;
+individual patches are not standalone builds.
+
+Provide native ARM64EC dispatch, call-return stacks and exception handling.
+The existing Wine ABI, 64KB guards and default settings are preserved.
+The iOS-only relocated guest window has been removed.
+Rebuild and install both PE DLLs and native Unix helpers together.
+
+MIT License
+
+Copyright (c) 2026 dbc-hbin (Darwin modifications)
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+
+---
+diff --git a/FEXCore/Source/Interface/Context/Context.h b/FEXCore/Source/Interface/Context/Context.h
+index 4802505ca3d733fc97583d76530e3aa8cacf3216..b0ddde110a3209460863f146fd45357bfbcdee24 100644
+--- a/FEXCore/Source/Interface/Context/Context.h
++++ b/FEXCore/Source/Interface/Context/Context.h
+@@ -233,6 +233,7 @@ public:
+   void ClearCodeCache(FEXCore::Core::InternalThreadState* Thread, bool NewCodeBuffer = true) override;
+   void InvalidateCodeBuffersCodeRange(uint64_t Start, uint64_t Length) override;
+   void InvalidateThreadCachedCodeRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) override;
++  void InvalidateCallRetStack(FEXCore::Core::InternalThreadState* Thread);
+   FEXCore::Utils::WritePriorityMutex::Mutex& GetCodeInvalidationMutex() override {
+     return CodeInvalidationMutex;
+   }
+diff --git a/FEXCore/Source/Interface/Core/Core.cpp b/FEXCore/Source/Interface/Core/Core.cpp
+index 6540de27c48236fa7161d489704b63e7ba2d477a..041300cbd30547cfe473fa1b3127a2559541b5b8 100644
+--- a/FEXCore/Source/Interface/Core/Core.cpp
++++ b/FEXCore/Source/Interface/Core/Core.cpp
+@@ -1077,11 +1077,22 @@ void ContextImpl::InvalidateThreadCachedCodeRange(FEXCore::Core::InternalThreadS
+   if (Thread->LookupCache->InvalidateCacheRange(Start, Length)) {
+     FEXCORE_PROFILE_SCOPED("InvalidateCallRet");
+ 
+-    // This may cause access violations in the thread on Windows as zeroing is not atomic, this is handled by the frontend
+-    Allocator::VirtualDontNeed(Thread->CallRetStackBase, FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE);
++    InvalidateCallRetStack(Thread);
+   }
+ }
+ 
++void ContextImpl::InvalidateCallRetStack(FEXCore::Core::InternalThreadState* Thread) {
++  // Threads not created by the frontend (e.g. the cache validation thread) have no call-ret stack.
++  if (!Thread->CallRetStackBase) {
++    return;
++  }
++  if (SyscallHandler && SyscallHandler->InvalidateCallRetStack(Thread)) {
++    return;
++  }
++  // This may cause access violations in a concurrently running thread as zeroing is not atomic, this is handled by the frontend
++  Allocator::VirtualDontNeed(Thread->CallRetStackBase, FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE);
++}
++
+ void ContextImpl::ThreadRemoveCodeEntryFromJit(FEXCore::Core::CpuStateFrame* Frame, uint64_t GuestRIP) {
+   static_cast<ContextImpl*>(Frame->Thread->CTX)->SyscallHandler->InvalidateGuestCodeRange(Frame->Thread, GuestRIP, 1);
+ }
+diff --git a/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp b/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp
+index 255f44e8356e7068a5aa991ac0a4a36c708769f6..5f1243dc1626db7fdce809d969b213facb7c6485 100644
+--- a/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp
++++ b/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp
+@@ -149,6 +149,8 @@ void Dispatcher::EmitDispatcher() {
+ #ifdef ARCHITECTURE_arm64ec
+   // Clobbers TMP1/2
+   // Check the EC code bitmap incase we need to exit the JIT to call into native code.
++  ARMEmitter::BiDirectionalLabel CheckECCode {};
++  (void)Bind(&CheckECCode);
+   ARMEmitter::ForwardLabel l_NotECCode;
+   ldr(TMP1, ARMEmitter::XReg::x18, TEB_PEB_OFFSET);
+   ldr(TMP1, TMP1, PEB_EC_CODE_BITMAP_OFFSET);
+@@ -313,6 +315,42 @@ void Dispatcher::EmitDispatcher() {
+     br(TMP1);
+   }
+ 
++  {
++    // Entered like a block entry from an indirect branch whose per-callsite inline cache slot is empty.
++    // State.rip holds the target, TMP4 the slot. Returns to the target's host code or the dispatcher.
++    InlineCacheFillerAddress = GetCursorAddress<uint64_t>();
++    EmitSignalGuardedRegion([&]() {
++      SpillStaticRegs(TMP1);
++
++      mov(ARMEmitter::XReg::x0, STATE);
++      mov(ARMEmitter::XReg::x1, TMP4);
++
++      ldr(ARMEmitter::XReg::x2, STATE_PTR(CpuStateFrame, Pointers.InlineCacheFill));
++      if (!CTX->Config.DisableVixlIndirectCalls) [[unlikely]] {
++        GenerateIndirectRuntimeCall<uintptr_t, void*, void*>(ARMEmitter::Reg::r2);
++      } else {
++        blr(ARMEmitter::Reg::r2);
++      }
++
++      if (!TMP_ABIARGS) {
++        mov(TMP1, ARMEmitter::XReg::x0);
++      }
++
++      FillStaticRegs();
++    });
++
++    br(TMP1);
++  }
++
++#ifdef ARCHITECTURE_arm64ec
++  // Native IC slots are immutable, and TMP4 still points to the matched slot after
++  // a call/return stack push. Recheck the live EC bitmap in case the VA was remapped.
++  NativeInlineCacheAddress = GetCursorAddress<uint64_t>();
++  ldr(RipReg, TMP4, 0);
++  str(RipReg, STATE_PTR(CpuStateFrame, State.rip));
++  (void)b(&CheckECCode);
++#endif
++
+   // Need to create the block
+   {
+     (void)Bind(&NoBlock);
+@@ -439,6 +477,26 @@ void Dispatcher::EmitDispatcher() {
+     }
+   }
+ 
++  {
++    // Faultless synchronous signal.
++    // Some games abuse SIGILL/SIGTRAP/SIGSEGV heavily and the fault overhead is visible.
++    // Instead of double faulting, clean up state and jump to the frontend to handle this.
++    // `FEXCore::Core::CpuStateFrame::SynchronousFaultData` needs to be setup at this point.
++    GuestSignal_SynchronousFault = GetCursorAddress<uint64_t>();
++
++    SpillStaticRegs(TMP1);
++
++    ldr(ARMEmitter::XReg::x0, &l_CTX);
++    mov(ARMEmitter::XReg::x1, STATE);
++    ldr(ARMEmitter::XReg::x2, STATE_PTR(CpuStateFrame, Pointers.SynchronousExceptionHandler));
++
++    if (!CTX->Config.DisableVixlIndirectCalls) [[unlikely]] {
++      GenerateIndirectRuntimeCall<void, void*, void*>(ARMEmitter::Reg::r2);
++    } else {
++      br(ARMEmitter::Reg::r2);
++    }
++  }
++
+   {
+     ThreadPauseHandlerAddressSpillSRA = GetCursorAddress<uint64_t>();
+     SpillStaticRegs(TMP1);
+@@ -2649,6 +2707,7 @@ void Dispatcher::InitThreadPointers(FEXCore::Core::InternalThreadState* Thread)
+     Ptrs.DispatcherLoopTopEnterEC = AbsoluteLoopTopAddressEnterEC;
+     Ptrs.DispatcherLoopTopEnterECFillSRA = AbsoluteLoopTopAddressEnterECFillSRA;
+     Ptrs.ExitFunctionLinker = ExitFunctionLinkerAddress;
++    Ptrs.InlineCacheFiller = InlineCacheFillerAddress;
+     Ptrs.ThreadStopHandlerSpillSRA = ThreadStopHandlerAddressSpillSRA;
+     Ptrs.ThreadPauseHandlerSpillSRA = ThreadPauseHandlerAddressSpillSRA;
+     Ptrs.ThreadDispatchSyscallHandler = ThreadDispatchSyscallHandler;
+@@ -2656,10 +2715,9 @@ void Dispatcher::InitThreadPointers(FEXCore::Core::InternalThreadState* Thread)
+     Ptrs.GuestSignal_SIGILL = GuestSignal_SIGILL;
+     Ptrs.GuestSignal_SIGTRAP = GuestSignal_SIGTRAP;
+     Ptrs.GuestSignal_SIGSEGV = GuestSignal_SIGSEGV;
++    Ptrs.GuestSignal_SynchronousFault = GuestSignal_SynchronousFault;
+     Ptrs.SignalReturnHandler = SignalHandlerReturnAddress;
+     Ptrs.SignalReturnHandlerRT = SignalHandlerReturnAddressRT;
+-    Ptrs.LUDIVHandler = LUDIVHandlerAddress;
+-    Ptrs.LDIVHandler = LDIVHandlerAddress;
+     Ptrs.F64SinHandler = F64SinHandlerAddress;
+     Ptrs.F64CosHandler = F64CosHandlerAddress;
+     Ptrs.F64TanHandler = F64TanHandlerAddress;
+diff --git a/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.h b/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.h
+index 8b1f7ff4002a26202b17ca79ce62594cfe69c480..5db13fef8cc0e553a906969b5f4c762a9ab7e02c 100644
+--- a/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.h
++++ b/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.h
+@@ -59,6 +59,12 @@ public:
+     return ExitFunctionLinkerAddress;
+   }
+ 
++#ifdef ARCHITECTURE_arm64ec
++  uint64_t GetNativeInlineCacheAddress() const {
++    return NativeInlineCacheAddress;
++  }
++#endif
++
+   SignalDelegatorConfig MakeSignalDelegatorConfig() const;
+ 
+ protected:
+@@ -84,11 +90,16 @@ private:
+   uint64_t ThreadDispatchSyscallHandler {};
+   uint64_t ThreadDispatchRemoveCodeEntry {};
+   uint64_t ExitFunctionLinkerAddress {};
++  uint64_t InlineCacheFillerAddress {};
++#ifdef ARCHITECTURE_arm64ec
++  uint64_t NativeInlineCacheAddress {};
++#endif
+   uint64_t SignalHandlerReturnAddress {};
+   uint64_t SignalHandlerReturnAddressRT {};
+   uint64_t GuestSignal_SIGILL {};
+   uint64_t GuestSignal_SIGTRAP {};
+   uint64_t GuestSignal_SIGSEGV {};
++  uint64_t GuestSignal_SynchronousFault {};
+ 
+   uint64_t PauseReturnInstruction {};
+   std::array<uint64_t, FallbackABI::FABI_UNKNOWN> ABIPointers {};
+diff --git a/FEXCore/Source/Interface/Core/JIT/BranchOps.cpp b/FEXCore/Source/Interface/Core/JIT/BranchOps.cpp
+index c2b1d8e287859ce96ea33c426e4c0d341dd38459..abe322ed79e85c175af624ea53d19af48715e11d 100644
+--- a/FEXCore/Source/Interface/Core/JIT/BranchOps.cpp
++++ b/FEXCore/Source/Interface/Core/JIT/BranchOps.cpp
+@@ -284,6 +284,7 @@ DEF_OP(CondJump) {
+ 
+ DEF_OP(Syscall) {
+   SpillStaticRegs(TMP1);
++  ResetStack();
+ 
+   // Jump to the syscall dispatch handler. We won't return after this.
+   ldr(TMP1, STATE, offsetof(FEXCore::Core::CpuStateFrame, Pointers.ThreadDispatchSyscallHandler));
+@@ -382,6 +383,10 @@ DEF_OP(ThreadRemoveCodeEntry) {
+   // Move the entry to ABI before saving state.
+   mov(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::r1, GetReg(Op->EntryToInvalidate));
+ 
++  // Reclaim the translated block's spill frame before assigning x0: a large
++  // frame uses TMP1, which is x0 on the WoW64/Linux ABI.
++  ResetStack();
++
+   // Arguments are passed as follows:
+   // X0: Thread
+   // X1: RIPToInvalidate
+diff --git a/FEXCore/Source/Interface/Core/JIT/JIT.cpp b/FEXCore/Source/Interface/Core/JIT/JIT.cpp
+index 50bcd9df3d32073a0c70748601af93b9a3dc19e0..2aae18857201a6e189023d886b0677ac42d21d04 100644
+--- a/FEXCore/Source/Interface/Core/JIT/JIT.cpp
++++ b/FEXCore/Source/Interface/Core/JIT/JIT.cpp
+@@ -796,8 +796,6 @@ void Arm64JITCore::EmitSuspendInterruptCheck() {
+   }
+ 
+ #ifdef _WIN32
+-  static constexpr uint16_t SuspendMagic {0xCAFE};
+-
+   ldr(TMP2.W(), STATE_PTR(CpuStateFrame, SuspendDoorbell));
+   ARMEmitter::ForwardLabel l_NoSuspend;
+   (void)cbz(ARMEmitter::Size::i32Bit, TMP2, &l_NoSuspend);
+@@ -806,6 +804,21 @@ void Arm64JITCore::EmitSuspendInterruptCheck() {
+ #endif
+ }
+ 
++void Arm64JITCore::EmitSuspendCheckedBackwardBranch(ARMEmitter::BiDirectionalLabel* Target) {
++#ifdef _WIN32
++  if (!CTX->Config.NeedsPendingInterruptFaultCheck) {
++    // Branch straight to the target when no suspend is pending. The suspend
++    // handler replaces the whole context, so nothing executes after the brk.
++    ldr(TMP2.W(), STATE_PTR(CpuStateFrame, SuspendDoorbell));
++    cbz_OrRestart(ARMEmitter::Size::i32Bit, TMP2, Target);
++    brk(SuspendMagic);
++    return;
++  }
++#endif
++  EmitSuspendInterruptCheck();
++  b_OrRestart(Target);
++}
++
+ void Arm64JITCore::EmitEntryPoint(ARMEmitter::BackwardLabel& HeaderLabel, bool CheckTF) {
+   // Get the address of the JITCodeHeader and store in to the core state.
+   // Two instruction cost, each 1 cycle.
+@@ -837,7 +850,7 @@ CodeBuffer::CodeBufferAllocation Arm64JITCore::AllocateCodeBufferInSharedCache(s
+                                                                                                "doesn't match up!\n");
+   // Bring CodeBuffer up to date
+   if (auto Prev = CheckCodeBufferUpdate()) {
+-    Allocator::VirtualDontNeed(ThreadState->CallRetStackBase, FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE);
++    CTX->InvalidateCallRetStack(ThreadState);
+     auto lk = ThreadState->LookupCache->AcquireWriteLock();
+     ThreadState->LookupCache->ChangeGuestToHostMapping(*Prev, *CurrentCodeBuffer->LookupCache, lk);
+   }
+@@ -960,9 +973,10 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
+       // if there's a pending branch, and it is not fall-through
+       if (PendingTargetLabel && PendingTargetLabel != Target) {
+         if (PendingTargetLabel->Backward.Location) {
+-          EmitSuspendInterruptCheck();
++          EmitSuspendCheckedBackwardBranch(PendingTargetLabel);
++        } else {
++          b_OrRestart(PendingTargetLabel);
+         }
+-        b_OrRestart(PendingTargetLabel);
+         PendingTargetLabel = nullptr;
+       }
+ 
+@@ -1009,16 +1023,19 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
+       }
+     }
+ 
+-    DebugData->Subblocks.push_back({static_cast<uint32_t>(BlockStartHostCode - CodeData.BlockBegin),
+-                                    static_cast<uint32_t>(GetCursorAddress<uint8_t*>() - BlockStartHostCode)});
++    if (RecordSubblocks) {
++      DebugData->Subblocks.push_back({static_cast<uint32_t>(BlockStartHostCode - CodeData.BlockBegin),
++                                      static_cast<uint32_t>(GetCursorAddress<uint8_t*>() - BlockStartHostCode)});
++    }
+   }
+ 
+   // Make sure last branch is generated. It certainly can't be eliminated here.
+   if (PendingTargetLabel) {
+     if (PendingTargetLabel->Backward.Location) {
+-      EmitSuspendInterruptCheck();
++      EmitSuspendCheckedBackwardBranch(PendingTargetLabel);
++    } else {
++      b_OrRestart(PendingTargetLabel);
+     }
+-    b_OrRestart(PendingTargetLabel);
+   }
+   PendingTargetLabel = nullptr;
+ 
+diff --git a/FEXCore/Source/Interface/Core/JIT/MiscOps.cpp b/FEXCore/Source/Interface/Core/JIT/MiscOps.cpp
+index 71b170c8d8508dcdee1c5b627332a3cd16296b9e..9c867fb63fa1f2a3bd1f6bedfcc07fc682735f28 100644
+--- a/FEXCore/Source/Interface/Core/JIT/MiscOps.cpp
++++ b/FEXCore/Source/Interface/Core/JIT/MiscOps.cpp
+@@ -80,7 +80,13 @@ void Arm64JITCore::EmitSynchronousFault(const IR::BreakDefinition& Reason) {
+   LoadConstant(ARMEmitter::Size::i64Bit, TMP1, Constant);
+   str(TMP1, STATE, offsetof(FEXCore::Core::CpuStateFrame, SynchronousFaultData));
+ 
+-  switch (Op->Reason.Signal) {
++  if (CTX->HostFeatures.SupportsFaultFreeSynchronousFaults) {
++    ldr(TMP1, STATE, offsetof(FEXCore::Core::CpuStateFrame, Pointers.GuestSignal_SynchronousFault));
++    br(TMP1);
++    return;
++  }
++
++  switch (Reason.Signal) {
+   case Core::FAULT_SIGILL:
+     ldr(TMP1, STATE, offsetof(FEXCore::Core::CpuStateFrame, Pointers.GuestSignal_SIGILL));
+     br(TMP1);
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp b/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
+index 38b67fd6a670574ab73c00b39ba88a030db0c2cc..3fab5bf76823af6c783849af29a5123f65e44df5 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
+@@ -517,13 +517,16 @@ void OpDispatchBuilder::CALLAbsoluteOp(OpcodeArgs) {
+ 
+   // Store the RIP
+   const uint64_t NextRIP = Op->PC + Op->InstSize;
+-  ExitFunction(JMPPCOffset, BranchHint::Call, ConstantPC, [&]() {
+-    auto CallReturnJumpTarget = JumpTargets.find(NextRIP);
+-    if (CallReturnJumpTarget != JumpTargets.end() && CallReturnJumpTarget->second.IsEntryPoint) {
+-      return CallReturnJumpTarget->second.BlockEntry;
+-    }
+-    return InvalidNode;
+-  }());
++  ExitFunction(
++    JMPPCOffset, BranchHint::Call, ConstantPC,
++    [&]() {
++      auto CallReturnJumpTarget = JumpTargets.find(NextRIP);
++      if (CallReturnJumpTarget != JumpTargets.end() && CallReturnJumpTarget->second.IsEntryPoint) {
++        return CallReturnJumpTarget->second.BlockEntry;
++      }
++      return InvalidNode;
++    }(),
++    0, 0, IsFixedSlotOperand(Op->Src[0]) || IsRegisterCallOperand(Op->Src[0]));
+ }
+ 
+ std::optional<CondClass> OpDispatchBuilder::DecodeNZCVCondition(uint8_t OP) {
+@@ -892,7 +895,7 @@ void OpDispatchBuilder::JUMPAbsoluteOp(OpcodeArgs) {
+   auto RIPOffset = LoadSourceGPR(Op, Op->Src[0], Op->Flags);
+ 
+   // Store the new RIP
+-  ExitFunction(RIPOffset);
++  ExitFunction(RIPOffset, BranchHint::None, IsFixedSlotOperand(Op->Src[0]));
+ }
+ 
+ void OpDispatchBuilder::JUMPFARIndirectOp(OpcodeArgs) {
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher.h b/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
+index 5d0274523af18591a03024c64eac2bf1873872dd..937bbbbee3164bd4ca40aaa36c12e7d471810df1 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
+@@ -198,14 +198,14 @@ public:
+     auto Cond = Set ? CondClass::TSTNZ : CondClass::TSTZ;
+     return _CondJump(Src, InlineConst, InvalidNode, InvalidNode, Cond, OpSize::iInvalid, false);
+   }
+-  IRPair<IROp_ExitFunction> ExitFunction(Ref NewRIP, BranchHint Hint = BranchHint::None) {
++  IRPair<IROp_ExitFunction> ExitFunction(Ref NewRIP, BranchHint Hint = BranchHint::None, bool InlineCache = false) {
+     FlushRegisterCache();
+-    return _ExitFunction(GetOpSize(NewRIP), NewRIP, Hint, InvalidNode, InvalidNode);
++    return _ExitFunction(GetOpSize(NewRIP), NewRIP, Hint, InvalidNode, InvalidNode, 0, 0, InlineCache);
+   }
+   IRPair<IROp_ExitFunction> ExitFunction(Ref NewRIP, BranchHint Hint, Ref CallReturnAddress, Ref CallReturnBlock,
+-                                         uint64_t PatchSiteAddress = 0, uint64_t PatchSiteSize = 0) {
++                                         uint64_t PatchSiteAddress = 0, uint64_t PatchSiteSize = 0, bool InlineCache = false) {
+     FlushRegisterCache();
+-    return _ExitFunction(GetOpSize(NewRIP), NewRIP, Hint, CallReturnAddress, CallReturnBlock, PatchSiteAddress, PatchSiteSize);
++    return _ExitFunction(GetOpSize(NewRIP), NewRIP, Hint, CallReturnAddress, CallReturnBlock, PatchSiteAddress, PatchSiteSize, InlineCache);
+   }
+   IRPair<IROp_Break> Break(BreakDefinition Reason) {
+     FlushRegisterCache();
+@@ -923,10 +923,25 @@ public:
+     return _VTBL1(OpSize::i128Bit, Src, LookupIndexes);
+   }
+ 
++  AddressMode AVX128_DecodeMemoryAddress(const X86Tables::DecodedOp& Op, const X86Tables::DecodedOperand& Operand,
++                                         MemoryAccessType AccessType, bool IsLoad, unsigned Bytes);
++  void MapFixedSharedDataRead(AddressMode& A, unsigned Bytes) {
++#ifdef ARCHITECTURE_arm64ec
++    // A relocation, segment or register base cannot prove an absolute fixed-page read.
++    if (!A.Base && !A.Index && !A.Segment) {
++      const uint64_t VA = A.AddrSize == OpSize::i32Bit ? static_cast<uint32_t>(A.Offset) : static_cast<uint64_t>(A.Offset);
++      const uint64_t Offset = VA - Core::JITPointers::WindowsSharedPage;
++      if (Offset <= FEXCore::Utils::FEX_PAGE_SIZE - Bytes) {
++        A.Base = _LoadContextGPR(OpSize::i64Bit, offsetof(Core::CpuStateFrame, Pointers.WindowsSharedDataBase));
++        A.Offset = Offset;
++        A.AddrSize = OpSize::i64Bit;
++      }
++    }
++#endif
++  }
+   RefPair AVX128_LoadSource_WithOpSize(const X86Tables::DecodedOp& Op, const X86Tables::DecodedOperand& Operand, uint32_t Flags,
+                                        bool NeedsHigh, MemoryAccessType AccessType = MemoryAccessType::DEFAULT);
+ 
+-  RefVSIB AVX128_LoadVSIB(const X86Tables::DecodedOp& Op, const X86Tables::DecodedOperand& Operand, uint32_t Flags, bool NeedsHigh);
+   void AVX128_StoreResult_WithOpSize(FEXCore::X86Tables::DecodedOp Op, const FEXCore::X86Tables::DecodedOperand& Operand, const RefPair Src,
+                                      MemoryAccessType AccessType = MemoryAccessType::DEFAULT);
+   void AVX128_VMOVScalarImpl(OpcodeArgs, IR::OpSize ElementSize);
+@@ -1588,9 +1603,23 @@ private:
+     return !(Load && (Operand.IsLiteral() || Operand.IsLiteralRelocation() || Operand.IsLiteralPatchable())) && !Operand.IsGPR();
+   }
+ 
++  // Import-table style `call/jmp [rip+disp]` (64-bit) or `call/jmp [disp32]` (32-bit): the target comes from one fixed slot,
++  // so it is almost always monomorphic and benefits from a per-callsite inline cache.
++  [[nodiscard]]
++  static bool IsFixedSlotOperand(const X86Tables::DecodedOperand& Operand) {
++    return Operand.IsRIPRelative() || Operand.IsRIPRelativeRelocation();
++  }
++
++  // `call reg` and `call [reg+disp]` (vtable-style) calls. Only calls are cached: register jumps are usually switch
++  // tables or dispatchers with many targets. The cache stays on the slot's first target; other targets use the L1 lookup.
++  [[nodiscard]]
++  static bool IsRegisterCallOperand(const X86Tables::DecodedOperand& Operand) {
++    return Operand.IsGPR() || Operand.IsGPRIndirect() || Operand.IsGPRIndirectRelocation();
++  }
++
+   [[nodiscard]]
+-  static bool IsNonTSOReg(MemoryAccessType Access, uint8_t Reg) {
+-    return Access == MemoryAccessType::DEFAULT && Reg == X86State::REG_RSP;
++  bool IsNonTSOReg(MemoryAccessType Access, uint8_t Reg) const {
++    return Access == MemoryAccessType::DEFAULT && Reg == X86State::REG_RSP && ForceTSO != ForceTSOMode::ForceEnabled;
+   }
+ 
+   AddressMode DecodeAddress(const X86Tables::DecodedOp& Op, const X86Tables::DecodedOperand& Operand, MemoryAccessType AccessType, bool IsLoad);
+diff --git a/FEXCore/include/FEXCore/Core/CoreState.h b/FEXCore/include/FEXCore/Core/CoreState.h
+index aaf139efb93445e54cfbc9ab83fb9b335eaff8c7..dee7bd0565485d1bfd0d655fa3d245437be3e5bd 100644
+--- a/FEXCore/include/FEXCore/Core/CoreState.h
++++ b/FEXCore/include/FEXCore/Core/CoreState.h
+@@ -346,14 +346,19 @@ struct JITPointers {
+   uint64_t SyscallHandlerObj {};
+   uint64_t SyscallHandlerFunc {};
+   uint64_t ExitFunctionLink {};
++  uint64_t InlineCacheFill {};
+   uint64_t MonoBackpatcherWrite {};
+-  uint64_t LUDIV {};
+-  uint64_t LDIV {};
+   uint64_t RDRANDFallback {};
+   uint64_t ThunkCallbackRet {};
+ 
++  /**
++   * @name Frontend handler pointers.
++   * @{ */
+   // Handles returning/calling ARM64EC code from the JIT, expects the target PC in TMP3
+   uint64_t ExitFunctionEC {};
++  // Handles a synchronous exception without faulting to jump in to the handler. Frontend specific.
++  uint64_t SynchronousExceptionHandler {};
++  /**  @} */
+ 
+   FallbackABIInfo FallbackHandlerPointers[FallbackHandlerIndex::OPINDEX_MAX];
+   uint64_t NamedVectorConstantPointers[FEXCore::IR::NamedVectorConstant::NAMED_VECTOR_CONST_POOL_MAX];
+@@ -375,11 +380,10 @@ struct JITPointers {
+   uint64_t GuestSignal_SIGILL {};
+   uint64_t GuestSignal_SIGTRAP {};
+   uint64_t GuestSignal_SIGSEGV {};
++  uint64_t GuestSignal_SynchronousFault {};
+   uint64_t SignalReturnHandler {};
+   uint64_t SignalReturnHandlerRT {};
+   uint64_t L2Pointer {};
+-  uint64_t LUDIVHandler {};
+-  uint64_t LDIVHandler {};
+   uint64_t F64SinHandler {};
+   uint64_t F64CosHandler {};
+   uint64_t F64TanHandler {};
+@@ -394,6 +398,11 @@ struct JITPointers {
+ 
+   // Copy of process-wide named vector constants data.
+   alignas(16) uint64_t NamedVectorConstants[FEXCore::IR::NamedVectorConstant::NAMED_VECTOR_CONST_POOL_MAX][2];
++#ifdef ARCHITECTURE_arm64ec
++  // Absolute Windows shared-page reads use this base, including after a disk-cache reload.
++  static constexpr uint64_t WindowsSharedPage = 0x7ffe0000;
++  uint64_t WindowsSharedDataBase {WindowsSharedPage};
++#endif
+ };
+ 
+ // Each guest JIT frame has one of these
+diff --git a/FEXCore/include/FEXCore/HLE/SyscallHandler.h b/FEXCore/include/FEXCore/HLE/SyscallHandler.h
+index 0ba0218e31cc6e95cc13174fd334d0a1f8de7570..2420e9b1d7d416ca6c71c1af41690b219e2ad6e2 100644
+--- a/FEXCore/include/FEXCore/HLE/SyscallHandler.h
++++ b/FEXCore/include/FEXCore/HLE/SyscallHandler.h
+@@ -34,6 +34,11 @@ public:
+ 
+   virtual void MarkGuestExecutableRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) {}
+   virtual void InvalidateGuestCodeRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) {}
++  // Clears every call-ret stack entry of the thread, which may be running concurrently.
++  // Returns false if the frontend doesn't manage the call-ret stack and the whole stack should be discarded instead.
++  virtual bool InvalidateCallRetStack(FEXCore::Core::InternalThreadState* Thread) {
++    return false;
++  }
+   virtual void MarkOvercommitRange(uint64_t Start, uint64_t Length) {}
+   virtual void UnmarkOvercommitRange(uint64_t Start, uint64_t Length) {}
+   virtual ExecutableRangeInfo QueryGuestExecutableRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Address) = 0;
+diff --git a/Source/Windows/ARM64EC/Module.S b/Source/Windows/ARM64EC/Module.S
+index 2489e653ccea22e16f312b201f04465172ee91da..ce36c1d688ef56e501acad854a2eb44a892c6088 100644
+--- a/Source/Windows/ARM64EC/Module.S
++++ b/Source/Windows/ARM64EC/Module.S
+@@ -158,9 +158,9 @@ DIRECT_SYSCALL_WRAPPER("#NtProtectVirtualMemoryNative", WineNtProtectVirtualMemo
+   subs x16, x11, x9
+   b.lo end
+   adrp x17, NtDllRedirectionLUTSize
+-  ldr x17, [x17, #:lo12:NtDllRedirectionLUTSize]
++  ldr w17, [x17, #:lo12:NtDllRedirectionLUTSize]
+   cmp x16, x17
+-  b.hi end
++  b.hs end
+   adrp x17, NtDllRedirectionLUT
+   ldr x17, [x17, #:lo12:NtDllRedirectionLUT]
+   ldr w11, [x17, x16, lsl #2]
+diff --git a/Source/Windows/ARM64EC/Module.cpp b/Source/Windows/ARM64EC/Module.cpp
+index 87fa891733d3749bcc6c04dcac5c6c39bd2e4638..2bf1cdb48eebe9193fd20e29811b8f28eebb5e59 100644
+--- a/Source/Windows/ARM64EC/Module.cpp
++++ b/Source/Windows/ARM64EC/Module.cpp
+@@ -33,6 +33,7 @@ $end_info$
+ #include "Windows/Common/FEXUnixLib.h"
+ #include "Common/CallRetStack.h"
+ #include "Common/JITGuardPage.h"
++#include "UserSharedData.h"
+ #include "Common/Config.h"
+ #include "Common/Exception.h"
+ #include "Common/ImageTracker.h"
+@@ -68,6 +69,7 @@ class ECSyscallHandler;
+ }
+ 
+ extern "C" {
++NTSYSAPI DECLSPEC_NORETURN void NTAPI RtlRaiseStatus(NTSTATUS Status);
+ extern IMAGE_DOS_HEADER __ImageBase; // Provided by the linker
+ 
+ extern void* ExitFunctionEC;
+@@ -150,6 +152,7 @@ std::optional<FEX::Windows::InvalidationTracker> InvalidationTracker;
+ std::optional<FEX::Windows::CPUFeatures> CPUFeatures;
+ std::optional<FEX::Windows::OvercommitTracker> OvercommitTracker;
+ std::optional<FEX::Windows::ImageTracker> ImageTracker;
++const uint8_t* UserSharedDataBacking {};
+ 
+ std::recursive_mutex ThreadCreationMutex;
+ // Map of TIDs to their FEX thread state, `ThreadCreationMutex` must be locked when accessing
+@@ -359,6 +362,22 @@ void HandleImageUnmap(uint64_t Address, uint64_t Size) {
+ }
+ } // namespace
+ 
++class ScopedCallbackDisable {
++private:
++  bool Prev;
++
++public:
++  ScopedCallbackDisable() {
++    const auto CPUArea = GetCPUArea();
++    Prev = CPUArea.Area->InSyscallCallback;
++    CPUArea.Area->InSyscallCallback = true;
++  }
++
++  ~ScopedCallbackDisable() {
++    GetCPUArea().Area->InSyscallCallback = Prev;
++  }
++};
++
+ namespace Exception {
+ static std::optional<FEX::Windows::TSOHandlerConfig> HandlerConfig;
+ static uintptr_t KiUserExceptionDispatcher;
+@@ -430,15 +449,31 @@ static void LoadStateFromECContext(FEXCore::Core::InternalThreadState* Thread, C
+     State.ds_cached = 0;
+   }
+ 
+-  if ((Context.ContextFlags & CONTEXT_FLOATING_POINT) == CONTEXT_FLOATING_POINT) {
+-    // Floating-point register state
+-    if ((Context.ContextFlags & CONTEXT_XSTATE) == CONTEXT_XSTATE) {
+-      const auto* Ymm = RtlLocateExtendedFeature(reinterpret_cast<CONTEXT_EX*>(&Context + 1), XSTATE_AVX, nullptr);
+-      CTX->SetXMMRegistersFromState(Thread, reinterpret_cast<const __uint128_t*>(Context.FltSave.XmmRegisters),
+-                                    reinterpret_cast<const __uint128_t*>(Ymm));
+-    } else {
+-      CTX->SetXMMRegistersFromState(Thread, reinterpret_cast<const __uint128_t*>(Context.FltSave.XmmRegisters), nullptr);
++  const bool FloatingPoint = (Context.ContextFlags & CONTEXT_FLOATING_POINT) == CONTEXT_FLOATING_POINT;
++  const bool XState = (Context.ContextFlags & CONTEXT_XSTATE) == CONTEXT_XSTATE;
++  if (FloatingPoint || XState) {
++    alignas(16) __uint128_t Low[16], High[16] {};
++    CTX->ReconstructXMMRegisters(Thread, Low, High);
++    if (FloatingPoint) memcpy(Low, Context.FltSave.XmmRegisters, sizeof(Low));
++    if (XState) {
++      auto* Extended = reinterpret_cast<CONTEXT_EX*>(&Context + 1);
++      if (Extended->XState.Length < sizeof(XSAVE_AREA_HEADER)) RtlRaiseStatus(STATUS_INVALID_PARAMETER);
++      auto* Header = reinterpret_cast<XSAVE_AREA_HEADER*>(reinterpret_cast<uint8_t*>(Extended) + Extended->XState.Offset);
++      if (Header->Mask & XSTATE_MASK_AVX) {
++        ULONG Length;
++        const auto* Ymm = RtlLocateExtendedFeature(Extended, XSTATE_AVX, &Length);
++        if (!Ymm || Length != sizeof(High)) RtlRaiseStatus(STATUS_INVALID_PARAMETER);
++        memcpy(High, Ymm, sizeof(High));
++      } else {
++        memset(High, 0, sizeof(High));
++      }
+     }
++    // Legacy FP updates preserve high; XSTATE-only updates preserve low and x87.
++    CTX->SetXMMRegistersFromState(Thread, Low, High);
++  }
++
++  if (FloatingPoint) {
++    // Floating-point register state
+     memcpy(State.mm, Context.FltSave.FloatRegisters, sizeof(State.mm));
+ 
+     State.FCW = Context.FltSave.ControlWord;
+@@ -526,10 +561,12 @@ static ARM64_NT_CONTEXT StoreStateToPackedECContext(FEXCore::Core::InternalThrea
+   ECContext.X24 = 0;
+   ECContext.X28 = 0;
+ 
+-  // NZCV+SS will be converted into EFlags by ntdll, the rest are lost during exception handling.
+-  // See HandleGuestException
++  // Wine carries PF/AF/DF in A64 RES0 bits 26/27/19; these packet bits must not reach native PSTATE.
+   uint32_t EFlags = CTX->ReconstructCompactedEFLAGS(Thread, false, nullptr, 0);
+   ECContext.Cpsr = 0;
++  ECContext.Cpsr |= (EFlags & (1U << FEXCore::X86State::RFLAG_PF_RAW_LOC)) ? (1U << 26) : 0;
++  ECContext.Cpsr |= (EFlags & (1U << FEXCore::X86State::RFLAG_AF_RAW_LOC)) ? (1U << 27) : 0;
++  ECContext.Cpsr |= (EFlags & (1U << FEXCore::X86State::RFLAG_DF_RAW_LOC)) ? (1U << 19) : 0;
+   ECContext.Cpsr |= (EFlags & (1U << FEXCore::X86State::RFLAG_TF_RAW_LOC)) ? (1U << 21) : 0;
+   ECContext.Cpsr |= (EFlags & (1U << FEXCore::X86State::RFLAG_OF_RAW_LOC)) ? (1U << 28) : 0;
+   ECContext.Cpsr |= (EFlags & (1U << FEXCore::X86State::RFLAG_CF_RAW_LOC)) ? (1U << 29) : 0;
+@@ -542,20 +579,10 @@ static ARM64_NT_CONTEXT StoreStateToPackedECContext(FEXCore::Core::InternalThrea
+   return ECContext;
+ }
+ 
+-static void RethrowGuestException(const EXCEPTION_RECORD& Rec, ARM64_NT_CONTEXT& Context) {
+-  auto* Thread = GetCPUArea().ThreadState();
++static void RaiseException(FEXCore::Core::InternalThreadState* Thread, const EXCEPTION_RECORD& Rec, ARM64_NT_CONTEXT& GuestContext) {
+   auto& Fault = Thread->CurrentFrame->SynchronousFaultData;
+ 
+-  LogMan::Msg::DFmt("Reconstructing context");
+-  if (!IsDispatcherAddress(Context.Pc)) {
+-    ReconstructThreadState(Thread, Context);
+-  }
+-  ARM64_NT_CONTEXT GuestContext = StoreStateToPackedECContext(Thread, Context.Fpcr, Context.Fpsr);
+-  LogMan::Msg::DFmt("pc: {:X} rip: {:X}", Context.Pc, GuestContext.Pc);
+-
+-  // X64 Windows always clears TF, DF and AF when handling an exception, restoring after.
+-  // Current ARM64EC windows can only restore NZCV+SS when returning from an exception and other flags are left untouched from the handler context.
+-  // TODO: Can extend wine to support this by mapping the remaining EFlags into reserved cpsr members.
++  // The saved context retains the original flags; clear TF for exception dispatch itself.
+   uint32_t EFlags = CTX->ReconstructCompactedEFLAGS(Thread, false, nullptr, 0);
+   EFlags &= ~(1 << FEXCore::X86State::RFLAG_TF_RAW_LOC);
+   CTX->SetFlagsFromCompactedEFLAGS(Thread, EFlags);
+@@ -572,12 +599,47 @@ static void RethrowGuestException(const EXCEPTION_RECORD& Rec, ARM64_NT_CONTEXT&
+   NtRaiseExceptionNative(&GuestRec, &GuestContext, FirstChance);
+ }
+ 
++static void RethrowGuestException(FEXCore::Core::InternalThreadState* Thread, const EXCEPTION_RECORD& Rec, ARM64_NT_CONTEXT& HostContext) {
++  LogMan::Msg::DFmt("Reconstructing context");
++  if (!IsDispatcherAddress(HostContext.Pc)) {
++    ReconstructThreadState(Thread, HostContext);
++  }
++  auto GuestContext = StoreStateToPackedECContext(Thread, HostContext.Fpcr, HostContext.Fpsr);
++  LogMan::Msg::DFmt("pc: {:X} rip: {:X}", HostContext.Pc, GuestContext.Pc);
++
++  RaiseException(Thread, Rec, GuestContext);
++}
++
++[[noreturn]]
++static void SynchronousExceptionHandler(FEXCore::Context::Context* CTX, FEXCore::Core::CpuStateFrame* Frame) {
++  // The dispatcher has spilled the guest state and reset the JIT stack; raise the guest exception without a host fault.
++  auto Thread = Frame->Thread;
++  auto& Fault = Thread->CurrentFrame->SynchronousFaultData;
++
++  uint64_t FPCR, FPSR;
++  __asm volatile("mrs %[fpcr], fpcr" : [fpcr] "=r"(FPCR));
++  __asm volatile("mrs %[fpsr], fpsr" : [fpsr] "=r"(FPSR));
++
++  auto Context = StoreStateToPackedECContext(Thread, static_cast<uint32_t>(FPCR), static_cast<uint32_t>(FPSR));
++  // Match the host exception codes of the faulting GuestSignal_* handlers (hlt, brk, null load).
++  EXCEPTION_RECORD Record = {};
++  switch (Fault.Signal) {
++  case FEXCore::Core::FAULT_SIGILL: Record.ExceptionCode = EXCEPTION_ILLEGAL_INSTRUCTION; break;
++  case FEXCore::Core::FAULT_SIGTRAP: Record.ExceptionCode = EXCEPTION_BREAKPOINT; break;
++  case FEXCore::Core::FAULT_SIGSEGV: Record.ExceptionCode = EXCEPTION_ACCESS_VIOLATION; break;
++  default: ERROR_AND_DIE_FMT("Unknown fault signal"); break;
++  }
++
++  RaiseException(Thread, Record, Context);
++  ERROR_AND_DIE_FMT("This should always noreturn");
++}
++
+ class ECSyscallHandler : public FEXCore::HLE::SyscallHandler, public FEXCore::Allocator::FEXAllocOperators {
+ public:
+   ECSyscallHandler() = default;
+ 
+   void HandleSyscall(FEXCore::Core::CpuStateFrame* Frame) override {
+-    ProcessPendingCrossProcessEmulatorWork();
++    ProcessCrossProcessWork();
+ 
+     // Manually raise an exeption with the current JIT state packed into a native context, ntdll handles this and
+     // reenters the JIT (see dlls/ntdll/signal_arm64ec.c in wine).
+@@ -603,9 +665,17 @@ public:
+   }
+ 
+   void InvalidateGuestCodeRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) override {
++    // Invalidating the call/return cache decommits memory. Do not reenter the
++    // memory notification callbacks while the code invalidation mutex is held.
++    ScopedCallbackDisable guard;
+     InvalidationTracker->InvalidateAlignedInterval(Start, Length, false);
+   }
+ 
++  bool InvalidateCallRetStack(FEXCore::Core::InternalThreadState* Thread) override {
++    FEX::Windows::CallRetStack::Invalidate(Thread, GetFrontendThreadData(Thread)->CallRetStack);
++    return true;
++  }
++
+   void MarkOvercommitRange(uint64_t Start, uint64_t Length) override {
+     OvercommitTracker->MarkRange(Start, Length);
+   }
+@@ -662,12 +732,19 @@ NTSTATUS ProcessInit() {
+ 
+   const auto NtDll = GetModuleHandleW(L"ntdll.dll");
+   const bool IsWine = !!GetProcAddress(NtDll, "wine_get_version");
++  if (IsWine) {
++    const auto Getter = reinterpret_cast<uintptr_t>(GetProcAddress(NtDll, "__wine_get_user_shared_data"));
++    if (Getter) {
++      // The compiler-generated ARM64EC call checker redirects the x64 export.
++      UserSharedDataBacking = reinterpret_cast<const uint8_t* (*)()>(Getter)();
++    }
++  }
+   OvercommitTracker.emplace(IsWine);
+ 
+   FEX::Windows::SetupEnvironmentVariableValues(NtDll);
+ 
+-  FEX::Windows::Allocator::SetupHooks(NtDll);
+   FEX::Windows::UnixLib::Init(NtDll);
++  FEX::Windows::Allocator::SetupHooks();
+   if (FEX::Windows::UnixLib::Available()) {
+     FEXCore::DiskCache::SetFileMapper(FEX::Windows::UnixLib::MapFile);
+   }
+@@ -719,22 +796,6 @@ NTSTATUS ProcessInit() {
+ 
+ void ProcessTerm(HANDLE Handle, BOOL After, NTSTATUS Status) {}
+ 
+-class ScopedCallbackDisable {
+-private:
+-  bool Prev;
+-
+-public:
+-  ScopedCallbackDisable() {
+-    const auto CPUArea = GetCPUArea();
+-    Prev = CPUArea.Area->InSyscallCallback;
+-    CPUArea.Area->InSyscallCallback = true;
+-  }
+-
+-  ~ScopedCallbackDisable() {
+-    GetCPUArea().Area->InSyscallCallback = Prev;
+-  }
+-};
+-
+ // Returns true if exception dispatch should be halted and the execution context restored to NativeContext
+ bool ResetToConsistentStateImpl(const ThreadCPUArea CPUArea, EXCEPTION_RECORD* Exception, CONTEXT* GuestContext, ARM64_NT_CONTEXT* NativeContext) {
+   auto Thread = CPUArea.ThreadState();
+@@ -752,8 +813,16 @@ bool ResetToConsistentStateImpl(const ThreadCPUArea CPUArea, EXCEPTION_RECORD* E
+ 
+   if (Exception->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
+     const auto FaultAddress = static_cast<uint64_t>(Exception->ExceptionInformation[1]);
++    if (UserSharedDataBacking && Exception->ExceptionInformation[0] == 0 &&
++        FaultAddress - FEX::Windows::UserSharedData::GuestBase < FEX::Windows::UserSharedData::PageSize &&
++        CTX->IsAddressInCodeBuffer(Thread, NativeContext->Pc) &&
++        FEX::Windows::UserSharedData::HandleLoad(UserSharedDataBacking, *reinterpret_cast<const uint32_t*>(NativeContext->Pc),
++                                               FaultAddress, NativeContext->X, NativeContext->Sp, NativeContext->V)) {
++      NativeContext->Pc += 4;
++      return true;
++    }
+ 
+-    if (FEX::Windows::CallRetStack::HandleAccessViolation(Thread, FaultAddress, NativeContext->X17)) {
++    if (FEX::Windows::CallRetStack::HandleAccessViolation(Thread, GetFrontendThreadData(Thread)->CallRetStack, FaultAddress, NativeContext->X17)) {
+       return true;
+     }
+ 
+@@ -806,7 +875,7 @@ bool ResetToConsistentStateImpl(const ThreadCPUArea CPUArea, EXCEPTION_RECORD* E
+   }
+ 
+   if (IsEmulatorStackAddress(CPUArea, reinterpret_cast<uint64_t>(__builtin_frame_address(0)))) {
+-    Exception::RethrowGuestException(*Exception, *NativeContext);
++    Exception::RethrowGuestException(Thread, *Exception, *NativeContext);
+     LogMan::Msg::DFmt("Rethrowing onto guest stack: {:X}", NativeContext->Sp);
+     return true;
+   } else {
+@@ -816,6 +885,65 @@ bool ResetToConsistentStateImpl(const ThreadCPUArea CPUArea, EXCEPTION_RECORD* E
+ }
+ 
+ NTSTATUS ResetToConsistentState(EXCEPTION_RECORD* Exception, CONTEXT* GuestContext, ARM64_NT_CONTEXT* NativeContext) {
++  if (!NativeContext && Exception->ExceptionCode == FEX::Windows::STATUS_FEX_XSTATE_CONTEXT) {
++    // Wine uses this private request only with a bounded initialized XSTATE tail.
++    auto& Status = Exception->ExceptionInformation[2];
++    Status = STATUS_NOT_SUPPORTED;
++    if (Exception->NumberParameters != 3 || Exception->ExceptionInformation[1] > 1 || !GuestContext ||
++        (GuestContext->ContextFlags & CONTEXT_XSTATE) != CONTEXT_XSTATE) {
++      Status = STATUS_INVALID_PARAMETER;
++      return STATUS_SUCCESS;
++    }
++    if (!CPUFeatures->IsFeaturePresent(PF_AVX2_INSTRUCTIONS_AVAILABLE)) return STATUS_SUCCESS;
++    THREAD_BASIC_INFORMATION Info {};
++    const auto Handle = reinterpret_cast<HANDLE>(Exception->ExceptionInformation[0]);
++    Status = NtQueryInformationThread(Handle, ThreadBasicInformation, &Info, sizeof(Info), nullptr);
++    if (Status == STATUS_ACCESS_DENIED) {
++      // Wine has already checked GET/SET_CONTEXT. Like ThreadTerm, acquire our
++      // own query handle rather than requiring callers to request query rights.
++      auto QueryHandle = FEX::Windows::DupHandle(Handle, THREAD_QUERY_LIMITED_INFORMATION);
++      if (QueryHandle) Status = NtQueryInformationThread(*QueryHandle, ThreadBasicInformation, &Info, sizeof(Info), nullptr);
++    }
++    if (Status != STATUS_SUCCESS) return STATUS_SUCCESS;
++    // A remote process's FEX state is never directly addressable here; its JIT packet uses the server.
++    if (HandleToULong(Info.ClientId.UniqueProcess) != GetCurrentProcessId()) {
++      Status = STATUS_NOT_SUPPORTED;
++      return STATUS_SUCCESS;
++    }
++    std::scoped_lock Lock(ThreadCreationMutex);
++    const auto Entry = Threads.find(HandleToULong(Info.ClientId.UniqueThread));
++    if (Entry == Threads.end()) {
++      Status = STATUS_NOT_SUPPORTED;
++      return STATUS_SUCCESS;
++    }
++    auto* Extended = reinterpret_cast<CONTEXT_EX*>(GuestContext + 1);
++    ULONG Length;
++    if (Extended->XState.Length < sizeof(XSAVE_AREA_HEADER)) {
++      Status = STATUS_INVALID_PARAMETER;
++      return STATUS_SUCCESS;
++    }
++    auto* Header = reinterpret_cast<XSAVE_AREA_HEADER*>(reinterpret_cast<uint8_t*>(Extended) + Extended->XState.Offset);
++    void* Ymm = nullptr;
++    if (!Exception->ExceptionInformation[1] || (Header->Mask & XSTATE_MASK_AVX)) {
++      Ymm = RtlLocateExtendedFeature(Extended, XSTATE_AVX, &Length);
++      if (!Ymm || Length != 16 * sizeof(__uint128_t)) {
++        Status = STATUS_INVALID_PARAMETER;
++        return STATUS_SUCCESS;
++      }
++    }
++    alignas(16) __uint128_t Low[16], High[16] {};
++    CTX->ReconstructXMMRegisters(Entry->second, Low, High);
++    if (Exception->ExceptionInformation[1]) {
++      if (Header->Mask & XSTATE_MASK_AVX) memcpy(High, Ymm, sizeof(High));
++      else memset(High, 0, sizeof(High));
++      CTX->SetXMMRegistersFromState(Entry->second, Low, High);
++    } else {
++      memcpy(Ymm, High, sizeof(High));
++      Header->Mask |= XSTATE_MASK_AVX;
++    }
++    Status = STATUS_SUCCESS;
++    return STATUS_SUCCESS;
++  }
+   bool Cont {};
+   if (Exception->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
+     const auto FaultAddress = static_cast<uint64_t>(Exception->ExceptionInformation[1]);
+@@ -1037,8 +1165,13 @@ NTSTATUS ThreadInit() {
+   Frame->State.cs_idx = FEXCore::Core::CPUState::DEFAULT_USER_CS << 3;
+   Frame->State.cs_cached = FEXCore::Core::CPUState::CalculateGDTBase(GDT);
+ 
+-  FEX::Windows::CallRetStack::InitializeThread(Thread);
++  Thread->FrontendPtr = new FrontendThreadData();
++  FEX::Windows::CallRetStack::InitializeThread(Thread, GetFrontendThreadData(Thread)->CallRetStack);
+   Thread->CurrentFrame->Pointers.ExitFunctionEC = reinterpret_cast<uintptr_t>(&ExitFunctionEC);
++  static_assert(FEX::Windows::UserSharedData::GuestBase == FEXCore::Core::JITPointers::WindowsSharedPage);
++  Thread->CurrentFrame->Pointers.WindowsSharedDataBase =
++    UserSharedDataBacking ? reinterpret_cast<uintptr_t>(UserSharedDataBacking) : FEXCore::Core::JITPointers::WindowsSharedPage;
++  Thread->CurrentFrame->Pointers.SynchronousExceptionHandler = reinterpret_cast<uintptr_t>(&Exception::SynchronousExceptionHandler);
+   CPUArea.StateFrame() = Thread->CurrentFrame;
+ 
+   uint64_t EnterEC = Thread->CurrentFrame->Pointers.DispatcherLoopTopEnterEC;
+diff --git a/Source/Windows/ARM64EC/UserSharedData.h b/Source/Windows/ARM64EC/UserSharedData.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..056d7ff6f485b44d7dbe6877f4490aaf0acedafa
+--- /dev/null
++++ b/Source/Windows/ARM64EC/UserSharedData.h
+@@ -0,0 +1,148 @@
++// SPDX-License-Identifier: MIT
++#pragma once
++#include <atomic>
++#include <cstdint>
++#include <cstring>
++
++namespace FEX::Windows::UserSharedData {
++constexpr uint64_t GuestBase = 0x7ffe0000;
++constexpr uint64_t PageSize = 0x1000;
++
++// Decode only the ordinary A64 loads emitted by the non-SVE Windows JIT.
++// Change an address register only when the instruction explicitly writes it back.
++inline bool HandleLoad(const uint8_t* Backing, uint32_t Insn, uint64_t Fault, uint64_t* X, uint64_t SP,
++                       void* Vectors) {
++  if (!Backing || Fault - GuestBase >= PageSize) {
++    return false;
++  }
++  const unsigned Rn = (Insn >> 5) & 31;
++  const unsigned Rt = Insn & 31;
++  const unsigned Size = Insn >> 30;
++  const bool Vector = (Insn >> 26) & 1;
++  const unsigned Opc = (Insn >> 22) & 3;
++  uint64_t Address = Rn == 31 ? SP : X[Rn];
++  uint64_t WritebackAddress = Address;
++  bool Writeback = false;
++  unsigned Bytes = 1U << Size;
++  unsigned Count = 1;
++  unsigned Rt2 = 0;
++  bool Signed = false;
++  bool Word = Size < 3;
++  bool Acquire = false;
++  int Lane = -1;
++  unsigned Replicate = 0;
++
++  if ((Insn & 0xbfff0000) == 0x0d400000) {
++    // LD1 lane / LD1R, without writeback or multiple structure registers.
++    const unsigned Op = (Insn >> 13) & 7;
++    const unsigned S = (Insn >> 12) & 1;
++    const unsigned Element = (Insn >> 10) & 3;
++    const unsigned Q = Insn >> 30;
++    if (Op == 0) { Bytes = 1; Lane = Q * 8 + S * 4 + Element; }
++    else if (Op == 2 && !(Element & 1)) { Bytes = 2; Lane = Q * 4 + S * 2 + (Element >> 1); }
++    else if (Op == 4 && Element == 0) { Bytes = 4; Lane = Q * 2 + S; }
++    else if (Op == 4 && Element == 1 && !S) { Bytes = 8; Lane = Q; }
++    else if (Op == 6 && !S) { Bytes = 1U << Element; Replicate = Q ? 16 : 8; }
++    else return false;
++  } else if ((Insn & 0x3ffffc00) == 0x08dffc00 || (Insn & 0x3ffffc00) == 0x38bfc000) {
++    // LDAR / LDAPR (including byte and halfword forms).
++    Acquire = true;
++  } else if ((Insn & 0x3fe00c00) == 0x19400000) {
++    // LDAPUR, the RCpc immediate form used for TSO.
++    Address += static_cast<int64_t>(static_cast<int32_t>((Insn >> 12) & 511) - ((Insn & (1U << 20)) ? 512 : 0));
++    Acquire = true;
++  } else if ((Insn & 0x3a000000) == 0x28000000) {
++    // LDP (including REP MOVS post-index) / LDNP.
++    const unsigned Mode = (Insn >> 23) & 3;
++    if (!(Insn & (1U << 22))) {
++      return false;
++    }
++    if (Vector) {
++      if (Size == 3) return false;
++      Bytes = 4U << Size;
++    } else {
++      if (Size == 3 || (Size == 1 && Mode == 0)) return false;
++      Bytes = Size == 2 ? 8 : 4;
++      Signed = Size == 1; // LDPSW
++      Word = Size == 0;
++    }
++    const int Offset = static_cast<int>((Insn >> 15) & 127) - ((Insn & (1U << 21)) ? 128 : 0);
++    WritebackAddress = Address + static_cast<int64_t>(Offset) * Bytes;
++    Writeback = Mode & 1;
++    if (Mode != 1) Address = WritebackAddress;
++    Count = 2;
++    Rt2 = (Insn >> 10) & 31;
++    if (Rt == Rt2) return false;
++  } else if ((Insn & 0x3b000000) == 0x39000000 || (Insn & 0x3b000000) == 0x38000000) {
++    if (Vector) {
++      if (!(Opc & 1) || (Opc == 3 && Size != 0)) return false;
++      if (Opc == 3) Bytes = 16;
++    } else {
++      if (Opc == 0 || (Opc == 2 && Size == 3) || (Opc == 3 && Size >= 2)) return false;
++      Signed = Opc >= 2;
++      Word = Opc == 3 || (Opc == 1 && Size < 3);
++    }
++    if (Insn & (1U << 24)) {
++      Address += ((Insn >> 10) & 4095) * Bytes;
++    } else if ((Insn & 0x00200c00) == 0x00200800) {
++      const unsigned Rm = (Insn >> 16) & 31;
++      uint64_t Offset = Rm == 31 ? 0 : X[Rm];
++      switch ((Insn >> 13) & 7) {
++      case 2: Offset = static_cast<uint32_t>(Offset); break;
++      case 3: break;
++      case 6: Offset = static_cast<int64_t>(static_cast<int32_t>(Offset)); break;
++      case 7: break;
++      default: return false;
++      }
++      Address += Offset * ((Insn & (1U << 12)) ? Bytes : 1);
++    } else if (!(Insn & (1U << 21)) && ((Insn >> 10) & 3) != 2) {
++      const unsigned Mode = (Insn >> 10) & 3;
++      WritebackAddress = Address + static_cast<int64_t>(static_cast<int32_t>((Insn >> 12) & 511) - ((Insn & (1U << 20)) ? 512 : 0));
++      Writeback = Mode & 1;
++      if (Mode != 1) Address = WritebackAddress;
++    } else {
++      return false; // Unprivileged and reserved forms.
++    }
++  } else {
++    return false;
++  }
++
++  // SP is passed by value; integer destination/base overlap has constrained writeback.
++  if (Writeback && (Rn == 31 || (!Vector && (Rn == Rt || (Count == 2 && Rn == Rt2))))) return false;
++  const uint64_t Offset = Address - GuestBase;
++  if (Offset >= PageSize || Bytes * Count > PageSize - Offset || Fault < Address || Fault - Address >= Bytes * Count) {
++    return false;
++  }
++  auto* V = static_cast<uint8_t*>(Vectors);
++  for (unsigned I = 0; I < Count; ++I) {
++    const unsigned Dst = I ? Rt2 : Rt;
++    const auto* Source = Backing + Offset + I * Bytes;
++    if (Vector) {
++      if (Lane >= 0) {
++        std::memcpy(V + Dst * 16 + Lane * Bytes, Source, Bytes);
++      } else {
++        std::memset(V + Dst * 16, 0, 16);
++        for (unsigned B = 0; B < (Replicate ? Replicate : Bytes); B += Bytes) {
++          std::memcpy(V + Dst * 16 + B, Source, Bytes);
++        }
++      }
++    } else {
++      uint64_t Value = 0;
++      switch (Bytes) {
++      case 1: Value = *Source; break;
++      case 2: { uint16_t T; std::memcpy(&T, Source, 2); Value = T; break; }
++      case 4: { uint32_t T; std::memcpy(&T, Source, 4); Value = T; break; }
++      case 8: std::memcpy(&Value, Source, 8); break;
++      }
++      if (Signed) {
++        const unsigned Shift = 64 - Bytes * 8;
++        Value = static_cast<int64_t>(Value << Shift) >> Shift;
++      }
++      if (Dst != 31) X[Dst] = Word ? static_cast<uint32_t>(Value) : Value;
++    }
++  }
++  if (Writeback) X[Rn] = WritebackAddress;
++  if (Acquire) std::atomic_thread_fence(std::memory_order_acquire);
++  return true;
++}
++} // namespace FEX::Windows::UserSharedData
+diff --git a/Source/Windows/Common/CallRetStack.h b/Source/Windows/Common/CallRetStack.h
+index ece1b5e053c5779bc0774712800924512fcdd1f9..9f648793beaed9705d4bad3b5b3bd3c071d43ac7 100644
+--- a/Source/Windows/Common/CallRetStack.h
++++ b/Source/Windows/Common/CallRetStack.h
+@@ -6,36 +6,76 @@
+ #include <FEXCore/Utils/LogManager.h>
+ #include <FEXCore/Debug/InternalThreadState.h>
+ 
++#include <algorithm>
++#include <atomic>
++
+ namespace FEX::Windows::CallRetStack {
+-static constexpr uint64_t GuardSize = FEXCore::Utils::FEX_GUARD_SIZE;
++// Keep Hadron's guard size so cache drift faults remain inside the reserved range.
++constexpr uint64_t GuardPageSize = FEXCore::Utils::FEX_GUARD_SIZE;
+ 
++// Only a window around the default location is committed. Accesses outside of it fault and grow it, so invalidation
++// only has to zero the initial window and decommit whatever it grew by, instead of decommitting the whole stack.
++constexpr uint64_t WindowBelowDefault = 48 * 1024;
++constexpr uint64_t WindowAboveDefault = 16 * 1024;
++constexpr uint64_t GrowSize = 256 * 1024;
+ struct CallRetStackInfo {
+   uint64_t AllocationBase;
+   uint64_t AllocationEnd;
+   uint64_t DefaultLocation;
+ };
+ 
++// Committed extent of a thread's call-ret stack. Grown by the owning thread's fault handler and reset by invalidations,
++// which may run on any thread and concurrently with each other. No lock is taken, so a suspended owner thread can never
++// block an invalidating thread.
++struct State {
++  std::atomic<uint64_t> Low {};
++  std::atomic<uint64_t> High {};
++};
++
+ CallRetStackInfo GetInfoThread(FEXCore::Core::InternalThreadState* Thread) {
+   uint64_t Base = reinterpret_cast<uint64_t>(Thread->CallRetStackBase);
+   // Leave some room from the base for the default location to allow for underflows without constant exceptions
+-  return {Base - GuardSize, Base + FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE + GuardSize,
++  return {Base - GuardPageSize, Base + FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE + GuardPageSize,
+           Base + FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE / 4};
+ }
+ 
+-void InitializeThread(FEXCore::Core::InternalThreadState* Thread) {
+-  // Allocate the call-ret stack with guard pages on both sides
+-  const void* CallRetStackAlloc = ::VirtualAlloc(nullptr, FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE + 2 * GuardSize,
++static bool Commit(uint64_t Begin, uint64_t End) {
++  return ::VirtualAlloc(reinterpret_cast<void*>(Begin), End - Begin, MEM_COMMIT, PAGE_READWRITE) != nullptr;
++}
++
++// Each entry is cleared by a single 16-byte aligned stp, which FEAT_LSE2 makes single-copy atomic like the JIT's ldp.
++// A concurrently running owner thread thus never sees a guest RIP paired with a cleared host address or vice versa.
++static void ZeroEntries(uint64_t Begin, uint64_t End) {
++  for (; Begin != End; Begin += 64) {
++    asm volatile("stp xzr, xzr, [%0]\n"
++                 "stp xzr, xzr, [%0, #16]\n"
++                 "stp xzr, xzr, [%0, #32]\n"
++                 "stp xzr, xzr, [%0, #48]" ::"r"(Begin)
++                 : "memory");
++  }
++}
++
++void InitializeThread(FEXCore::Core::InternalThreadState* Thread, State& Stack) {
++  // Reserve the call-ret stack with guard pages on both sides
++  const void* CallRetStackAlloc = ::VirtualAlloc(nullptr, FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE + 2 * GuardPageSize,
+                                                  MEM_RESERVE | MEM_TOP_DOWN, PAGE_NOACCESS);
+ 
+   FEXCore::Allocator::VirtualName("FEXMem_CallRetStacks", CallRetStackAlloc,
+-                                  FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE + 2 * GuardSize);
+-  FEXCore::Allocator::VirtualTHPControl(CallRetStackAlloc, FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE + 2 * GuardSize,
++                                  FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE + 2 * GuardPageSize);
++  FEXCore::Allocator::VirtualTHPControl(CallRetStackAlloc, FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE + 2 * GuardPageSize,
+                                         FEXCore::Allocator::THPControl::Disable);
+ 
+-  Thread->CallRetStackBase = reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(CallRetStackAlloc) + GuardSize);
+-  ::VirtualAlloc(Thread->CallRetStackBase, FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE, MEM_COMMIT, PAGE_READWRITE);
++  Thread->CallRetStackBase = reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(CallRetStackAlloc) + GuardPageSize);
++  const auto Base = reinterpret_cast<uint64_t>(Thread->CallRetStackBase);
++  const auto DefaultLocation = GetInfoThread(Thread).DefaultLocation;
++
++  // The first host page stays committed so the stack base is always accessible.
++  Commit(Base, Base + GuardPageSize);
++  Stack.Low = DefaultLocation - WindowBelowDefault;
++  Stack.High = DefaultLocation + WindowAboveDefault;
++  Commit(Stack.Low, Stack.High);
+ 
+-  Thread->CurrentFrame->State.callret_sp = GetInfoThread(Thread).DefaultLocation;
++  Thread->CurrentFrame->State.callret_sp = DefaultLocation;
+ }
+ 
+ void DestroyThread(FEXCore::Core::InternalThreadState* Thread) {
+@@ -43,13 +83,59 @@ void DestroyThread(FEXCore::Core::InternalThreadState* Thread) {
+   ::VirtualFree(reinterpret_cast<void*>(CallRetStackInfo.AllocationBase), 0, MEM_RELEASE);
+ }
+ 
+-bool HandleAccessViolation(FEXCore::Core::InternalThreadState* Thread, uint64_t Address, uint64_t& CallRetSPReg) {
++// Clears every entry while the owning thread may be running. Afterwards each committed page is either zeroed or
++// freshly committed, and entries outside the committed window can only be reached through a fault that commits zeroes.
++void Invalidate(FEXCore::Core::InternalThreadState* Thread, State& Stack) {
++  const auto Base = reinterpret_cast<uint64_t>(Thread->CallRetStackBase);
++  const auto DefaultLocation = GetInfoThread(Thread).DefaultLocation;
++  const auto InitialLow = DefaultLocation - WindowBelowDefault;
++  const auto InitialHigh = DefaultLocation + WindowAboveDefault;
++
++  // The first page never faults, so a stale call-ret SP that still points into it can keep writing there; always clear it.
++  ZeroEntries(Base, Base + GuardPageSize);
++  ZeroEntries(InitialLow, InitialHigh);
++  // A grow that publishes after these exchanges undoes itself, see HandleAccessViolation.
++  if (const auto Low = Stack.Low.exchange(InitialLow); Low < InitialLow) {
++    ::VirtualFree(reinterpret_cast<void*>(Low), InitialLow - Low, MEM_DECOMMIT);
++  }
++  if (const auto High = Stack.High.exchange(InitialHigh); High > InitialHigh) {
++    ::VirtualFree(reinterpret_cast<void*>(InitialHigh), High - InitialHigh, MEM_DECOMMIT);
++  }
++}
++
++// Commits [Begin, End) and publishes Bound = NewBound. Only the owning thread grows, so a failed exchange means an
++// invalidation reset Bound meanwhile. The pages then escaped its decommit, so decommit them again; the owner is inside
++// this handler and cannot have written to them, and the retried access faults and grows anew.
++static void Grow(std::atomic<uint64_t>& Bound, uint64_t Expected, uint64_t NewBound, uint64_t Begin, uint64_t End) {
++  if (Commit(Begin, End) && !Bound.compare_exchange_strong(Expected, NewBound)) {
++    ::VirtualFree(reinterpret_cast<void*>(Begin), End - Begin, MEM_DECOMMIT);
++  }
++}
++
++bool HandleAccessViolation(FEXCore::Core::InternalThreadState* Thread, State& Stack, uint64_t Address, uint64_t& CallRetSPReg) {
+   auto CallRetStackInfo = GetInfoThread(Thread);
+-  if (Address >= CallRetStackInfo.AllocationBase && Address < CallRetStackInfo.AllocationEnd) {
+-    LogMan::Msg::DFmt("Call-ret stack inbalance: {:X}", Address);
+-    CallRetSPReg = CallRetStackInfo.DefaultLocation;
++  if (Address < CallRetStackInfo.AllocationBase || Address >= CallRetStackInfo.AllocationEnd) {
++    return false;
++  }
++
++  const auto Base = reinterpret_cast<uint64_t>(Thread->CallRetStackBase);
++  const auto End = Base + FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE;
++  const auto Low = Stack.Low.load();
++  const auto High = Stack.High.load();
++  if (Address >= Base + GuardPageSize && Address < Low) {
++    // The first page is always committed, so the window never needs to reach below it.
++    const auto NewLow = std::max(Address & ~(GrowSize - 1), Base + GuardPageSize);
++    Grow(Stack.Low, Low, NewLow, NewLow, Low);
+     return true;
+   }
+-  return false;
++  if (Address >= High && Address < End) {
++    const auto NewHigh = std::min((Address & ~(GrowSize - 1)) + GrowSize, End);
++    Grow(Stack.High, High, NewHigh, High, NewHigh);
++    return true;
++  }
++
++  LogMan::Msg::DFmt("Call-ret stack inbalance: {:X}", Address);
++  CallRetSPReg = CallRetStackInfo.DefaultLocation;
++  return true;
+ }
+ } // namespace FEX::Windows::CallRetStack
+diff --git a/Source/Windows/Common/Exception.h b/Source/Windows/Common/Exception.h
+index 45267ed5c7e9276040bed3434fc33d355db96742..d9fee6efbc817ea4658eec22bd68bd012dd1b05c 100644
+--- a/Source/Windows/Common/Exception.h
++++ b/Source/Windows/Common/Exception.h
+@@ -9,6 +9,9 @@
+ #include <FEXCore/Debug/InternalThreadState.h>
+ 
+ namespace FEX::Windows {
++// Private Wine hook: ExceptionInformation carries thread handle, get/set, and NTSTATUS result.
++constexpr NTSTATUS STATUS_FEX_XSTATE_CONTEXT = static_cast<NTSTATUS>(0xe0424658);
++
+ template<typename TReg>
+ static inline EXCEPTION_RECORD HandleGuestException(FEXCore::Core::CpuStateFrame::SynchronousFaultDataStruct& Fault,
+                                                     const EXCEPTION_RECORD& Src, TReg& Rip, TReg Rax, TReg Cx, BOOL& FirstChance) {
+@@ -80,6 +83,7 @@ static inline EXCEPTION_RECORD HandleGuestException(FEXCore::Core::CpuStateFrame
+         return Dst;
+       }
+       break;
++    case FEXCore::X86State::X86_TRAPNO_SS: Dst.ExceptionCode = EXCEPTION_STACK_OVERFLOW; return Dst;
+     case FEXCore::X86State::X86_TRAPNO_OF: Dst.ExceptionCode = EXCEPTION_INT_OVERFLOW; return Dst;
+     case FEXCore::X86State::X86_TRAPNO_PF:
+       // A page-fault raised by an explicit break in JIT code is always an execute fault
+diff --git a/Source/Windows/WOW64/Module.cpp b/Source/Windows/WOW64/Module.cpp
+index 75dcf01d463da1794a905904bafcc2f7ca061ad5..da1312a4cc64ac4dd627dab3262bec3cdb65df5c 100644
+--- a/Source/Windows/WOW64/Module.cpp
++++ b/Source/Windows/WOW64/Module.cpp
+@@ -609,13 +609,13 @@ void BTCpuThreadInit() {
+   Frame->State.cs_idx = DefaultWow64CS << 3;
+   Frame->State.cs_cached = FEXCore::Core::CPUState::CalculateGDTBase(GDT);
+ 
+-  FEX::Windows::CallRetStack::InitializeThread(Thread);
+-
+   const auto TLS = GetTLS();
+   TLS.ThreadState() = Thread;
+ 
+   Thread->FrontendPtr = new FrontendThreadData(TLS);
++  FEX::Windows::CallRetStack::InitializeThread(Thread, GetFrontendThreadData(Thread)->CallRetStack);
+ 
++  std::scoped_lock Lock(ThreadCreationMutex);
+   auto ThreadTID = GetCurrentThreadId();
+   Threads.emplace(ThreadTID, Thread);
+   if (StatAllocHandler) {
+@@ -740,7 +740,7 @@ bool BTCpuResetToConsistentStateImpl(EXCEPTION_POINTERS* Ptrs) {
+   if (Exception->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
+     const auto FaultAddress = static_cast<uint64_t>(Exception->ExceptionInformation[1]);
+ 
+-    if (FEX::Windows::CallRetStack::HandleAccessViolation(Thread, FaultAddress, Context->X25)) {
++    if (FEX::Windows::CallRetStack::HandleAccessViolation(Thread, GetFrontendThreadData(Thread)->CallRetStack, FaultAddress, Context->X25)) {
+       return true;
+     }
+ 

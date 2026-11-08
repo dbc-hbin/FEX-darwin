@@ -1,0 +1,114 @@
+{
+  "upstream": {
+    "repository": "https://github.com/FEX-Emu/FEX.git",
+    "tag": "FEX-2610",
+    "commit": "14c92681f4d62cf84d901460e0358de09c8847a7",
+    "license": "patches/FEX-LICENSE"
+  },
+  "packaging": {
+    "repository": "https://github.com/riverfog7/wine-build-new.git",
+    "branch": "cleanup/fex-patch-source-debloat",
+    "commit": "396ecb609d07bf8f90905070d53b92f0a65d49bf",
+    "portfile": "overlay/emulators/fex-wine/Portfile",
+    "revision": 10
+  },
+  "imports": [
+    {
+      "name": "Hadron",
+      "repository": "https://github.com/Broyojo/hadron.git",
+      "commit": "6f401bcfcf4c1cbf7fbd724974fc8d3562262b1c",
+      "sourceDirectory": "third-party/hardon",
+      "license": "patches/hadron/LICENSE"
+    },
+    {
+      "name": "Arknights-MacOS-Runtime",
+      "repository": "https://github.com/LuMiSxh/Arknights-MacOS-Runtime.git",
+      "commit": "7d47798eab9b0143506db5e95fab9352127414a6",
+      "license": "patches/arknights-macos-runtime/LICENSE"
+    }
+  ],
+  "series": "Darwin/patches/series",
+  "patchDirectory": "Darwin/patches",
+  "patches": [
+    {
+      "path": "hadron/0001-Windows-UnixLib-Build-on-macOS.patch",
+      "sha256": "1d95ebfbe29b290e8a1f1b11218b6797588a4a1464ba8a4c038ba8e2dccb3086"
+    },
+    {
+      "path": "hadron/0002-Windows-Use-64K-guard-regions-for-the-call-ret-stack.patch",
+      "sha256": "b8af568cec0273043d4d7f407e860da94201e0f820f9501d00928de3c3a9058b"
+    },
+    {
+      "path": "hadron/0003-FEXCore-Use-64K-guard-regions-for-JIT-buffers.patch",
+      "sha256": "fc35ae7000107042a0a5e0b3e8f94ee7b4b6a2f8553a5a3b49cf2f9a61721e98"
+    },
+    {
+      "path": "hadron/0004-Windows-UnixLib-Use-thread_set_x86_64_compat-for-har.patch",
+      "sha256": "053830f17f3704a3a9faf0d08ef1282b95c60d52b5e97c68c5853542ec549b82"
+    },
+    {
+      "path": "hadron/0005-Windows-Use-per-thread-W-X-JIT-code-buffers-on-macOS.patch",
+      "sha256": "9d6c049b640d6d1eac524fbeb4455218c64fd1f7dc084bc43d64a0a531400aed"
+    },
+    {
+      "path": "local/0001-Windows-Key-disk-cache-after-hardware-TSO-detection.patch",
+      "sha256": "479d9611589d293b6405cdabe1338540f09478dc0a1ef98719d4d2e83d4e1909"
+    },
+    {
+      "path": "local/0002-Windows-Enable-cache-and-hardware-TSO-defaults.patch",
+      "sha256": "41143ae072058fdbe2eb568a6a27120eb86d82aa95431f1808143f6fa2ad5ea4"
+    },
+    {
+      "path": "local/0003-FEX-Harden-toolchain-and-portable-utilities.patch",
+      "sha256": "dab932695e95326df71c4165daa428bf87e56de339a888f2347262fc4c800eaa"
+    },
+    {
+      "path": "local/0004-FEX-Preserve-32-bit-address-semantics.patch",
+      "sha256": "a863e2ee55e3d1d223a6a25963750d99a3076123f5f6293fbfbe038da349da7d"
+    },
+    {
+      "path": "local/0005-FEX-Improve-x86-instruction-lowering.patch",
+      "sha256": "d37ec935724ebd8f34c6c08890e0d44ea1d459c50425073d695222505ce37ba8"
+    },
+    {
+      "path": "local/0006-FEX-Optimize-IR-and-register-allocation.patch",
+      "sha256": "d8d6d90e14d2165779fef64f15e7eaebf18baa24bc2eb40a926eb4a252e30e52"
+    },
+    {
+      "path": "local/0007-FEX-Optimize-REP-string-operations.patch",
+      "sha256": "c4efe7685288ef3b7192cc5b34a91c17bf0d4f4981939e6b820cf9adc07deced"
+    },
+    {
+      "path": "local/0008-Windows-Optimize-native-dispatch-and-exceptions.patch",
+      "sha256": "92035d90fd6191b6373a43534f116b816cf1dfaef1f5550eaa6fc2680131c9be"
+    },
+    {
+      "path": "local/0009-FEX-Optimize-Hadron-JIT-memory-and-invalidation.patch",
+      "sha256": "2ce99094f7c9fbc99bcc040fa6bffb8d6496cada7cac19db28daa78d0432e0e0"
+    },
+    {
+      "path": "local/0010-Windows-Optimize-disk-cache-and-TSO-identity.patch",
+      "sha256": "57cbc800ee09b3491e502e612e5160ee8fec08d5ec14e8a94bd4be348bd80fbc"
+    },
+    {
+      "path": "local/0011-FEX-Fix-scalar-TSO-bit-index-addresses.patch",
+      "sha256": "200e362e573dd651904da8011c1345db918a61a115ffe26fe0907f04fd0081a0"
+    },
+    {
+      "path": "arknights-macos-runtime/0001-arm64ec-restore-carried-eflags.patch",
+      "sha256": "6f4ebc271f043deac6a6938a1980fbe77bb34f09160a1079dabd40982b03d89b"
+    },
+    {
+      "path": "local/0012-FEX-Preserve-fault-state-and-valid-arithmetic-immediates.patch",
+      "sha256": "94ffb080bd2cceb244152c43f33ebf94ea7af93dd4dc3dcb44550f5597c4c412"
+    }
+  ],
+  "wineCompanionPatches": [
+    {
+      "path": "wine/0001-ntdll-preserve-carried-eflags-on-continuation.patch",
+      "sha256": "59c9df233907338c9e22e85a48bfae66acccc6a53beccad678f72d27fe4c564f",
+      "base": "Wine 11.20 with paired PF/AF/DF transport"
+    }
+  ],
+  "appliedSourceTree": "ca8a669addd2c9c257a1ad19c9aeee7f6ea80d43"
+}

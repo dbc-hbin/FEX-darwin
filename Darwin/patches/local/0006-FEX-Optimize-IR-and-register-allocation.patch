@@ -1,0 +1,581 @@
+Subject: [PATCH 4/9] IR construction, register forwarding and allocation
+
+Base-commit: 14c92681f4d62cf84d901460e0358de09c8847a7
+Prerequisites: five pinned Hadron patches, local/0001 and local/0002,
+and all earlier numbered patches in this series.
+
+Apply local/0003 through local/0011 in Portfile order before building.
+Shared declarations and frontend/backend changes cross patch boundaries;
+individual patches are not standalone builds.
+
+Provide IR construction, register forwarding and allocation changes.
+The existing Wine ABI, 64KB guards and default settings are preserved.
+The iOS-only relocated guest window has been removed.
+Rebuild and install both PE DLLs and native Unix helpers together.
+
+MIT License
+
+Copyright (c) 2026 dbc-hbin (Darwin modifications)
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+
+---
+diff --git a/FEXCore/Source/Interface/Core/Core.cpp b/FEXCore/Source/Interface/Core/Core.cpp
+index 52bd64d3aa7a1f7c26a96e0ea249149ad1152f8a..6540de27c48236fa7161d489704b63e7ba2d477a 100644
+--- a/FEXCore/Source/Interface/Core/Core.cpp
++++ b/FEXCore/Source/Interface/Core/Core.cpp
+@@ -556,6 +556,10 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
+                                         AreMonoHacksActive() && MonoBackpatcherBlock.load(std::memory_order_relaxed) == GuestRIP);
+ 
+     const auto GPRSize = Thread->OpDispatcher->GetGPROpSize();
++#ifdef _WIN32
++    const bool CanCoalesceRegisters = !ExtendedDebugInfo && MaxInst != 1 && !FEXCore::Config::Get_O0() &&
++                                      Config.SMCChecks != FEXCore::Config::CONFIG_SMC_FULL;
++#endif
+ 
+ #ifdef ZYDIS_DISASSEMBLER
+     const auto ZydisMachineMode = Config.Is64BitMode ? ZYDIS_MACHINE_MODE_LONG_64 : ZYDIS_MACHINE_MODE_LEGACY_32;
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp b/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
+index febc527cc20393d7873fa99762d1f02078e5dcd6..c3b5fe6160e5f25f4d307685fcd749faf0d4cae6 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
+@@ -3765,8 +3765,8 @@ void OpDispatchBuilder::DIVOp(OpcodeArgs) {
+     return;
+   }
+ 
+-  Ref Quotient = _AllocateGPR(true);
+-  Ref Remainder = _AllocateGPR(true);
++  Ref Quotient = _AllocateGPR(!DivRemainderDead);
++  Ref Remainder = DivRemainderDead ? Invalid() : _AllocateGPR(true);
+ 
+   if (Size == OpSize::i8Bit) {
+     Ref Src1 = LoadGPRRegister(X86State::REG_RAX, OpSize::i16Bit);
+@@ -3784,12 +3784,16 @@ void OpDispatchBuilder::DIVOp(OpcodeArgs) {
+ 
+     if (Size == OpSize::i32Bit) {
+       Quotient = _Bfe(OpSize::i32Bit, IR::OpSizeAsBits(Size), 0, Quotient);
+-      Remainder = _Bfe(OpSize::i32Bit, IR::OpSizeAsBits(Size), 0, Remainder);
++      if (!DivRemainderDead) {
++        Remainder = _Bfe(OpSize::i32Bit, IR::OpSizeAsBits(Size), 0, Remainder);
++      }
+       Size = OpSize::iInvalid;
+     }
+ 
+     StoreGPRRegister(X86State::REG_RAX, Quotient, Size);
+-    StoreGPRRegister(X86State::REG_RDX, Remainder, Size);
++    if (!DivRemainderDead) {
++      StoreGPRRegister(X86State::REG_RDX, Remainder, Size);
++    }
+   }
+ }
+ 
+@@ -3806,8 +3810,8 @@ void OpDispatchBuilder::IDIVOp(OpcodeArgs) {
+     return;
+   }
+ 
+-  Ref Quotient = _AllocateGPR(true);
+-  Ref Remainder = _AllocateGPR(true);
++  Ref Quotient = _AllocateGPR(!DivRemainderDead);
++  Ref Remainder = DivRemainderDead ? Invalid() : _AllocateGPR(true);
+ 
+   if (Size == OpSize::i8Bit) {
+     Ref Src1 = LoadGPRRegister(X86State::REG_RAX);
+@@ -3827,12 +3831,16 @@ void OpDispatchBuilder::IDIVOp(OpcodeArgs) {
+ 
+     if (Size == OpSize::i32Bit) {
+       Quotient = _Bfe(OpSize::i32Bit, IR::OpSizeAsBits(Size), 0, Quotient);
+-      Remainder = _Bfe(OpSize::i32Bit, IR::OpSizeAsBits(Size), 0, Remainder);
++      if (!DivRemainderDead) {
++        Remainder = _Bfe(OpSize::i32Bit, IR::OpSizeAsBits(Size), 0, Remainder);
++      }
+       Size = OpSize::iInvalid;
+     }
+ 
+     StoreGPRRegister(X86State::REG_RAX, Quotient, Size);
+-    StoreGPRRegister(X86State::REG_RDX, Remainder, Size);
++    if (!DivRemainderDead) {
++      StoreGPRRegister(X86State::REG_RDX, Remainder, Size);
++    }
+   }
+ }
+ 
+@@ -4709,10 +4717,12 @@ void OpDispatchBuilder::ResetWorkingList() {
+   JumpTargets.clear();
+   BlockSetRIP = false;
+   DecodeFailure = false;
++  DivRemainderDead = false;
+   ShouldDump = false;
+   CurrentCodeBlock = nullptr;
+   RegCache.Written = 0;
+   RegCache.Cached = 0;
++  RegCache.SHA256Rounds.A = nullptr;
+ }
+ 
+ void OpDispatchBuilder::UnhandledOp(OpcodeArgs) {
+@@ -4771,7 +4781,9 @@ void OpDispatchBuilder::ALUOp(OpcodeArgs, FEXCore::IR::IROps ALUIROp, FEXCore::I
+       (ALUIROp == IR::IROps::OP_XOR || ALUIROp == IR::IROps::OP_OR || ALUIROp == IR::IROps::OP_ANDWITHFLAGS)) {
+ 
+     RoundedSize = ResultSize = GetGPROpSize();
+-    LOGMAN_THROW_A_FMT(Const < (1ull << IR::OpSizeAsBits(Size)), "does not clobber");
++    // Forwarded register constants can retain the upper garbage allowed by the load.
++    Const &= (1ull << IR::OpSizeAsBits(Size)) - 1;
++    Src = Constant(Const);
+ 
+     // For AND, we can play the same trick but we instead need the upper bits of
+     // the constant to be all-1s instead of all-0s to preserve. We also can't
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher.h b/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
+index 3782e7d29842a22567e9cfee2afcaf2dfad300a3..22545b77e9fd782140c6f54c046dd68115c4d9e4 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
+@@ -308,6 +308,9 @@ public:
+ 
+   // Should only be called at the start of IR Emission.
+   void ResetWorkingList();
++  void SetDivRemainderDead(bool Dead) {
++    DivRemainderDead = Dead;
++  }
+ 
+   void ResetDecodeFailure() {
+     NeedsBlockEnd = DecodeFailure = false;
+@@ -1164,12 +1167,38 @@ public:
+     _StoreContext(Size, Class, Value, Offset);
+   }
+ 
+-  void FlushRegisterCache(bool SRAOnly = false, bool MMXOnly = false) {
++  static uint64_t RegisterForwardMask(X86Tables::DecodedOp Op) {
++    if (!Op->TableInfo || !(Op->TableInfo->Flags & X86Tables::InstFlags::FLAGS_CAN_FORWARD_REGISTERS) ||
++        (Op->Flags & X86Tables::DecodeFlags::FLAG_LOCK) || (!Op->Dest.IsGPR() && !Op->Dest.IsNone())) {
++      return 0;
++    }
++    // Among the eligible handlers, only accumulator-immediate ALU/CMP/TEST omit
++    // the decoded destination. Their RAX operand is implicit in FEX-2610.
++    uint64_t Mask = Op->Dest.IsNone() ? 1ULL << (GPR0Index + X86State::REG_RAX) : 0;
++    auto AddOperand = [&](const X86Tables::DecodedOperand& Operand) {
++      if (!Operand.IsGPR()) {
++        return Operand.IsNone() || Operand.IsLiteral();
++      }
++      const auto Reg = Operand.Data.GPR.GPR;
++      if (Reg > X86State::REG_XMM_15) {
++        return false;
++      }
++      Mask |= 1ULL << (Reg < X86State::REG_XMM_0 ? GPR0Index + Reg : FPR0Index + Reg - X86State::REG_XMM_0);
++      return true;
++    };
++    if (!AddOperand(Op->Dest) || !std::all_of(std::begin(Op->Src), std::end(Op->Src), AddOperand)) {
++      return 0;
++    }
++    return Mask;
++  }
++
++  void FlushRegisterCache(bool SRAOnly = false, bool MMXOnly = false, uint64_t KeepSRA = 0) {
+     // At block boundaries, fix up the carry flag.
+     if (!SRAOnly) {
+       RectifyCarryInvert(CFInvertedABI);
+ 
+-      // Also we can't trust the LastDef accross block boundaries, so clear that as well.
++      // Cross-instruction peephole state cannot be trusted across block boundaries.
++      RegCache.SHA256Rounds.A = nullptr;
+       for (auto& Def : RegCache.LastDef) {
+         Def = nullptr;
+       }
+@@ -1195,7 +1224,7 @@ public:
+       const uint64_t GPRMask = ((1ull << (AFIndex - GPR0Index + 1)) - 1) << GPR0Index;
+       const uint64_t FPRMask = ((1ull << (FPR15Index - FPR0Index + 1)) - 1) << FPR0Index;
+ 
+-      Mask &= (GPRMask | FPRMask);
++      Mask = (GPRMask | FPRMask) & ~KeepSRA;
+       Bits &= Mask;
+     }
+ 
+@@ -1349,6 +1378,7 @@ private:
+   fextl::map<uint64_t, JumpTargetInfo> JumpTargets;
+   bool HandledLock {false};
+   bool DecodeFailure {false};
++  bool DivRemainderDead {false};
+   bool NeedsBlockEnd {false};
+   ForceTSOMode ForceTSO {ForceTSOMode::NoOverride};
+   // Used during new op bringup
+@@ -2799,6 +2829,32 @@ constexpr inline void InstallToTable(auto& FinalTable, const auto& LocalTable) {
+ #endif
+ 
+       TableOp.OpcodeDispatcher.OpDispatch = Dispatcher;
++#ifdef _WIN32
++      // Classify once when constructing the decode tables. Floating-point operations,
++      // implicit memory accesses and control flow need their usual recovery points.
++      using B = OpDispatchBuilder;
++      if (Dispatcher == &B::Bind<&B::MOVGPROp, 0> || Dispatcher == &B::Bind<&B::MOVGPROp, 1> ||
++          Dispatcher == &B::SecondaryALUOp || Dispatcher == &B::Bind<&B::CMPOp, 0, false> || Dispatcher == &B::Bind<&B::CMPOp, 1, false> ||
++          Dispatcher == &B::Bind<&B::CMPOp, 0, true> ||
++          Dispatcher == &B::Bind<&B::TESTOp, 0, false> || Dispatcher == &B::Bind<&B::TESTOp, 1, false> ||
++          Dispatcher == &B::Bind<&B::TESTOp, 0, true> ||
++          Dispatcher == &B::Bind<&B::ALUOp, OP_ADD, OP_ATOMICFETCHADD, 0, false> ||
++          Dispatcher == &B::Bind<&B::ALUOp, OP_ADD, OP_ATOMICFETCHADD, 0, true> ||
++          Dispatcher == &B::Bind<&B::ALUOp, OP_SUB, OP_ATOMICFETCHSUB, 0, false> ||
++          Dispatcher == &B::Bind<&B::ALUOp, OP_SUB, OP_ATOMICFETCHSUB, 0, true> ||
++          Dispatcher == &B::Bind<&B::ALUOp, OP_ANDWITHFLAGS, OP_ATOMICFETCHAND, 0, false> ||
++          Dispatcher == &B::Bind<&B::ALUOp, OP_ANDWITHFLAGS, OP_ATOMICFETCHAND, 0, true> ||
++          Dispatcher == &B::Bind<&B::ALUOp, OP_OR, OP_ATOMICFETCHOR, 0, false> ||
++          Dispatcher == &B::Bind<&B::ALUOp, OP_OR, OP_ATOMICFETCHOR, 0, true> ||
++          Dispatcher == &B::Bind<&B::ALUOp, OP_XOR, OP_ATOMICFETCHXOR, 0, false> ||
++          Dispatcher == &B::Bind<&B::ALUOp, OP_XOR, OP_ATOMICFETCHXOR, 0, true> || Dispatcher == &B::MOVSXOp ||
++          Dispatcher == &B::BSWAPOp || Dispatcher == &B::MOVVectorAlignedOp || Dispatcher == &B::MOVVectorUnalignedOp ||
++          Dispatcher == &B::VectorXOROp || Dispatcher == &B::AVX128_VectorXOR || Dispatcher == &B::AVX128_VMOVAPS ||
++          Dispatcher == &B::AVX128_VANDN || Dispatcher == &B::Bind<&B::AVX128_VectorALU, OP_VAND, OpSize::i128Bit> ||
++          Dispatcher == &B::Bind<&B::AVX128_VectorALU, OP_VOR, OpSize::i128Bit>) {
++        TableOp.Flags |= X86Tables::InstFlags::FLAGS_CAN_FORWARD_REGISTERS;
++      }
++#endif
+     }
+   }
+ }
+diff --git a/FEXCore/Source/Interface/Core/X86Tables/X86Tables.h b/FEXCore/Source/Interface/Core/X86Tables/X86Tables.h
+index 67b8920cbf37aab1ad64b6724540f364cd768714..5a87bb2bd315b812c3179bdae7753d1793b668b4 100644
+--- a/FEXCore/Source/Interface/Core/X86Tables/X86Tables.h
++++ b/FEXCore/Source/Interface/Core/X86Tables/X86Tables.h
+@@ -407,7 +407,11 @@ namespace InstFlags {
+   constexpr InstFlagType FLAGS_CALL = (1ULL << 30);
+   constexpr InstFlagType FLAGS_SUPPORTS_LOCK = (1ULL << 31);
+   constexpr InstFlagType FLAGS_LITERAL_PATCHABLE = (1ULL << 32);
+-  // Flags [57..33]: Undefined
++  constexpr InstFlagType FLAGS_NO_PREFIX_ORDER = (1ULL << 33);
++  // The handler cannot fault or leave the JIT when every operand is a register or immediate.
++  constexpr InstFlagType FLAGS_CAN_FORWARD_REGISTERS = (1ULL << 34);
++
++  // Flags [57..35]: Undefined
+   // Flags [60..58]: Dst size
+   constexpr InstFlagType FLAGS_SIZE_DST_OFF = 58;
+   // Flags [63..61]: Src size
+diff --git a/FEXCore/Source/Interface/IR/IR.json b/FEXCore/Source/Interface/IR/IR.json
+index 2cf73b7241c86bd29019b8454cba233b9e032b8f..be64e8c22a8c55fda7c89e9aa83a29b993ccd93b 100644
+--- a/FEXCore/Source/Interface/IR/IR.json
++++ b/FEXCore/Source/Interface/IR/IR.json
+@@ -577,6 +577,7 @@
+       },
+ 
+       "SSA = LoadMemTSO RegisterClass:$Class, OpSize:#Size, GPR:$Addr, GPR:$Offset, OpSize:$Align, MemOffsetType:$OffsetType, u8:$OffsetScale": {
++        "HasSideEffects": true,
+         "Desc": ["Does a x86 TSO compatible load from memory. Offset must be Invalid()."
+                 ],
+         "Inline": ["", "Memtso"],
+@@ -592,6 +593,7 @@
+       },
+ 
+       "FPR = VLoadVectorMasked OpSize:#RegisterSize, OpSize:#ElementSize, FPR:$Mask, GPR:$Addr, GPR:$Offset, MemOffsetType:$OffsetType, u8:$OffsetScale": {
++        "HasSideEffects": true,
+         "Desc": ["Does a masked load similar to VPMASKMOV/VMASKMOV where the upper bit of each element",
+                  "determines whether or not that element will be loaded from memory"],
+         "ImplicitFlagClobber": true,
+@@ -607,6 +609,7 @@
+         "ElementSize": "ElementSize"
+       },
+       "FPR = VLoadVectorGatherMasked OpSize:#RegisterSize, OpSize:#ElementSize, FPR:$Incoming, FPR:$Mask, GPR:$AddrBase, FPR:$VectorIndexLow, FPR:$VectorIndexHigh, OpSize:$VectorIndexElementSize, u8:$OffsetScale, u8:$DataElementOffsetStart, u8:$IndexElementOffsetStart, OpSize:$AddrSize, i1:$MaskAllOnes{false}": {
++        "HasSideEffects": true,
+         "Desc": [
+           "Does a masked load similar to VPGATHERD* where the upper bit of each element",
+           "determines whether or not that element will be loaded from memory.",
+@@ -622,6 +625,7 @@
+         ]
+       },
+       "FPR = VLoadVectorGatherMaskedQPS OpSize:#RegisterSize, OpSize:#ElementSize, FPR:$Incoming, FPR:$MaskReg, GPR:$AddrBase, FPR:$VectorIndexLow, FPR:$VectorIndexHigh, u8:$OffsetScale, OpSize:$AddrSize, i1:$MaskAllOnes{false}": {
++        "HasSideEffects": true,
+         "Desc": [
+           "Does a masked load similar to VPGATHERQPS where the upper bit of each element",
+           "determines whether or not that element will be loaded from memory.",
+diff --git a/FEXCore/Source/Interface/IR/IREmitter.cpp b/FEXCore/Source/Interface/IR/IREmitter.cpp
+index f305ad3e88a694f8326452316cec781791c3eae1..eea0c64c96dcc6c9be4eda30ed265f4ff896c12c 100644
+--- a/FEXCore/Source/Interface/IR/IREmitter.cpp
++++ b/FEXCore/Source/Interface/IR/IREmitter.cpp
+@@ -94,6 +94,7 @@ void IREmitter::ResetWorkingList() {
+   InvalidNode = reinterpret_cast<Ref>(DualListData.ListAllocate(sizeof(OrderedNode)));
+   memset(InvalidNode, 0, sizeof(OrderedNode));
+   CurrentCodeBlock = nullptr;
++  CachedCodeBlockTail = nullptr;
+ }
+ 
+ void IREmitter::ReplaceAllUsesWithRange(Ref Node, Ref NewNode, AllNodesIterator Begin, AllNodesIterator End) {
+@@ -147,13 +148,16 @@ void IREmitter::RemoveArgUses(Ref Node) {
+ }
+ 
+ void IREmitter::RemovePostRA(Ref Node) {
++  if (Node == CachedCodeBlockTail) {
++    CachedCodeBlockTail = nullptr;
++  }
+   Node->Unlink(DualListData.ListBegin());
+ }
+ 
+ void IREmitter::Remove(Ref Node) {
+   RemoveArgUses(Node);
+ 
+-  Node->Unlink(DualListData.ListBegin());
++  RemovePostRA(Node);
+ }
+ 
+ IREmitter::IRPair<IROp_CodeBlock> IREmitter::CreateNewCodeBlockAfter(Ref insertAfter) {
+@@ -167,7 +171,7 @@ IREmitter::IRPair<IROp_CodeBlock> IREmitter::CreateNewCodeBlockAfter(Ref insertA
+     LOGMAN_THROW_A_FMT(CurrentCodeBlock != nullptr, "CurrentCodeBlock must not be null here");
+ 
+     // Find last block
+-    auto LastBlock = CurrentCodeBlock;
++    auto LastBlock = CachedCodeBlockTail ? CachedCodeBlockTail : CurrentCodeBlock;
+ 
+     while (LastBlock->Header.Next.GetNode(DualListData.ListBegin()) != InvalidNode) {
+       LastBlock = LastBlock->Header.Next.GetNode(DualListData.ListBegin());
+@@ -175,6 +179,7 @@ IREmitter::IRPair<IROp_CodeBlock> IREmitter::CreateNewCodeBlockAfter(Ref insertA
+ 
+     // Append it after the last block
+     LinkCodeBlocks(LastBlock, CodeNode);
++    CachedCodeBlockTail = CodeNode;
+   }
+ 
+   SetWriteCursor(OldCursor);
+diff --git a/FEXCore/Source/Interface/IR/IREmitter.h b/FEXCore/Source/Interface/IR/IREmitter.h
+index aba0c1f5fbcca55952b5dac6da16985366c17a08..00673847ac6ad17624a37c4284c9ae770a4b12e4 100644
+--- a/FEXCore/Source/Interface/IR/IREmitter.h
++++ b/FEXCore/Source/Interface/IR/IREmitter.h
+@@ -392,6 +392,7 @@ public:
+     LOGMAN_THROW_A_FMT(rhs.DualListData.ListBackingSize() <= DualListData.ListBackingSize(), "Trying to take ownership of data that is too "
+                                                                                              "large");
+     DualListData.CopyData(rhs.DualListData);
++    CachedCodeBlockTail = nullptr;
+     InvalidNode = rhs.InvalidNode->Wrapped(rhs.DualListData.ListBegin()).GetNode(DualListData.ListBegin());
+     CurrentWriteCursor = rhs.CurrentWriteCursor;
+     CodeBlocks = rhs.CodeBlocks;
+@@ -521,6 +522,8 @@ protected:
+ 
+   Ref InvalidNode {};
+   Ref CurrentCodeBlock {};
++  // Reachable anchor; explicit insertions may extend the chain after it.
++  Ref CachedCodeBlockTail {};
+   fextl::vector<Ref> CodeBlocks;
+   uint64_t Entry {};
+   bool SupportsTSOImm9 {};
+diff --git a/FEXCore/Source/Interface/IR/Passes/RedundantFlagCalculationElimination.cpp b/FEXCore/Source/Interface/IR/Passes/RedundantFlagCalculationElimination.cpp
+index dc44f1606b4e086e29f89f952b275899017aa1e4..60dd9461733ead00d9749a40aba34181b7460ad4 100644
+--- a/FEXCore/Source/Interface/IR/Passes/RedundantFlagCalculationElimination.cpp
++++ b/FEXCore/Source/Interface/IR/Passes/RedundantFlagCalculationElimination.cpp
+@@ -104,20 +104,22 @@ struct BlockInfo {
+ };
+ 
+ struct ControlFlowGraph {
+-  fextl::vector<BlockInfo> BlockMap;
++  fextl::vector<BlockInfo>& BlockMap;
+   IRListView& IR;
+ 
+   void Init(fextl::deque<uint32_t>& Worklist, uint32_t BlockCount) {
+-    BlockMap.resize(BlockCount);
++    if (BlockMap.size() < BlockCount) {
++      BlockMap.resize(BlockCount);
++    }
+ 
+     for (unsigned ID = 0; ID < BlockCount; ++ID) {
+       // Add the block with conservative flags and already in the worklist.
+-      auto Info = BlockInfo {{}, nullptr, FLAG_ALL, true};
++      auto& Info = BlockMap[ID];
++      Info.Predecessors.clear();
++      Info.Node = nullptr;
++      Info.Flags = FLAG_ALL;
++      Info.InWorklist = true;
+ 
+-      // Add some initial capacity
+-      Info.Predecessors.reserve(2);
+-
+-      BlockMap[ID] = std::move(Info);
+       Worklist.push_back(ID);
+     }
+   }
+@@ -160,6 +162,11 @@ private:
+   CondClass X86ToArmFloatCond(CondClass X86);
+   bool ProcessBlock(IREmitter* IREmit, IRListView& CurrentIR, Ref Block, ControlFlowGraph& CFG);
+   void OptimizeParity(IREmitter* IREmit, IRListView& CurrentIR, ControlFlowGraph& CFG);
++
++  // BlockMap and Worklist are reused across compiles: freeing the worklist's 4 KiB deque block every compile
++  // empties its allocator page, which rpmalloc then decommits and recommits on the next compile.
++  fextl::vector<BlockInfo> BlockMap;
++  fextl::deque<uint32_t> Worklist;
+ };
+ 
+ unsigned DeadFlagCalculationEliminination::FlagsForCondClassType(CondClass Cond) {
+@@ -684,10 +691,9 @@ void DeadFlagCalculationEliminination::Run(IREmitter* IREmit) {
+   FEXCORE_PROFILE_SCOPED("PassManager::DFE");
+ 
+   auto CurrentIR = IREmit->ViewIR();
+-  fextl::deque<uint32_t> Worklist;
+ 
+   // Initialize CFG
+-  ControlFlowGraph CFG {.IR = CurrentIR};
++  ControlFlowGraph CFG {.BlockMap = BlockMap, .IR = CurrentIR};
+   CFG.Init(Worklist, CurrentIR.GetHeader()->BlockCount);
+ 
+   // Gather CFG
+diff --git a/FEXCore/Source/Interface/IR/Passes/RegisterAllocationPass.cpp b/FEXCore/Source/Interface/IR/Passes/RegisterAllocationPass.cpp
+index c47998aec874f8696c71c5acb618cb1f3d0ebef0..d3fd1422058ec7561361c6558e4e7538115a7756 100644
+--- a/FEXCore/Source/Interface/IR/Passes/RegisterAllocationPass.cpp
++++ b/FEXCore/Source/Interface/IR/Passes/RegisterAllocationPass.cpp
+@@ -31,6 +31,10 @@ namespace {
+     // allocated to R. Else, RegToSSA[R] is UNDEFINED, no need to clear this
+     // when freeing registers.
+     Ref RegToSSA[32];
++    uint32_t SRAEpoch[32];
++    // Bit R is set once a Pop has been allowed to update the SRA register R in
++    // place ahead of the store currently recorded in RegToSSA[R].
++    uint32_t SRAPopClaimed;
+   };
+ 
+   IR::RegClass GetRegClassFromNode(const IR::IROp_Header* IROp) {
+@@ -500,7 +504,10 @@ bool ConstrainedRAPass::TryPostRAMerge(Ref LastNode, Ref CodeNode, IROp_Header*
+   } else if (IROp->Op == OP_POP) {
+     auto SP = PhysicalRegister(IROp->Args[0]);
+ 
+-    if (LastOp->Op == OP_POP && LastOp->Size == IROp->Size && IROp->Size >= OpSize::i32Bit && SP == PhysicalRegister(LastOp->Args[0])) {
++    // Two pops that each advance the SRA stack pointer in place belong to separate guest instructions;
++    // an `ldp` faulting on the second load would report the first one, so only merge pops through a temporary.
++    if (LastOp->Op == OP_POP && LastOp->Size == IROp->Size && IROp->Size >= OpSize::i32Bit && SP == PhysicalRegister(LastOp->Args[0]) &&
++        SP.AsRegClass() != RegClass::GPRFixed) {
+       IREmit->SetWriteCursorBefore(LastNode);
+       IREmit->_PopTwo(IROp->Size, IROp->Args[0], LastOp->Args[1], IROp->Args[1]);
+       IREmit->RemovePostRA(CodeNode);
+@@ -512,7 +519,7 @@ bool ConstrainedRAPass::TryPostRAMerge(Ref LastNode, Ref CodeNode, IROp_Header*
+     if (!Op->Upper.IsInvalid() && PhysicalRegister(Op->Upper) == PhysicalRegister(LastNode)) {
+       if (IROp->Op == OP_DIV ? IsSignext(LastOp, Op->Lower, IROp->Size) : IsZero(LastOp)) {
+         Op->Upper.SetInvalid();
+-        return PhysicalRegister(LastNode) == PhysicalRegister(Op->OutRemainder);
++        return !Op->OutRemainder.IsInvalid() && PhysicalRegister(LastNode) == PhysicalRegister(Op->OutRemainder);
+       }
+     }
+   } else if (IROp->Op == OP_XGETBV && PhysicalRegister(IROp->Args[0]) == PhysicalRegister(LastNode) && LastOp->Op == OP_CONSTANT) {
+@@ -590,6 +597,7 @@ void ConstrainedRAPass::Run(IREmitter* IREmit_) {
+     // At the start of each block, all registers are available.
+     for (auto& Class : Classes) {
+       Class.Available = (1u << Class.Count) - 1;
++      Class.SRAPopClaimed = 0;
+     }
+ 
+     auto BlockIROp = BlockHeader->CW<IR::IROp_CodeBlock>();
+@@ -600,6 +608,7 @@ void ConstrainedRAPass::Run(IREmitter* IREmit_) {
+       // We grab these nodes this way so we can iterate easily
+       auto CodeBegin = IR->at(BlockIROp->Begin);
+       auto CodeLast = IR->at(BlockIROp->Last);
++      uint32_t Epoch = 0;
+ 
+       while (1) {
+         auto [CodeNode, IROp] = CodeLast();
+@@ -613,6 +622,8 @@ void ConstrainedRAPass::Run(IREmitter* IREmit_) {
+ 
+           PreferredReg[IR->GetID(Node).Value] = Reg;
+           GetClass(Reg)->RegToSSA[Reg.Reg] = CodeNode;
++          GetClass(Reg)->SRAEpoch[Reg.Reg] = Epoch;
++          GetClass(Reg)->SRAPopClaimed &= ~(1u << Reg.Reg);
+         }
+ 
+         // Coalescing an SRA store is equivalent to hoisting the store,
+@@ -628,11 +639,51 @@ void ConstrainedRAPass::Run(IREmitter* IREmit_) {
+           auto Node = GetClass(Reg)->RegToSSA[Reg.Reg];
+           IROp_Header* Header = IR->GetOp<IROp_Header>(Node);
+ 
+-          if (CodeNode != DecodeSRANode(Header, Node)) {
++          if (CodeNode != DecodeSRANode(Header, Node) || GetClass(Reg)->SRAEpoch[Reg.Reg] != Epoch) {
+             PreferredReg[IR->GetID(CodeNode).Value] = PhysicalRegister::Invalid();
+           }
+         }
+ 
++        // A coalesced store must not become visible before an intervening fault
++        // or guest boundary. x87 predicate loads and memory broadcasts need
++        // explicit barriers because they are not marked HasSideEffects in IR.
++        // Increment after checking this node: a faulting load may still write
++        // its own destination directly, since a failed load does not commit it.
++        //
++        // Likewise a faulting Pop leaves its in/out address unchanged: the
++        // post-indexed writeback is not committed. So when the address is the SRA register's own value
++        // (an RMWHandle of a LoadRegister of that register, so the handle is a
++        // no-op) and this Pop is the only fault point before that value's SRA
++        // store, the Pop may advance the SRA register in place. Only one Pop
++        // may claim this per store, so a later Pop in the same span can never
++        // see a partially advanced SP.
++        if (IROp->Op == OP_POP) {
++          auto Addr = IROp->Args[0];
++          Addr.ClearKill();
++          const auto AddrNode = IR->GetNode(Addr);
++          const auto AddrOp = IR->GetOp<IROp_Header>(AddrNode);
++          if (auto Reg = PreferredReg[Addr.ID().Value]; !Reg.IsInvalid() && AddrOp->Op == OP_RMWHANDLE) {
++            auto Source = AddrOp->Args[0];
++            Source.ClearKill();
++            const auto SourceNode = IR->GetNode(Source);
++            const auto SourceOp = IR->GetOp<IROp_Header>(SourceNode);
++            auto Class = GetClass(Reg);
++            auto Store = Class->RegToSSA[Reg.Reg];
++            if (SourceOp->Op == OP_LOADREGISTER && DecodeSRAReg(SourceOp, SourceNode) == Reg &&
++                AddrNode == DecodeSRANode(IR->GetOp<IROp_Header>(Store), Store) && Class->SRAEpoch[Reg.Reg] == Epoch &&
++                !(Class->SRAPopClaimed & (1u << Reg.Reg))) {
++              Class->SRAEpoch[Reg.Reg] = Epoch + 1;
++              Class->SRAPopClaimed |= 1u << Reg.Reg;
++            }
++          }
++        }
++
++        // CarryInvert only flips host NZCV.C, so it is neither a fault point nor a guest boundary.
++        if ((IR::HasSideEffects(IROp->Op) && !DecodeSRANode(IROp, CodeNode) && IROp->Op != OP_CARRYINVERT) ||
++            IROp->Op == OP_LOADMEMX87SVEOPTPREDICATE || IROp->Op == OP_VBROADCASTFROMMEM) {
++          ++Epoch;
++        }
++
+         const int NumArgs = IR::GetRAArgs(IROp->Op);
+         for (int i = NumArgs - 1; i >= 0; --i) {
+           const auto& Arg = IROp->Args[i];
+diff --git a/FEXCore/Source/Interface/IR/Passes/x87StackOptimizationPass.cpp b/FEXCore/Source/Interface/IR/Passes/x87StackOptimizationPass.cpp
+index 20c96d649c04854d216f59dc8e2e47e7b441b1e8..c6dd477a86a46e251e0004cf0d4757478c11dcf5 100644
+--- a/FEXCore/Source/Interface/IR/Passes/x87StackOptimizationPass.cpp
++++ b/FEXCore/Source/Interface/IR/Passes/x87StackOptimizationPass.cpp
+@@ -687,11 +687,16 @@ Ref X87StackOptimization::SynchronizeStackValues() {
+   // Before leaving we need to write the current values in the stack to
+   // context so that the values are correct. Copy SourceDataNode in the
+   // stack to the respective mmX register.
++  // On the fast path TopValueCache/TopValidCache are only filled here and flushed right after, and
++  // every direct x87 context writer first leaves the fast path or reinitializes the stack. With TOP
++  // unchanged they therefore describe the context as of the previous synchronization in this block,
++  // so only slots and tags that changed since then are written. A TOP change above went through
++  // SetTopWithCache_Slow, which cleared both caches.
+   Ref TopValue = GetTopWithCache_Slow();
+   for (size_t i = 0; i < StackData.size; ++i) {
+     const auto& [Valid, StackMember] = StackData.top(i);
+ 
+-    if (Valid == StackSlot::VALID) {
++    if (Valid == StackSlot::VALID && TopValueCache[i] != StackMember.StackDataNode) {
+       StoreStackValueAtOffset_Slow(StackMember.StackDataNode, i, false);
+     }
+   }
+@@ -699,12 +704,16 @@ Ref X87StackOptimization::SynchronizeStackValues() {
+     uint8_t ValidMask = StackData.getValidMask();
+     uint8_t InvalidMask = StackData.getInvalidMask();
+     for (auto& Elem : TopValidCache) {
+-      Elem = (ValidMask & 1) ? StackSlot::VALID : ((InvalidMask & 1) ? StackSlot::INVALID : StackSlot::UNUSED);
++      const auto New = (ValidMask & 1) ? StackSlot::VALID : ((InvalidMask & 1) ? StackSlot::INVALID : StackSlot::UNUSED);
++      // UNUSED leaves the context tag alone, so only a changed known tag needs an FTW update.
++      if (New != StackSlot::UNUSED && New != Elem) {
++        FlushValidPending = true;
++      }
++      Elem = New;
+ 
+       ValidMask >>= 1;
+       InvalidMask >>= 1;
+     }
+-    FlushValidPending = true;
+   }
+ 
+   return TopValue;
