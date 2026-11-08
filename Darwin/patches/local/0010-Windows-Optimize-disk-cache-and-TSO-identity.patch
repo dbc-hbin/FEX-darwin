@@ -1,0 +1,1450 @@
+Subject: [PATCH 8/9] Immutable cache extents, snapshot ownership and effective TSO identity
+
+Base-commit: 14c92681f4d62cf84d901460e0358de09c8847a7
+Prerequisites: five pinned Hadron patches, local/0001 and local/0002,
+and all earlier numbered patches in this series.
+
+Apply local/0003 through local/0011 in Portfile order before building.
+Shared declarations and frontend/backend changes cross patch boundaries;
+individual patches are not standalone builds.
+
+Maintain immutable cache extents, snapshot ownership and effective TSO identity.
+The existing Wine ABI, 64KB guards and default settings are preserved.
+The iOS-only relocated guest window has been removed.
+Rebuild and install both PE DLLs and native Unix helpers together.
+
+MIT License
+
+Copyright (c) 2026 dbc-hbin (Darwin modifications)
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+
+---
+diff --git a/FEXCore/Source/Interface/Context/Context.h b/FEXCore/Source/Interface/Context/Context.h
+index b0ddde110a3209460863f146fd45357bfbcdee24..7eeb5d2617547be49ee26a8b3fd5fca807611b35 100644
+--- a/FEXCore/Source/Interface/Context/Context.h
++++ b/FEXCore/Source/Interface/Context/Context.h
+@@ -207,7 +207,7 @@ public:
+ 
+   void InitDiskCache() override {
+ #ifdef _WIN32
+-    // Windows probes hardware TSO after constructing the context, before creating guest threads.
++    // Initialize after Windows has finalized its effective hardware TSO state.
+     if (!DiskCacheInitialized) {
+       DiskCache.Init(this);
+       DiskCacheInitialized = true;
+@@ -433,7 +433,8 @@ public:
+     bool NeedsAddGuestCodeRanges;
+   };
+   [[nodiscard]]
+-  CompileCodeResult CompileCode(FEXCore::Core::InternalThreadState* Thread, uint64_t GuestRIP, uint64_t MaxInst = 0);
++  CompileCodeResult CompileCode(FEXCore::Core::InternalThreadState* Thread, uint64_t GuestRIP, uint64_t MaxInst,
++                                const std::optional<ExecutableFileSectionInfo>& Region);
+   uintptr_t CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_t GuestRIP, uint64_t MaxInst = 0);
+   uintptr_t CompileSingleStep(FEXCore::Core::CpuStateFrame* Frame, uint64_t GuestRIP);
+ 
+@@ -464,7 +465,7 @@ public:
+   }
+ 
+   bool HasHardwareTSOSupport() const {
+-    return SupportsHardwareTSO;
++    return SupportsHardwareTSO || HostFeatures.SupportsHardwareTSO;
+   }
+ 
+   void EnableExitOnHLT() override {
+@@ -483,7 +484,7 @@ public:
+ 
+ protected:
+   void UpdateAtomicTSOEmulationConfig() {
+-    if (SupportsHardwareTSO) {
++    if (SupportsHardwareTSO || HostFeatures.SupportsHardwareTSO) {
+       // If the hardware supports TSO then we don't need to emulate it through atomics.
+       AtomicTSOEmulationEnabled = false;
+       VectorAtomicTSOEmulationEnabled = false;
+diff --git a/FEXCore/Source/Interface/Core/CodeCache.cpp b/FEXCore/Source/Interface/Core/CodeCache.cpp
+index c7dda6ef935dbec576e0cb59d7aa3861f3b8d7fa..8cb846eac06f12aa4987e7b6a853ac36eeba3ba5 100644
+--- a/FEXCore/Source/Interface/Core/CodeCache.cpp
++++ b/FEXCore/Source/Interface/Core/CodeCache.cpp
+@@ -431,7 +431,7 @@ void CodeCache::Validate(const ExecutableFileSectionInfo& Section, fextl::set<ui
+       .subspan(0, CachedCode.size_bytes());
+ 
+   while (!GuestBlocks.empty()) {
+-    auto [CompiledBlocks, _, _2, _3, _4] = ValidationCTX->CompileCode(ValidationThread.get(), *GuestBlocks.begin(), 0 /* TODO: Set MaxInst? */);
++    auto [CompiledBlocks, _, _2, _3, _4] = ValidationCTX->CompileCode(ValidationThread.get(), *GuestBlocks.begin(), 0, Section);
+     for (auto& Entry : CompiledBlocks.EntryPoints) {
+       GuestBlocks.erase(Entry.first);
+     }
+@@ -575,46 +575,83 @@ bool CodeCache::ApplyPackedCodeRelocations(uint64_t GuestEntry, std::span<std::b
+                                            std::span<const DiskCache::BlobSmallRelocation> SmallRelocs,
+                                            std::span<const DiskCache::BlobThunkRelocation> ThunkRelocs) {
+   CPU::Arm64Emitter Emitter(&CTX, Code.data(), Code.size_bytes());
++  // Packed relocations are read from the on-disk cache. Validate every field that drives a write in all build types:
++  // a literal writes 8 bytes and a padded constant move writes four instructions.
++  constexpr size_t LiteralSize = sizeof(uint64_t);
++  constexpr size_t MoveSize = 4 * sizeof(uint32_t);
++  const auto Fits = [&](uint32_t Offset, size_t WriteSize) {
++    return WriteSize <= Code.size_bytes() && Offset <= Code.size_bytes() - WriteSize;
++  };
++  const auto ValidRegister = [](uint8_t RegisterIndex) {
++    return RegisterIndex < 32;
++  };
++  const auto ValidValueSize = [](uint8_t ValueSize) {
++    return ValueSize == 1 || ValueSize == 2 || ValueSize == 4 || ValueSize == 8;
++  };
+   for (auto& Reloc : SmallRelocs) {
+-    LOGMAN_THROW_A_FMT(Reloc.Offset < Code.size_bytes(), "Invalid relocation offset");
+     Emitter.SetCursorOffset(Reloc.Offset);
+     switch ((CPU::RelocationTypes)Reloc.Type) {
+     case FEXCore::CPU::RelocationTypes::RELOC_NAMED_SYMBOL_LITERAL: {
++      if (!Fits(Reloc.Offset, LiteralSize)) {
++        return false;
++      }
+       ApplySymbolLiteralRelocation(CTX, (CPU::RelocNamedSymbolLiteral::NamedSymbol)Reloc.Named.Symbol, GuestEntry, Emitter, false);
+       break;
+     }
+     case FEXCore::CPU::RelocationTypes::RELOC_GUEST_RIP_LITERAL: {
++      if (!Fits(Reloc.Offset, LiteralSize)) {
++        return false;
++      }
+       ApplyRIPLiteralRelocation(CTX, Reloc.RIPLiteral.GuestRIP, GuestEntry, Emitter);
+       break;
+     }
+     case FEXCore::CPU::RelocationTypes::RELOC_GUEST_RIP_MOVE: {
++      if (!Fits(Reloc.Offset, MoveSize) || !ValidRegister(Reloc.RIPMove.RegisterIndex)) {
++        return false;
++      }
+       ApplyRIPMoveRelocation(CTX, Reloc.RIPMove.GuestRIP, Reloc.RIPMove.RegisterIndex, GuestEntry, Emitter);
+       break;
+     }
+     case FEXCore::CPU::RelocationTypes::RELOC_GUEST_PATCHABLE_DATA_MOVE: {
++      if (!Fits(Reloc.Offset, MoveSize) || !ValidRegister(Reloc.PatchableData.RegisterIndex) ||
++          !ValidValueSize(Reloc.PatchableData.ValueSize)) {
++        return false;
++      }
+       ApplyPatchableDataRelocation(GuestEntry + Reloc.PatchableData.SiteOffset, Reloc.PatchableData.ValueSize,
+                                    Reloc.PatchableData.RegisterIndex, Emitter);
+       break;
+     }
+     case FEXCore::CPU::RelocationTypes::RELOC_GUEST_PATCHABLE_RIP_LITERAL: {
++      if (!Fits(Reloc.Offset, LiteralSize) || !ValidValueSize(Reloc.PatchableData.ValueSize)) {
++        return false;
++      }
+       ApplyPatchableRIPLiteralRelocation(GuestEntry + Reloc.PatchableData.SiteOffset, Reloc.PatchableData.ValueSize, Emitter);
+       break;
+     }
+     case FEXCore::CPU::RelocationTypes::RELOC_GUEST_PATCHABLE_RIP_MOVE: {
++      if (!Fits(Reloc.Offset, MoveSize) || !ValidRegister(Reloc.PatchableData.RegisterIndex) ||
++          !ValidValueSize(Reloc.PatchableData.ValueSize)) {
++        return false;
++      }
+       ApplyPatchableRIPMoveRelocation(GuestEntry + Reloc.PatchableData.SiteOffset, Reloc.PatchableData.ValueSize,
+                                       Reloc.PatchableData.RegisterIndex, Emitter);
+       break;
+     }
+     case FEXCore::CPU::RelocationTypes::RELOC_GUEST_PATCHABLE_CRC_MOVE: {
++      if (!Fits(Reloc.Offset, MoveSize) || !ValidRegister(Reloc.PatchableData.RegisterIndex) || !Reloc.PatchableData.ValueSize) {
++        return false;
++      }
+       ApplyPatchableCRCMoveRelocation(GuestEntry + Reloc.PatchableData.SiteOffset, Reloc.PatchableData.ValueSize,
+                                       Reloc.PatchableData.RegisterIndex, Emitter);
+       break;
+     }
+-    default: ERROR_AND_DIE_FMT("Unknown packed relocation type {}", ToUnderlying((CPU::RelocationTypes)Reloc.Type));
++    default: return false;
+     }
+   }
+   for (auto& Reloc : ThunkRelocs) {
+-    LOGMAN_THROW_A_FMT(Reloc.Offset < Code.size_bytes(), "Invalid relocation offset");
++    if (!Fits(Reloc.Offset, MoveSize) || !ValidRegister(Reloc.RegisterIndex)) {
++      return false;
++    }
+     Emitter.SetCursorOffset(Reloc.Offset);
+     if (!ApplyThunkMoveRelocation(CTX, (const IR::SHA256Sum*)Reloc.SymbolHash, Reloc.RegisterIndex, Emitter, false)) {
+       return false;
+diff --git a/FEXCore/Source/Interface/Core/Core.cpp b/FEXCore/Source/Interface/Core/Core.cpp
+index fdcff3a2097ff8027cc679913ddbf43b5aed3087..49b9c1422d8e9004893c60b0937baf86c18d6af9 100644
+--- a/FEXCore/Source/Interface/Core/Core.cpp
++++ b/FEXCore/Source/Interface/Core/Core.cpp
+@@ -630,14 +630,8 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
+       }
+ #endif
+ 
+-      bool BlockInForceTSOValidRange = false;
+-      auto InstForceTSOIt = ForceTSOInstructions.end();
+-      if (ForceTSOValidRanges.Contains({Block.Entry, Block.Entry + Block.Size})) {
+-        if (auto It = ForceTSOInstructions.lower_bound(Block.Entry); It != ForceTSOInstructions.end() && *It < Block.Entry + Block.Size) {
+-          InstForceTSOIt = It;
+-          BlockInForceTSOValidRange = true;
+-        }
+-      }
++      auto TSORange = ForceTSOValidRanges.Query(Block.Entry);
++      auto InstForceTSOIt = ForceTSOInstructions.lower_bound(Block.Entry);
+ 
+       // Set the block entry point
+       Thread->OpDispatcher->SetNewBlockIfChanged(Block.Entry);
+@@ -841,8 +835,9 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
+             ++TotalInstructions;
+ 
+             // Walk InstForceTSOIt forward past the handled instruction
+-            InstForceTSOIt =
+-              std::find_if(InstForceTSOIt, ForceTSOInstructions.end(), [&](auto Val) { return Val >= Block.Entry + BlockInstructionsLength; });
++            while (InstForceTSOIt != ForceTSOInstructions.end() && *InstForceTSOIt < Block.Entry + BlockInstructionsLength) {
++              ++InstForceTSOIt;
++            }
+           }
+         } else {
+           // Invalid instruction
+@@ -931,13 +926,10 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
+   };
+ }
+ 
+-ContextImpl::CompileCodeResult ContextImpl::CompileCode(FEXCore::Core::InternalThreadState* Thread, uint64_t GuestRIP, uint64_t MaxInst) {
+-  if (SourcecodeResolver && Config.GDBSymbols()) {
+-    auto MappedSection = SyscallHandler->LookupExecutableFileSection(Thread, GuestRIP);
+-    if (MappedSection) {
+-      MappedSection->FileInfo.SourcecodeMap =
+-        SourcecodeResolver->GenerateMap(MappedSection->FileInfo.Filename, CodeMap::GetBaseFilename(MappedSection->FileInfo, false));
+-    }
++ContextImpl::CompileCodeResult ContextImpl::CompileCode(FEXCore::Core::InternalThreadState* Thread, uint64_t GuestRIP, uint64_t MaxInst,
++                                                        const std::optional<ExecutableFileSectionInfo>& Region) {
++  if (SourcecodeResolver && Config.GDBSymbols() && Region) {
++    Region->FileInfo.SourcecodeMap = SourcecodeResolver->GenerateMap(Region->FileInfo.Filename, CodeMap::GetBaseFilename(Region->FileInfo, false));
+   }
+ 
+   // Generate IR + Meta Info
+@@ -1017,12 +1009,12 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
+     return HostCode;
+   }
+ 
+-  Thread->FrontendDecoder->SetupDecodeInstructionsAtEntry(Thread, GuestRIP, MaxInst);
+-
+-  std::optional<ExecutableFileSectionInfo> Region = SyscallHandler->LookupExecutableFileSection(Thread, GuestRIP);
++  const bool NeedSection = DiskCache.IsReadingDiskCache() || (CodeMapWriter && !CodeCache.IsGeneratingCache) ||
++                           Config.BlockJITNaming() || Config.LibraryJITNaming() || Config.GDBSymbols();
++  auto Region = Thread->FrontendDecoder->SetupDecodeInstructionsAtEntry(Thread, GuestRIP, MaxInst, NeedSection);
+   std::optional<DiskCache::CodeHitData> Hit;
+   std::optional<uint64_t> DiskCacheGuestCodeKey;
+-  {
++  if (DiskCache.IsReadingDiskCache()) {
+     FEXCORE_PROFILE_ACCUMULATION(Thread, AccumulatedDiskCacheLookupTime);
+     Hit = DiskCache.Lookup(Thread, Region, GuestRIP, DiskCacheGuestCodeKey);
+     if (Hit && !DiskCache.IsValidating()) {
+@@ -1036,11 +1028,14 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
+ 
+         LOGMAN_THROW_A_FMT(Hit->EntryPointRIPs.size() == Hit->EntryPointHostOffsets.size(), "Mismatched Disk Cache entrypoint pairs!");
+ 
++        auto EntryPoints = std::views::iota(size_t {0}, Hit->EntryPointRIPs.size()) | std::views::transform([&](size_t i) {
++                             return std::pair {Hit->EntryPointRIPs[i], LoadedCode.BlockBegin + Hit->EntryPointHostOffsets[i]};
++                           });
++        Thread->LookupCache->AddBlockMappings(Thread, EntryPoints, Hit->GuestPages);
++
+         uintptr_t CachedHostCode = 0;
+-        for (size_t i = 0; i < Hit->EntryPointRIPs.size(); i++) {
+-          void* HostAddr = LoadedCode.BlockBegin + Hit->EntryPointHostOffsets[i];
+-          Thread->LookupCache->AddBlockMapping(Thread, Hit->EntryPointRIPs[i], Hit->GuestPages, HostAddr);
+-          if (Hit->EntryPointRIPs[i] == GuestRIP) {
++        for (const auto& [GuestAddr, HostAddr] : EntryPoints) {
++          if (GuestAddr == GuestRIP) {
+             CachedHostCode = reinterpret_cast<uintptr_t>(HostAddr);
+           }
+         }
+@@ -1061,7 +1056,7 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
+   // Accumulate a JIT count now, as even if another thread raced us, it should count as a compile.
+   FEXCORE_PROFILE_INSTANT_INCREMENT(Thread, AccumulatedJITCount, 1);
+ 
+-  auto [CompiledCode, DebugData, StartAddr, Length, NeedsAddGuestCodeRanges] = CompileCode(Thread, GuestRIP, MaxInst);
++  auto [CompiledCode, DebugData, StartAddr, Length, NeedsAddGuestCodeRanges] = CompileCode(Thread, GuestRIP, MaxInst, Region);
+   auto CodePtr = CompiledCode.EntryPoints[GuestRIP];
+   if (CodePtr == nullptr) {
+     return 0;
+@@ -1081,38 +1076,30 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
+   if (Config.BlockJITNaming()) {
+     auto FragmentBasePtr = CompiledCode.BlockBegin;
+ 
+-    auto GuestRIPLookup = SyscallHandler->LookupExecutableFileSection(Thread, GuestRIP);
+-
+     if (DebugData->Subblocks.size()) {
+       for (auto& Subblock : DebugData->Subblocks) {
+         auto BlockBasePtr = FragmentBasePtr + Subblock.HostCodeOffset;
+-        if (GuestRIPLookup) {
+-          Symbols.Register(Thread->SymbolBuffer.get(), BlockBasePtr, CompiledCode.Size, GuestRIPLookup->FileInfo.Filename,
+-                           GuestRIP - GuestRIPLookup->FileStartVA);
++        if (Region) {
++          Symbols.Register(Thread->SymbolBuffer.get(), BlockBasePtr, CompiledCode.Size, Region->FileInfo.Filename, GuestRIP - Region->FileStartVA);
+         } else {
+           Symbols.Register(Thread->SymbolBuffer.get(), BlockBasePtr, GuestRIP, Subblock.HostCodeSize);
+         }
+       }
+     } else {
+-      if (GuestRIPLookup) {
+-        Symbols.Register(Thread->SymbolBuffer.get(), FragmentBasePtr, CompiledCode.Size, GuestRIPLookup->FileInfo.Filename,
+-                         GuestRIP - GuestRIPLookup->FileStartVA);
++      if (Region) {
++        Symbols.Register(Thread->SymbolBuffer.get(), FragmentBasePtr, CompiledCode.Size, Region->FileInfo.Filename, GuestRIP - Region->FileStartVA);
+       } else {
+         Symbols.Register(Thread->SymbolBuffer.get(), FragmentBasePtr, GuestRIP, CompiledCode.Size);
+       }
+     }
+   }
+ 
+-  if (Config.LibraryJITNaming() || Config.GDBSymbols()) {
+-    auto MappedSection = SyscallHandler->LookupExecutableFileSection(Thread, GuestRIP);
+-    if (MappedSection) {
+-      if (Config.LibraryJITNaming()) {
+-        Symbols.RegisterNamedRegion(Thread->SymbolBuffer.get(), CodePtr, DebugData->HostCodeSize, MappedSection->FileInfo.Filename);
+-      }
+-
+-      if (Config.GDBSymbols()) {
+-        GDBJITRegister(MappedSection->FileInfo, MappedSection->FileStartVA, GuestRIP, (uintptr_t)CodePtr, *DebugData);
+-      }
++  if (Region) {
++    if (Config.LibraryJITNaming()) {
++      Symbols.RegisterNamedRegion(Thread->SymbolBuffer.get(), CodePtr, DebugData->HostCodeSize, Region->FileInfo.Filename);
++    }
++    if (Config.GDBSymbols()) {
++      GDBJITRegister(Region->FileInfo, Region->FileStartVA, GuestRIP, (uintptr_t)CodePtr, *DebugData);
+     }
+   }
+ 
+@@ -1172,8 +1159,8 @@ uintptr_t ContextImpl::CompileSingleStep(FEXCore::Core::CpuStateFrame* Frame, ui
+   // Invalidate might take a unique lock on this, to guarantee that during invalidation no code gets compiled
+   auto lk = GuardSignalDeferringSection<std::shared_lock>(CodeInvalidationMutex, Thread);
+ 
+-  Thread->FrontendDecoder->SetupDecodeInstructionsAtEntry(Thread, GuestRIP, 1);
+-  auto [CompiledCode, DebugData, StartAddr, Length, _] = CompileCode(Thread, GuestRIP, 1);
++  auto Region = Thread->FrontendDecoder->SetupDecodeInstructionsAtEntry(Thread, GuestRIP, 1, SourcecodeResolver && Config.GDBSymbols());
++  auto [CompiledCode, DebugData, StartAddr, Length, _] = CompileCode(Thread, GuestRIP, 1, Region);
+   auto CodePtr = CompiledCode.EntryPoints[GuestRIP];
+   if (CodePtr == nullptr) {
+     return 0;
+@@ -1302,7 +1289,7 @@ void ContextImpl::RemoveForceTSOInformation(uint64_t Address, uint64_t Size) {
+   LogMan::Throw::AFmt(CodeInvalidationMutex.try_lock() == false, "CodeInvalidationMutex needs to be unique_locked here");
+ 
+   ForceTSOValidRanges.Remove({Address, Address + Size});
+-  ForceTSOInstructions.erase(ForceTSOInstructions.lower_bound(Address), ForceTSOInstructions.upper_bound(Address + Size));
++  ForceTSOInstructions.erase(ForceTSOInstructions.lower_bound(Address), ForceTSOInstructions.lower_bound(Address + Size));
+ }
+ 
+ void ContextImpl::MarkMonoBackpatcherBlock(uint64_t BlockEntry) {
+diff --git a/FEXCore/Source/Interface/Core/DiskCache.cpp b/FEXCore/Source/Interface/Core/DiskCache.cpp
+index 8fb85642f675d48c37c652816664b5357c18e93f..e0c689fc7ba97a8f2ccbad99e2ed487fe2cb1574 100644
+--- a/FEXCore/Source/Interface/Core/DiskCache.cpp
++++ b/FEXCore/Source/Interface/Core/DiskCache.cpp
+@@ -3,10 +3,10 @@
+ #define XXH_STATIC_LINKING_ONLY
+ 
+ #include "Interface/Core/Frontend.h"
++#include "Interface/Core/DiskCache.h"
+ #include "Interface/Context/Context.h"
+ 
+ #include <FEXCore/Config/Config.h>
+-#include <FEXCore/Core/DiskCache.h>
+ #include <FEXCore/Core/DiskCacheFileMapper.h>
+ #include <FEXCore/fextl/memory.h>
+ #include <FEXCore/fextl/string.h>
+@@ -22,6 +22,15 @@
+ #include <cstring>
+ #include <atomic>
+ 
++#ifdef _WIN32
++#include <winternl.h>
++extern "C" NTSTATUS RtlUnicodeToUTF8N(PCHAR, ULONG, PULONG, PCWCH, ULONG);
++extern "C" NTSTATUS WINAPI NtQueryAttributesFile(const OBJECT_ATTRIBUTES*, FILE_BASIC_INFORMATION*);
++extern "C" NTSTATUS WINAPI NtCreateSection(HANDLE*, ACCESS_MASK, const OBJECT_ATTRIBUTES*, const LARGE_INTEGER*, ULONG, ULONG, HANDLE);
++extern "C" NTSTATUS WINAPI NtMapViewOfSection(HANDLE, HANDLE, void**, ULONG_PTR, SIZE_T, const LARGE_INTEGER*, SIZE_T*, ULONG, ULONG, ULONG);
++extern "C" NTSTATUS WINAPI NtUnmapViewOfSection(HANDLE, void*);
++#endif
++
+ namespace FEXCore {
+ 
+ namespace DiskCache {
+@@ -176,15 +185,45 @@ namespace DiskCache {
+     }
+ 
+     File::File::FileHandleType CacheFileHandle = CacheFOZ.GetHandle();
+-    if (FileMapper && CacheFileHandle != (File::File::FileHandleType)-1) {
+-      CacheFileMapping = reinterpret_cast<uint8_t*>(FileMapper(CacheFileHandle, ReadOnly ? CacheFOZ.Size() : BIG_MAPPING_SIZE));
+-      CacheFileSize = CacheFOZ.Size();
++    const ssize_t FileSize = CacheFOZ.Size();
++    if (MapDiskCacheFiles && FileSize > 0 && CacheFileHandle != (File::File::FileHandleType)-1) {
++      CacheFileSize = FileSize;
++      if (FileMapper) {
++        CacheFileMappingSize = ReadOnly ? FileSize : BIG_MAPPING_SIZE;
++        CacheFileMapping = reinterpret_cast<uint8_t*>(FileMapper(CacheFileHandle, CacheFileMappingSize));
++      }
++#ifdef _WIN32
++      else {
++        // FOZ is append-only. Keep this read-only snapshot fixed; later appends use positional reads.
++        LARGE_INTEGER MappingSize {.QuadPart = FileSize};
++        HANDLE Mapping;
++        if (NtCreateSection(&Mapping, SECTION_MAP_READ, nullptr, &MappingSize, PAGE_READONLY, SEC_COMMIT, CacheFileHandle) >= 0) {
++          void* View = nullptr;
++          SIZE_T ViewSize = FileSize;
++          const auto Status = NtMapViewOfSection(Mapping, GetCurrentProcess(), &View, 0, 0, nullptr, &ViewSize, /* ViewUnmap */ 2, 0, PAGE_READONLY);
++          NtClose(Mapping);
++          if (Status >= 0) {
++            CacheFileMapping = static_cast<uint8_t*>(View);
++            CacheFileMappingSize = FileSize;
++            OwnsCacheFileMapping = true;
++          }
++        }
++      }
++#endif
+     }
+ 
+     this->ReadOnly = ReadOnly;
+     return true;
+   }
+ 
++  IndexedDB::~IndexedDB() {
++#ifdef _WIN32
++    if (OwnsCacheFileMapping) {
++      NtUnmapViewOfSection(GetCurrentProcess(), CacheFileMapping);
++    }
++#endif
++  }
++
+   void IndexedDB::PopulateIndex(Index& CacheIndex, bool& FoundMetadata) {
+     fextl::vector<uint8_t> Data;
+     if (!IndexFOZ.ReadAll(Data)) {
+@@ -230,13 +269,17 @@ namespace DiskCache {
+       const auto* GuestExtents = reinterpret_cast<const uint32_t*>(IndexDataStart + ReadOffset);
+       ReadOffset += IndexBlobExtra->GuestExtentsCount * sizeof(uint32_t);
+       if (FOZKey->bytes[39] != 0xFF) {
++        // Extents are (offset, length) pairs; an odd count would read past the entry.
++        if (IndexBlobExtra->GuestExtentsCount & 1) {
++          continue;
++        }
+         IndexEntry NewEntry {this, IndexBlobCommon->cache_db_file_offset, IndexBlobCommon->size, IndexBlobExtra->GuestSize,
+                              IndexBlobExtra->GuestHash};
+-        NewEntry.GuestExtents.resize(IndexBlobExtra->GuestExtentsCount);
+-        memcpy(NewEntry.GuestExtents.data(), GuestExtents, IndexBlobExtra->GuestExtentsCount * sizeof(uint32_t));
++        fextl::vector<uint32_t> Extents(IndexBlobExtra->GuestExtentsCount);
++        memcpy(Extents.data(), GuestExtents, IndexBlobExtra->GuestExtentsCount * sizeof(uint32_t));
+         bool ExtentsValid = true;
+-        for (uint32_t i = 0; i < NewEntry.GuestExtents.size(); i += 2) {
+-          if ((uint64_t)NewEntry.GuestExtents[i] + NewEntry.GuestExtents[i + 1] > IndexBlobExtra->GuestSize) {
++        for (uint32_t i = 0; i < Extents.size(); i += 2) {
++          if ((uint64_t)Extents[i] + Extents[i + 1] > IndexBlobExtra->GuestSize) {
+             ExtentsValid = false;
+             break;
+           }
+@@ -244,6 +287,7 @@ namespace DiskCache {
+         if (!ExtentsValid) {
+           continue;
+         }
++        NewEntry.GuestExtents = fextl::make_shared<fextl::vector<uint32_t>>(std::move(Extents));
+         auto It = CacheIndex.find(IndexBlobCommon->hash);
+         if (It == CacheIndex.end()) {
+           CacheIndex.emplace(IndexBlobCommon->hash, IndexCacheHead {std::move(NewEntry), IndexBlobExtra->GuestFootprint, nullptr});
+@@ -261,8 +305,13 @@ namespace DiskCache {
+   }
+ 
+   bool IndexedDB::ReadCacheBlob(uint64_t Offset, std::span<uint8_t> OutBlob) {
+-    if (CacheFileMapping && (ReadOnly || Offset + OutBlob.size() <= BIG_MAPPING_SIZE)) {
+-      if (Offset + OutBlob.size() > CacheFileSize) {
++    if (OutBlob.size() > UINT64_MAX - Offset) {
++      return false;
++    }
++    if (CacheFileMapping && ((ReadOnly && !OwnsCacheFileMapping) ||
++                             (Offset <= CacheFileMappingSize && OutBlob.size() <= CacheFileMappingSize - Offset))) {
++      const uint64_t FileSize = CacheFileSize;
++      if (Offset > FileSize || OutBlob.size() > FileSize - Offset) {
+         return false;
+       }
+       // todo could reduce copies by having a private mapping for relocs, etc
+@@ -280,8 +329,7 @@ namespace DiskCache {
+       return false;
+     }
+ 
+-    if (MaxSizeReached || CacheFileSize + Blob.size() >= MaxFileSize) {
+-      MaxSizeReached = true;
++    if (MaxSizeReached) {
+       return false;
+     }
+ 
+@@ -291,6 +339,18 @@ namespace DiskCache {
+       return false;
+     }
+ 
++    // Account for the FOZ wrapper and other writers while holding the file lock.
++    const ssize_t FileSize = CacheFOZ.Size();
++    const uint64_t WrapperSize = sizeof(MesaFOZ::foz_payload_key) + sizeof(MesaFOZ::foz_payload_header);
++    if (FileSize < 0 || static_cast<uint64_t>(FileSize) > MaxFileSize ||
++        WrapperSize > MaxFileSize - static_cast<uint64_t>(FileSize) ||
++        Blob.size() > MaxFileSize - static_cast<uint64_t>(FileSize) - WrapperSize) {
++      MaxSizeReached = FileSize >= 0;
++      CacheFOZ.Unlock();
++      IndexFOZ.Unlock();
++      return false;
++    }
++
+     // write cache side first so we get offset for index
+     std::span<const uint8_t> BlobChunks[] = {Blob};
+     uint64_t BlobOffset = 0;
+@@ -367,32 +427,95 @@ namespace DiskCache {
+     if (!DiskCachePruneStaleEntries) {
+       return;
+     }
++    const fextl::string NativeCacheBase(CacheBase);
++
++#ifdef _WIN32
++    // Config/getenv and file-open APIs use ANSI; FileUtils traversal uses UTF-8.
++    UNICODE_STRING BaseW;
++    if (!RtlCreateUnicodeStringFromAsciiz(&BaseW, NativeCacheBase.c_str())) return;
++    ULONG Bytes {};
++    if (RtlUnicodeToUTF8N(nullptr, 0, &Bytes, BaseW.Buffer, BaseW.Length) != 0) {
++      RtlFreeUnicodeString(&BaseW);
++      return;
++    }
++    fextl::string UTF8Base(Bytes, '\0');
++    const auto Status = RtlUnicodeToUTF8N(UTF8Base.data(), Bytes, &Bytes, BaseW.Buffer, BaseW.Length);
++    RtlFreeUnicodeString(&BaseW);
++    if (Status != 0) return;
++    CacheBase = UTF8Base;
++#endif
+ 
+     struct SimpleCapture {
+-      std::string_view CacheBase, MachineBucketHash;
++      std::string_view CacheBase, NativeCacheBase, MachineBucketHash;
+     } const SimpleCapture {
+       .CacheBase = CacheBase,
++      .NativeCacheBase = NativeCacheBase,
+       .MachineBucketHash = MachineBucketHash,
+     };
+ 
+     FEXCore::FileUtils::WalkDirectory(
+       CacheBase,
+       [](std::string_view name, bool is_dir, const void* user_data) {
+-        if (!is_dir) {
++        if (!is_dir || name.size() != 16 || name.find_first_not_of("0123456789abcdef") != std::string_view::npos) {
+           return;
+         }
+ 
+         auto capture = reinterpret_cast<const struct SimpleCapture*>(user_data);
+ 
+-        // Current behaviour is to remove entries that no longer match the MachineBucketHash.
+-        // This means that if the Disk Cache version no longer matches, or the FEXCore::HostFeatures differ, then they get removed.
+-        if (name != capture->MachineBucketHash) {
+-          FEXCore::FileUtils::RecursiveRemoveDirectory(fextl::fmt::format("{}/{}", capture->CacheBase, name));
+-        }
++        if (name == capture->MachineBucketHash) return;
++        const auto Directory = fextl::fmt::format("{}/{}", capture->CacheBase, name);
++        const auto NativeDirectory = fextl::fmt::format("{}/{}", capture->NativeCacheBase, name);
++        bool RemovedCacheFile = false;
++        struct BucketCapture {
++          const fextl::string& NativeDirectory;
++          bool& RemovedCacheFile;
++        } Bucket {NativeDirectory, RemovedCacheFile};
++        // Remove only recognizable FEX database files, never an arbitrary directory tree.
++        // Keep the native (ANSI on Windows) path for file APIs; traversal uses UTF-8.
++        FEXCore::FileUtils::WalkDirectory(Directory, [](std::string_view FileName, bool IsDirectory, const void* UserData) {
++          if (IsDirectory || !FileName.starts_with("RWCacheDB_") || FileName.size() < 26 ||
++              FileName.substr(10, 16).find_first_not_of("0123456789abcdef") != std::string_view::npos ||
++              (FileName.substr(26) != ".foz" && FileName.substr(26) != "_idx.foz")) return;
++          const auto& Bucket = *static_cast<const BucketCapture*>(UserData);
++          const auto Path = fextl::fmt::format("{}/{}", Bucket.NativeDirectory, FileName);
++          // A cache-shaped name can still be a FIFO/device or a link to one.
++          // Inspect it without opening it, so validation cannot block startup.
++#ifdef _WIN32
++          UNICODE_STRING PathW, NTPath;
++          if (!RtlCreateUnicodeStringFromAsciiz(&PathW, Path.c_str())) return;
++          const bool HasNTPath = RtlDosPathNameToNtPathName_U(PathW.Buffer, &NTPath, nullptr, nullptr);
++          RtlFreeUnicodeString(&PathW);
++          if (!HasNTPath) return;
++          OBJECT_ATTRIBUTES Attributes;
++          InitializeObjectAttributes(&Attributes, &NTPath, OBJ_CASE_INSENSITIVE, nullptr, nullptr);
++          FILE_BASIC_INFORMATION Info {};
++          const auto Status = NtQueryAttributesFile(&Attributes, &Info);
++          RtlFreeUnicodeString(&NTPath);
++          if (Status != 0 || (Info.FileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DEVICE))) return;
++#else
++          struct stat Info {};
++          if (lstat(Path.c_str(), &Info) != 0 || !S_ISREG(Info.st_mode)) return;
++#endif
++          {
++            FOZFile File;
++            if (!File.Open(Path, true)) return;
++          }
++#ifdef _WIN32
++          if (DeleteFileA(Path.c_str())) Bucket.RemovedCacheFile = true;
++#else
++          if (unlink(Path.c_str()) == 0) Bucket.RemovedCacheFile = true;
++#endif
++        }, &Bucket);
++        // Unknown files, nested directories and failed reads/deletes keep the bucket alive.
++        if (!RemovedCacheFile) return;
++#ifdef _WIN32
++        RemoveDirectoryA(NativeDirectory.c_str());
++#else
++        rmdir(NativeDirectory.c_str());
++#endif
+       },
+       &SimpleCapture);
+   }
+-
+   void DiskCache::Init(FEXCore::Context::ContextImpl* CTX) {
+     this->CTX = CTX;
+ 
+@@ -402,7 +525,9 @@ namespace DiskCache {
+ 
+     fextl::string SerializedConfig = FEXCore::Config::SerializeForCache();
+ 
+-    const auto HostFeatureHash = CTX->HostFeatures.HashForCaching();
++    auto MachineFeatures = CTX->HostFeatures;
++    MachineFeatures.SupportsHardwareTSO = false;
++    const auto HostFeatureHash = MachineFeatures.HashForCaching();
+ 
+     struct __attribute__((packed)) {
+       uint16_t FormatVersion;
+@@ -471,7 +596,7 @@ namespace DiskCache {
+     WritingDiskCache = (bool)RWCacheDB;
+     ReadingDiskCache = !ROCacheDBs.empty() || RWCacheDB != nullptr;
+ 
+-    if (IsWritingDiskCache()) {
++    if (IsWritingDiskCache() || (IsReadingDiskCache() && MemoryLRUMaxSize)) {
+       FEXCore::Threads::Flags WriterThreadFlags = {.LowPriority = true, .Internal = true};
+       Writer = fextl::make_unique<WorkQueueThread>(WriterThreadFlags, "FEX:DiskCache");
+     }
+@@ -530,6 +655,7 @@ namespace DiskCache {
+         if (IndexEntry) {
+           IndexEntry->MemoryBlob.reset();
+           IndexEntry->LRUEntry.reset();
++          if (!IndexEntry->DB) Self->EraseEntryLocked(LastKey.LookupKey, IndexEntry);
+         }
+         Self->MemoryLRUCurrentSize -= LastKey.Size;
+         auto Deleted = Last;
+@@ -542,7 +668,6 @@ namespace DiskCache {
+       }
+     }
+   };
+-
+   std::optional<CodeHitData> DiskCache::Lookup(Core::InternalThreadState* Thread, std::optional<ExecutableFileSectionInfo> Region,
+                                                uint64_t GuestRIP, std::optional<uint64_t>& GuestCodeKey) {
+     if (!IsReadingDiskCache()) {
+@@ -558,7 +683,7 @@ namespace DiskCache {
+       if (!AnonCaching) {
+         return std::nullopt;
+       }
+-      Thread->FrontendDecoder->DecodeLoop(reinterpret_cast<const uint8_t*>(CTX->GetGuestBase() + GuestRIP), AnonPrefixGuestBytes);
++      Thread->FrontendDecoder->DecodeLoop(reinterpret_cast<const uint8_t*>(GuestRIP), AnonPrefixGuestBytes);
+       const auto* BlockInfo = Thread->FrontendDecoder->GetDecodedBlockInfo();
+ 
+       XXH3_state_t HashState;
+@@ -570,11 +695,11 @@ namespace DiskCache {
+         uint64_t HashStart = SubBlock.Entry;
+         // skip over masked in-block data and data/etc gaps between blocks
+         for (auto& DataMask : SubBlock.DataMasks) {
+-          XXH3_64bits_update(&HashState, reinterpret_cast<const uint8_t*>(CTX->GetGuestBase() + HashStart), DataMask.FieldAddress - HashStart);
++          XXH3_64bits_update(&HashState, reinterpret_cast<const uint8_t*>(HashStart), DataMask.FieldAddress - HashStart);
+           HashStart = DataMask.FieldAddress + DataMask.ValueSize;
+         }
+         if (HashStart != SubBlock.Entry + SubBlock.Size) {
+-          XXH3_64bits_update(&HashState, reinterpret_cast<const uint8_t*>(CTX->GetGuestBase() + HashStart), SubBlock.Size - (HashStart - SubBlock.Entry));
++          XXH3_64bits_update(&HashState, reinterpret_cast<const uint8_t*>(HashStart), SubBlock.Size - (HashStart - SubBlock.Entry));
+         }
+       }
+       GuestCodeKey = XXH3_64bits_digest(&HashState);
+@@ -600,11 +725,10 @@ namespace DiskCache {
+     bool TriedMainEntry = false;
+     IndexEntry MainEntry;
+     uint64_t MainEntryFootprint;
+-    fextl::multimap<uint64_t, IndexEntry>::iterator MoreEntriesIt;
+-    fextl::multimap<uint64_t, IndexEntry>* MapPointer = nullptr;
+-    IndexEntry* EntryUnderReview;
+-    fextl::shared_ptr<fextl::vector<uint8_t>> BlobRef;
+-    std::optional<fextl::list<MemoryLRUKey>::iterator> LRUIter;
++    // Eviction can erase or promote entries after IndexLock is released.
++    fextl::vector<std::pair<uint64_t, IndexEntry>> MoreEntriesSnapshot;
++    decltype(MoreEntriesSnapshot)::iterator MoreEntriesIt;
++    const IndexEntry* EntryUnderReview;
+     uint64_t CurrentFootprint = 0;
+     {
+       std::lock_guard Guard(IndexLock);
+@@ -616,19 +740,15 @@ namespace DiskCache {
+ 
+       MainEntry = It->second.MainEntry;
+       MainEntryFootprint = It->second.MainEntryFootprint;
+-      MapPointer = It->second.MoreEntries.get();
+-      if (MapPointer) {
+-        MoreEntriesIt = It->second.MoreEntries->begin();
++      if (It->second.MoreEntries) {
++        MoreEntriesSnapshot.assign(It->second.MoreEntries->begin(), It->second.MoreEntries->end());
+       }
+-      if (MapPointer && MoreEntriesIt != It->second.MoreEntries->end()) {
++      MoreEntriesIt = MoreEntriesSnapshot.begin();
++      if (MoreEntriesIt != MoreEntriesSnapshot.end()) {
+         EntryUnderReview = &MoreEntriesIt->second;
+-        BlobRef = EntryUnderReview->MemoryBlob;
+-        LRUIter = EntryUnderReview->LRUEntry;
+         CurrentFootprint = MoreEntriesIt->first;
+       } else {
+         EntryUnderReview = &MainEntry;
+-        BlobRef = EntryUnderReview->MemoryBlob;
+-        LRUIter = EntryUnderReview->LRUEntry;
+         CurrentFootprint = MainEntryFootprint;
+         TriedMainEntry = true;
+       }
+@@ -638,67 +758,53 @@ namespace DiskCache {
+     bool Advance = false;
+     while (!FoundMatchingHash) {
+       if (Advance) {
+-        std::lock_guard Guard(IndexLock);
+-
+         EntryUnderReview = nullptr;
+-        if (MapPointer && MoreEntriesIt != MapPointer->end()) {
++        if (MoreEntriesIt != MoreEntriesSnapshot.end()) {
+           // if the current footprint is also the main entry's footprint, give main entry a shot next
+           if (!TriedMainEntry && MoreEntriesIt->first == MainEntryFootprint) {
+             EntryUnderReview = &MainEntry;
+-            BlobRef = EntryUnderReview->MemoryBlob;
+-            LRUIter = EntryUnderReview->LRUEntry;
+             CurrentFootprint = MainEntryFootprint;
+             TriedMainEntry = true;
+           } else {
+             MoreEntriesIt++;
+           }
+         }
+-        if (!MapPointer || MoreEntriesIt == MapPointer->end()) {
++        if (MoreEntriesIt == MoreEntriesSnapshot.end()) {
+           if (TriedMainEntry) {
+             // ran out
+             break;
+           } else {
+             EntryUnderReview = &MainEntry;
+-            BlobRef = EntryUnderReview->MemoryBlob;
+-            LRUIter = EntryUnderReview->LRUEntry;
+             CurrentFootprint = MainEntryFootprint;
+             TriedMainEntry = true;
+           }
+         }
+-        if (!EntryUnderReview && MapPointer && MoreEntriesIt != MapPointer->end()) {
++        if (!EntryUnderReview && MoreEntriesIt != MoreEntriesSnapshot.end()) {
+           EntryUnderReview = &MoreEntriesIt->second;
+-          BlobRef = EntryUnderReview->MemoryBlob;
+-          LRUIter = EntryUnderReview->LRUEntry;
+           CurrentFootprint = MoreEntriesIt->first;
+         }
+       }
+ 
+       Advance = true;
+ 
+-      // entry not backed by anything right now - todo prune..
+-      if (!EntryUnderReview->DB && !BlobRef) {
++      // Ignore an unbacked entry in the snapshot.
++      if (!EntryUnderReview->DB && !EntryUnderReview->MemoryBlob) {
+         continue;
+       }
+-
+       // do we have enough room in our live code to even hash GuestSize worth?
+       if (Available < EntryUnderReview->GuestSize) {
+         continue;
+       }
+ 
+-      // if (Entry.GuestExtents.size()) {
+-      //   LogMan::Msg::IFmt("lookup! length {:d}", Entry.GuestSize);
+-      //   for(uint32_t i = 0; i < Entry.GuestExtents.size(); i+=2 ) {
+-      //     LogMan::Msg::IFmt("extent {} {}", Entry.GuestExtents[i], Entry.GuestExtents[i]+Entry.GuestExtents[i+1]);
+-      //   }
+-      // }
+       {
+-        IndexEntry& Entry = *EntryUnderReview;
++        const IndexEntry& Entry = *EntryUnderReview;
++        const auto& Extents = *Entry.GuestExtents;
+         // only renew the hash if the candidate footprint is different than previous
+         if (FirstHash || LastFootprintHashed != CurrentFootprint) {
+           XXH3_state_t HashState;
+           XXH3_128bits_reset(&HashState);
+-          for (uint32_t i = 0; i < Entry.GuestExtents.size(); i += 2) {
+-            XXH3_128bits_update(&HashState, reinterpret_cast<uint8_t*>(CTX->GetGuestBase() + GuestRIP) + Entry.GuestExtents[i], Entry.GuestExtents[i + 1]);
++          for (uint32_t i = 0; i < Extents.size(); i += 2) {
++            XXH3_128bits_update(&HashState, reinterpret_cast<uint8_t*>(GuestRIP) + Extents[i], Extents[i + 1]);
+           }
+           LiveGuestHash = XXH3_128bits_digest(&HashState);
+           LastFootprintHashed = CurrentFootprint;
+@@ -712,12 +818,12 @@ namespace DiskCache {
+           fextl::vector<uint8_t> GuestCode(Entry.GuestSize);
+           if (Entry.Size >= Entry.GuestSize && Entry.DB && Entry.DB->ReadCacheBlob(Entry.Offset + Entry.Size - Entry.GuestSize, GuestCode)) {
+             const uint8_t* CachedGuest = GuestCode.data();
+-            const uint8_t* LiveGuest = reinterpret_cast<const uint8_t*>(CTX->GetGuestBase() + GuestRIP);
++            const uint8_t* LiveGuest = reinterpret_cast<const uint8_t*>(GuestRIP);
+             uint64_t DiffCount = 0;
+             uint64_t DiffOffset = 0;
+-            for (uint32_t i = 0; i < Entry.GuestExtents.size(); i += 2) {
+-              uint32_t Begin = Entry.GuestExtents[i];
+-              uint32_t End = Begin + Entry.GuestExtents[i + 1];
++            for (uint32_t i = 0; i < Extents.size(); i += 2) {
++              uint32_t Begin = Extents[i];
++              uint32_t End = Begin + Extents[i + 1];
+               bool PreviousByteDiff = false;
+               for (uint32_t Offset = Begin; Offset < End; Offset++) {
+                 if (LiveGuest[Offset] != CachedGuest[Offset]) {
+@@ -755,12 +861,15 @@ namespace DiskCache {
+       return std::nullopt;
+     }
+ 
+-    IndexEntry& Entry = *EntryUnderReview;
++    const IndexEntry& Entry = *EntryUnderReview;
++    const auto& Extents = *Entry.GuestExtents;
++    const auto& BlobRef = Entry.MemoryBlob;
++    const auto& LRUIter = Entry.LRUEntry;
+ 
+     fextl::vector<uint64_t> GuestPages;
+-    for (uint32_t i = 0; i < Entry.GuestExtents.size(); i += 2) {
+-      uint64_t FirstPage = (Entry.GuestExtents[i] + GuestRIP) & Utils::FEX_PAGE_MASK;
+-      uint64_t LastPage = (Entry.GuestExtents[i] + GuestRIP + Entry.GuestExtents[i + 1] - 1) & Utils::FEX_PAGE_MASK;
++    for (uint32_t i = 0; i < Extents.size(); i += 2) {
++      uint64_t FirstPage = (Extents[i] + GuestRIP) & Utils::FEX_PAGE_MASK;
++      uint64_t LastPage = (Extents[i] + GuestRIP + Extents[i + 1] - 1) & Utils::FEX_PAGE_MASK;
+       for (uint64_t Page = FirstPage; Page <= LastPage; Page += Utils::FEX_PAGE_SIZE) {
+         if (GuestPages.size() == 0 || Page != GuestPages.back()) {
+           GuestPages.push_back(Page);
+@@ -795,8 +904,9 @@ namespace DiskCache {
+     memcpy(&Header, HitData.Blob.data() + BlobOffset, sizeof(Header));
+     BlobOffset += sizeof(Header);
+ 
+-    uint32_t SizeNeeded = sizeof(Header) + Header.HostSize + Header.EntryPointCount * (sizeof(uint64_t) + sizeof(uint32_t));
+-    SizeNeeded += Header.SmallRelocCount * sizeof(BlobSmallRelocation) + Header.ThunkRelocCount * sizeof(BlobThunkRelocation);
++    // Header counts come from the cache file; sum them in 64 bits so they cannot wrap past the entry size.
++    uint64_t SizeNeeded = sizeof(Header) + uint64_t {Header.HostSize} + uint64_t {Header.EntryPointCount} * (sizeof(uint64_t) + sizeof(uint32_t));
++    SizeNeeded += uint64_t {Header.SmallRelocCount} * sizeof(BlobSmallRelocation) + uint64_t {Header.ThunkRelocCount} * sizeof(BlobThunkRelocation);
+     if (EntrySizeWithoutGuestCode != SizeNeeded) {
+       return std::nullopt;
+     }
+@@ -812,7 +922,7 @@ namespace DiskCache {
+ 
+     if (StoreInMemory) {
+       auto NewBlobRef = fextl::make_shared<fextl::vector<uint8_t>>(EntrySizeWithoutGuestCode);
+-      memcpy(NewBlobRef->data(), HitData.Blob.data() + BlobOffset, EntrySizeWithoutGuestCode);
++      memcpy(NewBlobRef->data(), HitData.Blob.data() + BlobOffset - sizeof(Header), EntrySizeWithoutGuestCode);
+       std::lock_guard Guard(IndexLock);
+       auto CurrentIndexEntry = LookupLocked(LookupKey, Header.GuestHash, LastFootprintHashed);
+       if (CurrentIndexEntry && !CurrentIndexEntry->MemoryBlob) {
+@@ -827,7 +937,6 @@ namespace DiskCache {
+     if (StoreInMemory && MemoryLRUCurrentSize > MemoryLRUMaxSize + MemoryLRUEvictThreshold) {
+       Writer->QueueWork(fextl::make_unique<PruneMemoryLRUWorkItem>(this));
+     }
+-
+     HitData.HostCode = {HitData.Blob.data() + BlobOffset, Header.HostSize};
+     BlobOffset += Header.HostSize;
+     HitData.EntryPointRIPs = {reinterpret_cast<uint64_t*>(HitData.Blob.data() + BlobOffset), Header.EntryPointCount};
+@@ -896,7 +1005,7 @@ namespace DiskCache {
+   IndexEntry* DiskCache::LookupLocked(const uint64_t LookupKey, const XXH128_hash_t& GuestHash, const uint64_t GuestFootprint) {
+     auto It = Index.find(LookupKey);
+     if (It != Index.end()) {
+-      if (XXH128_isEqual(It->second.MainEntry.GuestHash, GuestHash)) {
++      if (It->second.MainEntryFootprint == GuestFootprint && XXH128_isEqual(It->second.MainEntry.GuestHash, GuestHash)) {
+         return &It->second.MainEntry;
+       }
+       if (It->second.MoreEntries.get()) {
+@@ -911,43 +1020,56 @@ namespace DiskCache {
+     return nullptr;
+   }
+ 
++  void DiskCache::EraseEntryLocked(uint64_t LookupKey, IndexEntry* Entry) {
++    auto It = Index.find(LookupKey);
++    auto& Head = It->second;
++    if (Entry == &Head.MainEntry) {
++      if (!Head.MoreEntries || Head.MoreEntries->empty()) {
++        Index.erase(It);
++      } else {
++        auto First = Head.MoreEntries->begin();
++        Head.MainEntryFootprint = First->first;
++        Head.MainEntry = std::move(First->second);
++        Head.MoreEntries->erase(First);
++      }
++    } else {
++      for (auto More = Head.MoreEntries->begin(); More != Head.MoreEntries->end(); ++More) {
++        if (&More->second == Entry) {
++          Head.MoreEntries->erase(More);
++          break;
++        }
++      }
++    }
++  }
+   struct DiskCache::CacheStoreWorkItem final : WorkQueueThread::WorkItem {
+     DiskCache* Self;
+     IndexedDB* DB;
+     MesaFOZ::foz_payload_key UniqueKey;
+     uint64_t LookupKey;
+-    std::span<uint8_t> Blob;
++    fextl::shared_ptr<fextl::vector<uint8_t>> Blob;
+     fextl::vector<uint8_t> IndexBlob;
+     bool StoreDisk;
+     CacheStoreWorkItem(DiskCache* Self, IndexedDB* DB, const MesaFOZ::foz_payload_key& UniqueKey, uint64_t LookupKey,
+-                       std::span<uint8_t> Blob, fextl::vector<uint8_t>&& IndexBlob, bool StoreDisk)
++                       fextl::shared_ptr<fextl::vector<uint8_t>> Blob, fextl::vector<uint8_t>&& IndexBlob, bool StoreDisk)
+       : Self(Self)
+       , DB(DB)
+       , UniqueKey(UniqueKey)
+       , LookupKey(LookupKey)
+-      , Blob(Blob)
++      , Blob(std::move(Blob))
+       , IndexBlob(std::move(IndexBlob))
+       , StoreDisk(StoreDisk) {}
+     void Run() override {
+       struct MesaFOZ::mesa_index_db_file_entry IndexHeader;
+-      bool DiskSuccess = !StoreDisk || DB->StoreCacheBlob(UniqueKey, LookupKey, Blob, IndexHeader, IndexBlob);
++      bool DiskSuccess = !StoreDisk || DB->StoreCacheBlob(UniqueKey, LookupKey, *Blob, IndexHeader, IndexBlob);
+ 
+       bool KeepEntryInMemory = true;
+       // todo possible other lru condition here like entry size?
+-      if (Blob.size() > Self->MemoryLRUMaxSize) {
++      if (Blob->size() > Self->MemoryLRUMaxSize) {
+         KeepEntryInMemory = false;
+-      } else {
+-        Self->MemoryLRUCurrentSize += Blob.size();
+       }
+ 
+       const IndexExtraBlobHeader* IndexAfterHeader = reinterpret_cast<const IndexExtraBlobHeader*>(IndexBlob.data());
+ 
+-      fextl::list<MemoryLRUKey>::iterator NewLRUEntry;
+-      if (KeepEntryInMemory) {
+-        std::lock_guard Guard(Self->MemoryLRULock);
+-        Self->MemoryLRU.push_front({LookupKey, IndexAfterHeader->GuestHash, IndexAfterHeader->GuestFootprint, (uint32_t)Blob.size()});
+-        NewLRUEntry = Self->MemoryLRU.begin();
+-      }
+       {
+         std::lock_guard Guard(Self->IndexLock);
+         auto IndexEntry = Self->LookupLocked(LookupKey, IndexAfterHeader->GuestHash, IndexAfterHeader->GuestFootprint);
+@@ -959,8 +1081,12 @@ namespace DiskCache {
+           }
+           if (!KeepEntryInMemory) {
+             IndexEntry->MemoryBlob.reset();
++            if (!IndexEntry->DB) Self->EraseEntryLocked(LookupKey, IndexEntry);
+           } else {
+-            IndexEntry->LRUEntry = NewLRUEntry;
++            std::lock_guard LRUGuard(Self->MemoryLRULock);
++            Self->MemoryLRU.push_front({LookupKey, IndexAfterHeader->GuestHash, IndexAfterHeader->GuestFootprint, (uint32_t)Blob->size()});
++            IndexEntry->LRUEntry = Self->MemoryLRU.begin();
++            Self->MemoryLRUCurrentSize += Blob->size();
+           }
+         }
+       }
+@@ -980,6 +1106,9 @@ namespace DiskCache {
+     if (!DecodedBlockInfo) {
+       return false;
+     }
++    if (RWCacheDB->Full() && !MemoryLRUMaxSize) {
++      return false;
++    }
+     // check for any reloc targets outside of our jurisdiction
+     // todo what are they exactly? caching those blocks is great when it works, so need to figure this out and make finer-grained if we can
+     if (RelocationFilter && Region) {
+@@ -1026,9 +1155,8 @@ namespace DiskCache {
+     const size_t TotalSize = GuestCodeOffset + GuestCode.size();
+ 
+     // we'll copy everything into here and pass it to the Writer, then return to caller quickly
+-    fextl::vector<uint8_t> Blob;
+-    Blob.resize(TotalSize);
+-    uint8_t* BlobData = Blob.data();
++    auto BlobRef = fextl::make_shared<fextl::vector<uint8_t>>(TotalSize);
++    uint8_t* BlobData = BlobRef->data();
+ 
+     BlobFixedHeader Header {
+       .GuestSize = (uint32_t)GuestCode.size(),
+@@ -1176,37 +1304,23 @@ namespace DiskCache {
+       Header.GuestHash = XXH3_128bits_digest(&HashState);
+     }
+     memcpy(BlobData + HeaderOffset, &Header, sizeof(Header));
+-
+     auto RangeInfo = CTX->SyscallHandler->QueryGuestExecutableRange(Thread, GuestRIP);
+     uint64_t LookupKey =
+       MakeLookupKey(Thread, GuestCodeKey, RangeInfo.Writable, GuestRIP == CTX->GetMonoBackPatcherBlock().load(std::memory_order_relaxed));
+ 
+     // blob done, publish to index as in-memory for now, flush to disk below
+-    auto BlobRef = fextl::make_shared<fextl::vector<uint8_t>>(std::move(Blob));
+     struct IndexEntry NewEntry {nullptr, 0, (uint32_t)TotalSize, Header.GuestSize, Header.GuestHash, BlobRef};
+-    NewEntry.GuestExtents = ExactGuestCodeExtents;
++    const fextl::shared_ptr<const fextl::vector<uint32_t>> GuestExtents =
++      fextl::make_shared<fextl::vector<uint32_t>>(std::move(ExactGuestCodeExtents));
++    NewEntry.GuestExtents = GuestExtents;
+     {
+       std::lock_guard Guard(IndexLock);
+       auto It = Index.find(LookupKey);
+       if (It == Index.end()) {
+         Index.emplace(LookupKey, IndexCacheHead {std::move(NewEntry), GuestFootprint, nullptr});
++      } else if (LookupLocked(LookupKey, Header.GuestHash, GuestFootprint)) {
++        return true;
+       } else {
+-        bool Dupe = false;
+-        if (It->second.MoreEntries.get()) {
+-          for (auto& [Key, Elem] : *It->second.MoreEntries) {
+-            if (XXH128_isEqual(Elem.GuestHash, Header.GuestHash)) {
+-              Dupe = true;
+-              break;
+-            }
+-          }
+-        }
+-        if (!Dupe && XXH128_isEqual(It->second.MainEntry.GuestHash, Header.GuestHash)) {
+-          Dupe = true;
+-        }
+-        // could happen if it's seen again while in flight in the store queue
+-        if (Dupe) {
+-          return true;
+-        }
+         if (!It->second.MoreEntries.get()) {
+           It->second.MoreEntries = fextl::make_unique<fextl::multimap<uint64_t, struct IndexEntry>>();
+         } else if (It->second.MoreEntries->size() >= LOOKUP_KEY_MAX_BUCKET_DEPTH) {
+@@ -1217,7 +1331,6 @@ namespace DiskCache {
+     }
+ 
+     memcpy(BlobData + GuestCodeOffset, GuestCode.data(), GuestCode.size());
+-
+     MesaFOZ::foz_payload_key Key = {};
+     {
+       XXH3_state_t HashState;
+@@ -1230,11 +1343,11 @@ namespace DiskCache {
+     }
+ 
+     fextl::vector<uint8_t> IndexBlob;
+-    IndexBlob.resize(sizeof(IndexExtraBlobHeader) + ExactGuestCodeExtents.size() * sizeof(uint32_t));
++    IndexBlob.resize(sizeof(IndexExtraBlobHeader) + GuestExtents->size() * sizeof(uint32_t));
+ 
+-    IndexExtraBlobHeader IndexBlobHeader {Header.GuestHash, GuestFootprint, Header.GuestSize, (uint32_t)ExactGuestCodeExtents.size()};
++    IndexExtraBlobHeader IndexBlobHeader {Header.GuestHash, GuestFootprint, Header.GuestSize, (uint32_t)GuestExtents->size()};
+     memcpy(IndexBlob.data(), &IndexBlobHeader, sizeof(IndexExtraBlobHeader));
+-    memcpy(IndexBlob.data() + sizeof(IndexExtraBlobHeader), ExactGuestCodeExtents.data(), ExactGuestCodeExtents.size() * sizeof(uint32_t));
++    memcpy(IndexBlob.data() + sizeof(IndexExtraBlobHeader), GuestExtents->data(), GuestExtents->size() * sizeof(uint32_t));
+ 
+     bool StoreDisk = true;
+ 
+@@ -1243,7 +1356,7 @@ namespace DiskCache {
+     }
+ 
+     // hand the rest off to the writer thread
+-    Writer->QueueWork(fextl::make_unique<CacheStoreWorkItem>(this, RWCacheDB.get(), Key, LookupKey, std::span(BlobData, TotalSize),
++    Writer->QueueWork(fextl::make_unique<CacheStoreWorkItem>(this, RWCacheDB.get(), Key, LookupKey, std::move(BlobRef),
+                                                              std::move(IndexBlob), StoreDisk));
+     return true;
+   }
+diff --git a/FEXCore/Source/Interface/Core/DiskCache.h b/FEXCore/Source/Interface/Core/DiskCache.h
+index 0b433655e3e9fdaddb28dfed530fad045abda469..f5933cf0c569d443c7a004a93b0f0c771bc101b1 100644
+--- a/FEXCore/Source/Interface/Core/DiskCache.h
++++ b/FEXCore/Source/Interface/Core/DiskCache.h
+@@ -6,6 +6,7 @@
+ 
+ #include <FEXCore/Core/CodeCache.h>
+ #include <FEXCore/Core/Context.h>
++#include <FEXCore/Core/DiskCache.h>
+ #include <FEXCore/Config/Config.h>
+ #include <FEXCore/Utils/File.h>
+ #include <FEXCore/Utils/WorkQueueThread.h>
+@@ -14,7 +15,9 @@
+ #include <FEXCore/fextl/unordered_set.h>
+ #include <FEXCore/fextl/robin_map.h>
+ #include <FEXCore/fextl/map.h>
++#include <FEXCore/fextl/list.h>
+ #include <FEXCore/fextl/vector.h>
++#include <atomic>
+ #include <stdint.h>
+ #include <mutex>
+ #include <optional>
+@@ -64,7 +67,7 @@ namespace DiskCache {
+     uint32_t GuestSize;
+     XXH128_hash_t GuestHash;
+     fextl::shared_ptr<fextl::vector<uint8_t>> MemoryBlob;
+-    fextl::vector<uint32_t> GuestExtents;
++    fextl::shared_ptr<const fextl::vector<uint32_t>> GuestExtents;
+     std::optional<fextl::list<MemoryLRUKey>::iterator> LRUEntry;
+   };
+ 
+@@ -163,6 +166,7 @@ namespace DiskCache {
+ 
+   class IndexedDB {
+   public:
++    ~IndexedDB();
+     bool Open(const fextl::string& CacheDBName, bool ReadOnly);
+     void PopulateIndex(Index& CacheIndex, bool& FoundMetadata);
+     bool ReadCacheBlob(uint64_t Offset, std::span<uint8_t> OutBlob);
+@@ -179,12 +183,15 @@ namespace DiskCache {
+ 
+     FOZFile CacheFOZ;
+     uint8_t* CacheFileMapping = nullptr;
+-    std::atomic<uint64_t> CacheFileSize;
++    uint64_t CacheFileMappingSize = 0;
++    std::atomic<uint64_t> CacheFileSize {};
++    bool OwnsCacheFileMapping = false;
+     FOZFile IndexFOZ;
+     bool ReadOnly = false;
+-    bool MaxSizeReached = false;
++    std::atomic<bool> MaxSizeReached {};
+ 
+     FEX_CONFIG_OPT(MaxFileSize, DISKCACHEMAXFILESIZE);
++    FEX_CONFIG_OPT(MapDiskCacheFiles, DISKCACHEFILEMAPPING);
+   };
+ 
+   class DiskCache {
+@@ -213,6 +220,7 @@ namespace DiskCache {
+     bool OpenCacheDB(const fextl::string& CacheDBName, bool ReadOnly);
+     uint64_t MakeLookupKey(Core::InternalThreadState* Thread, const uint64_t ModuleOffset, bool Writable, bool MonoBackpatcher);
+     IndexEntry* LookupLocked(const uint64_t LookupKey, const XXH128_hash_t& GuestHash, const uint64_t GuestFootprint);
++    void EraseEntryLocked(uint64_t LookupKey, IndexEntry* Entry);
+ 
+     bool ReadingDiskCache {};
+     bool WritingDiskCache {};
+@@ -246,10 +254,9 @@ namespace DiskCache {
+   };
+ 
+   static constexpr uint16_t AnonPrefixGuestBytes = 64;
+-  // The current version of the diskcache.
+-  // This must be changed any time codegen changes occur!
+-  // Be aware of the impact of changing this frequently!
+-  static constexpr uint16_t FormatVersion = 31;
++  // Darwin code generation uses a separate cache namespace from upstream.
++  // Shared division remainder lowering and simplified Darwin translation.
++  static constexpr uint16_t FormatVersion = 0xA623;
+ 
+   static constexpr uint32_t LOOKUP_KEY_MAX_BUCKET_DEPTH = 500;
+ 
+diff --git a/FEXCore/Source/Interface/Core/Frontend.cpp b/FEXCore/Source/Interface/Core/Frontend.cpp
+index 42cd55f44a6af3895ab15ff226fb342d9b3b05ec..dd9490fa88c7619156e6f1f09921f79988a7c3f9 100644
+--- a/FEXCore/Source/Interface/Core/Frontend.cpp
++++ b/FEXCore/Source/Interface/Core/Frontend.cpp
+@@ -1754,7 +1754,8 @@ void Decoder::DecodeLoop(const uint8_t* _InstStream, uint64_t GuestSizePause) {
+   }
+ }
+ 
+-void Decoder::SetupDecodeInstructionsAtEntry(FEXCore::Core::InternalThreadState* Thread, uint64_t PC, uint64_t MaxInst) {
++std::optional<ExecutableFileSectionInfo> Decoder::SetupDecodeInstructionsAtEntry(FEXCore::Core::InternalThreadState* Thread, uint64_t PC,
++                                                                                uint64_t MaxInst, bool NeedSection) {
+   FEXCORE_PROFILE_SCOPED("DecodeInstructions");
+   BlockInfo.TotalInstructionCount = 0;
+   BlockInfo.Blocks.clear();
+@@ -1785,13 +1786,12 @@ void Decoder::SetupDecodeInstructionsAtEntry(FEXCore::Core::InternalThreadState*
+   SectionMaxAddress = ~0ULL;
+   Relocations = nullptr;
+ 
+-  if (CTX->GetCodeCache().IsGeneratingCache || EnableCodeCacheValidation) {
+-    // If generating cache, attempt to load section bounds and relocations
+-    if (auto SectionInfo = CTX->SyscallHandler->LookupExecutableFileSection(Thread, EntryPoint)) {
+-      SectionMinAddress = SectionInfo->FileStartVA;
+-      SectionMaxAddress = SectionInfo->EndVA;
+-      Relocations = &SectionInfo->FileInfo.Relocations;
+-    }
++  const bool NeedRelocations = CTX->GetCodeCache().IsGeneratingCache || EnableCodeCacheValidation;
++  auto Section = (NeedSection || NeedRelocations) ? CTX->SyscallHandler->LookupExecutableFileSection(Thread, EntryPoint) : std::nullopt;
++  if (NeedRelocations && Section) {
++    SectionMinAddress = Section->FileStartVA;
++    SectionMaxAddress = Section->EndVA;
++    Relocations = &Section->FileInfo.Relocations;
+   }
+ 
+   DecodedMinAddress = EntryPoint;
+@@ -1806,6 +1806,7 @@ void Decoder::SetupDecodeInstructionsAtEntry(FEXCore::Core::InternalThreadState*
+ 
+   EntryBlock = true;
+   FinalInstruction = false;
++  return Section;
+ }
+ 
+ } // namespace FEXCore::Frontend
+diff --git a/FEXCore/Source/Interface/Core/Frontend.h b/FEXCore/Source/Interface/Core/Frontend.h
+index 667081d339459ff79cdb0b3ef225754717b99a43..157af8f553efa2f0a4a3c94ca8a668a780b15793 100644
+--- a/FEXCore/Source/Interface/Core/Frontend.h
++++ b/FEXCore/Source/Interface/Core/Frontend.h
+@@ -63,7 +63,8 @@ public:
+   Decoder(FEXCore::Core::InternalThreadState* Thread);
+   bool CheckIfCacheable(FEXCore::Core::InternalThreadState&, const uint8_t* InstStream, uint64_t PC, uint64_t MaxInst);
+ 
+-  void SetupDecodeInstructionsAtEntry(FEXCore::Core::InternalThreadState* Thread, uint64_t PC, uint64_t MaxInst);
++  std::optional<ExecutableFileSectionInfo> SetupDecodeInstructionsAtEntry(FEXCore::Core::InternalThreadState* Thread, uint64_t PC,
++                                                                         uint64_t MaxInst, bool NeedSection = false);
+   void DecodeLoop(const uint8_t* InstStream, uint64_t GuestPause = 0);
+ 
+   const DecodedBlockInformation* GetDecodedBlockInfo() const {
+diff --git a/FEXCore/Source/Utils/FileUtils.cpp b/FEXCore/Source/Utils/FileUtils.cpp
+index d3e62cacde06e483ece57bbb07642bed7d23eabd..53ad6bbf262c1f5fd57066256b2b2b5ee07ce8e5 100644
+--- a/FEXCore/Source/Utils/FileUtils.cpp
++++ b/FEXCore/Source/Utils/FileUtils.cpp
+@@ -10,6 +10,7 @@
+ #include <fcntl.h>
+ #include <unistd.h>
+ #else
++#include <climits>
+ #include <windows.h>
+ #include <winnt.h>
+ #include <winternl.h>
+@@ -21,6 +22,7 @@ extern "C" NTSTATUS WINAPI NtQueryDirectoryFile(HANDLE, HANDLE, PIO_APC_ROUTINE,
+ 
+ extern "C" NTSTATUS RtlUnicodeToUTF8N(OUT PCHAR UTF8StringDestination, IN ULONG UTF8StringMaxByteCount,
+                                       OUT PULONG UTF8StringActualByteCount, IN PCWCH UnicodeStringSource, IN ULONG UnicodeStringByteCount);
++extern "C" NTSTATUS RtlUTF8ToUnicodeN(PWSTR, ULONG, PULONG, PCCH, ULONG);
+ #endif
+ 
+ namespace FEXCore::FileUtils {
+@@ -202,14 +204,27 @@ end:
+ }
+ 
+ #else
++static std::optional<fextl::basic_string<wchar_t>> PathToWidePath(std::string_view Path) {
++  // WalkDirectory returns UTF-8 names, independent of the process ANSI code page.
++  ULONG Bytes {};
++  if (Path.empty() || Path.find('\0') != std::string_view::npos || Path.size() > ULONG_MAX ||
++      RtlUTF8ToUnicodeN(nullptr, 0, &Bytes, Path.data(), Path.size()) != STATUS_SUCCESS) {
++    return std::nullopt;
++  }
++  fextl::basic_string<wchar_t> PathW(Bytes / sizeof(wchar_t), L'\0');
++  if (RtlUTF8ToUnicodeN(PathW.data(), Bytes, &Bytes, Path.data(), Path.size()) != STATUS_SUCCESS) {
++    return std::nullopt;
++  }
++  return PathW;
++}
++
+ static inline std::optional<UNICODE_STRING> PathToNTPath(std::string_view Path) {
+-  UNICODE_STRING PathW;
+-  if (!RtlCreateUnicodeStringFromAsciiz(&PathW, fextl::string(Path).c_str())) {
++  auto PathW = PathToWidePath(Path);
++  if (!PathW) {
+     return std::nullopt;
+   }
+   UNICODE_STRING NTPath;
+-  bool Success = RtlDosPathNameToNtPathName_U(PathW.Buffer, &NTPath, nullptr, nullptr);
+-  RtlFreeUnicodeString(&PathW);
++  bool Success = RtlDosPathNameToNtPathName_U(PathW->c_str(), &NTPath, nullptr, nullptr);
+   if (!Success) {
+     return std::nullopt;
+   }
+@@ -237,7 +252,7 @@ FEX_DEFAULT_VISIBILITY void WalkDirectory(std::string_view Directory,
+ 
+   InitializeObjectAttributes(&attr, &*NTPath, OBJ_CASE_INSENSITIVE, nullptr, nullptr);
+   Status = NtOpenFile(&dir_fd, FILE_LIST_DIRECTORY | SYNCHRONIZE, &attr, &io, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+-                      FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT);
++                      FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT);
+ 
+   FreeNTPath(*NTPath);
+ 
+@@ -275,7 +290,7 @@ FEX_DEFAULT_VISIBILITY void WalkDirectory(std::string_view Directory,
+         // Buffer too small? Scale and try again.
+         dirent_size *= 2;
+         FEXCore::Allocator::free(dirent_buffer);
+-        uint8_t* dirent_buffer = reinterpret_cast<uint8_t*>(FEXCore::Allocator::malloc(dirent_size));
++        dirent_buffer = reinterpret_cast<uint8_t*>(FEXCore::Allocator::malloc(dirent_size));
+ 
+         if (!dirent_buffer) {
+           // Ran out of memory?
+@@ -298,10 +313,17 @@ FEX_DEFAULT_VISIBILITY void WalkDirectory(std::string_view Directory,
+       if (EntryName != L"." && EntryName != L"..") {
+         ULONG utf8_bytes_needed = 0;
+         ULONG actual_utf8_bytes = 0;
+-        RtlUnicodeToUTF8N(nullptr, 0, &utf8_bytes_needed, Info->FileName, Info->FileNameLength);
++        Status = RtlUnicodeToUTF8N(nullptr, 0, &utf8_bytes_needed, Info->FileName, Info->FileNameLength);
++        if (Status != STATUS_SUCCESS) {
++          goto end;
++        }
+         char* dynamic_buf = reinterpret_cast<char*>(FEXCore::Allocator::malloc(utf8_bytes_needed + 1));
+         if (dynamic_buf) {
+-          RtlUnicodeToUTF8N(dynamic_buf, utf8_bytes_needed + 1, &actual_utf8_bytes, Info->FileName, Info->FileNameLength);
++          Status = RtlUnicodeToUTF8N(dynamic_buf, utf8_bytes_needed + 1, &actual_utf8_bytes, Info->FileName, Info->FileNameLength);
++          if (Status != STATUS_SUCCESS) {
++            FEXCore::Allocator::free(dynamic_buf);
++            goto end;
++          }
+           std::string_view name_view(dynamic_buf, actual_utf8_bytes);
+           bool is_dir = (Info->FileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+           Callback(name_view, is_dir, user_data);
+@@ -345,10 +367,12 @@ FEX_DEFAULT_VISIBILITY bool RecursiveRemoveDirectory(const fextl::string& Direct
+       WalkDirectory(full_path, Data->RemoveFile, &NewData);
+     }
+ 
+-    if (is_dir) {
+-      RemoveDirectoryA(full_path.c_str());
+-    } else {
+-      DeleteFileA(full_path.c_str());
++    if (auto PathW = PathToWidePath(full_path)) {
++      if (is_dir) {
++        RemoveDirectoryW(PathW->c_str());
++      } else {
++        DeleteFileW(PathW->c_str());
++      }
+     }
+   };
+ 
+@@ -359,7 +383,8 @@ FEX_DEFAULT_VISIBILITY bool RecursiveRemoveDirectory(const fextl::string& Direct
+ 
+   WalkDirectory(Directory, RemoveFile, &Data);
+ 
+-  return RemoveDirectoryA(Directory.c_str()) != 0;
++  auto PathW = PathToWidePath(Directory);
++  return PathW && RemoveDirectoryW(PathW->c_str()) != 0;
+ }
+ 
+ #endif
+diff --git a/FEXCore/include/FEXCore/Core/HostFeatures.h b/FEXCore/include/FEXCore/Core/HostFeatures.h
+index 9708cd968769b5dedc8a78ee3501b6234c9f3863..a5c4a95d36a4f92189113f331b6313105e7c069b 100644
+--- a/FEXCore/include/FEXCore/Core/HostFeatures.h
++++ b/FEXCore/include/FEXCore/Core/HostFeatures.h
+@@ -83,9 +83,13 @@ struct HostFeatures {
+   uint32_t PreferZVAForVZero           : 1 {};
+   uint32_t SupportsAFP                 : 1 {};
+   uint32_t SupportsFloatExceptions     : 1 {};
++  uint32_t SupportsFaultFreeSynchronousFaults : 1 {};
+   // Flag if this is InstCountCI
+   uint32_t IsInstCountCI : 1 {};
+-  uint32_t pad           : 26 {};
++  // Effective hardware TSO selected before context construction, not CPU capability.
++  // DiskCache keeps this in the process key rather than the machine key.
++  uint32_t SupportsHardwareTSO : 1 {};
++  uint32_t pad           : 24 {};
+ 
+   // This affects codegen, but it isn't machine state
+   HostTypeEnum HostType {};
+diff --git a/FEXCore/include/FEXCore/Utils/FileUtils.h b/FEXCore/include/FEXCore/Utils/FileUtils.h
+index 07365aa927fb9542f0a236554d212668be9a52dc..5a852281126a198b06971f8eaafa99ad6b3b6ccb 100644
+--- a/FEXCore/include/FEXCore/Utils/FileUtils.h
++++ b/FEXCore/include/FEXCore/Utils/FileUtils.h
+@@ -6,6 +6,7 @@
+ #include <FEXCore/Utils/CompilerDefs.h>
+ 
+ namespace FEXCore::FileUtils {
++// Paths and returned entry names use UTF-8, including on Windows.
+ /**
+  * @brief Removes an entirely directory passed in. Including the path itself.
+  *
+diff --git a/Source/Windows/ARM64EC/Module.cpp b/Source/Windows/ARM64EC/Module.cpp
+index 1901e16111988c329d808309001d8f81df416333..ca12dd6ba108fef492ba167dd96713cddf6696a2 100644
+--- a/Source/Windows/ARM64EC/Module.cpp
++++ b/Source/Windows/ARM64EC/Module.cpp
+@@ -775,7 +775,7 @@ NTSTATUS ProcessInit() {
+   CTX->SetSignalDelegator(SignalDelegator.get());
+   CTX->SetSyscallHandler(SyscallHandler.get());
+   CTX->InitCore();
+-  Exception::HandlerConfig.emplace(*CTX);
++  Exception::HandlerConfig.emplace();
+   CTX->InitDiskCache();
+   InvalidationTracker.emplace(*CTX, Threads);
+   ImageTracker.emplace(*CTX, false);
+diff --git a/Source/Windows/Common/CPUFeatures.cpp b/Source/Windows/Common/CPUFeatures.cpp
+index c033db8affb2e49bb7b14f81d26674cb611f19a6..2cdcf9b014589f97ac3dd5008660876412852134 100644
+--- a/Source/Windows/Common/CPUFeatures.cpp
++++ b/Source/Windows/Common/CPUFeatures.cpp
+@@ -2,6 +2,7 @@
+ 
+ #include "Common/CPUInfo.h"
+ 
++#include <FEXCore/Config/Config.h>
+ #include <FEXCore/Core/Context.h>
+ #include <FEXCore/Core/HostFeatures.h>
+ #include <FEXCore/fextl/fmt.h>
+@@ -9,6 +10,7 @@
+ #include <windows.h>
+ 
+ #include "CPUFeatures.h"
++#include "FEXUnixLib.h"
+ 
+ namespace {
+ 
+@@ -90,6 +92,11 @@ FEXCore::HostFeatures CPUFeatures::FetchHostFeatures(bool IsWine, FEXCore::HostF
+     // AVX is unsupported for WOW64
+     HostFeatures.SupportsAVX = false;
+   }
++
++  // ARM64EC raises synchronous guest exceptions from the dispatcher without a host fault.
++  HostFeatures.SupportsFaultFreeSynchronousFaults = HostType == FEXCore::HostFeatures::HostTypeEnum::Arm64ec;
++  FEX_CONFIG_OPT(TSOEnabled, TSOENABLED);
++  HostFeatures.SupportsHardwareTSO = TSOEnabled() && UnixLib::TryEnableHardwareTSO();
+   return HostFeatures;
+ }
+ 
+diff --git a/Source/Windows/Common/FEXUnixLib.h b/Source/Windows/Common/FEXUnixLib.h
+index aa4491b79517de1c95c3a201e020ad9c9b631737..362a12e8cb4bebd5a3ca15d5acc6b34aa6a268bf 100644
+--- a/Source/Windows/Common/FEXUnixLib.h
++++ b/Source/Windows/Common/FEXUnixLib.h
+@@ -22,9 +22,11 @@ bool Init(HMODULE NtDll);
+ bool Available();
+ 
+ /**
+- * @brief Tries to enable hardware TSO if supported.
++ * @brief Enable hardware TSO through the native Unix helper.
+  *
+- * @return true if hardware TSO is supported and enabled.
++ * Call before creating the context so its code-cache identity includes this state.
++ * Wine enables its other guest-executing threads through its existing TSO hook.
++ * @return true if the helper enabled hardware TSO on the calling thread.
+  */
+ bool TryEnableHardwareTSO();
+ 
+diff --git a/Source/Windows/Common/TSOHandlerConfig.h b/Source/Windows/Common/TSOHandlerConfig.h
+index f63478d792dc7f1774f7cf15ee05c95d13e459c8..3825070260c4bbf8d638bc38200af426133a66f2 100644
+--- a/Source/Windows/Common/TSOHandlerConfig.h
++++ b/Source/Windows/Common/TSOHandlerConfig.h
+@@ -1,7 +1,6 @@
+ // SPDX-License-Identifier: MIT
+ #pragma once
+ 
+-#include <FEXCore/Core/Context.h>
+ #include <FEXCore/Config/Config.h>
+ #include <FEXCore/Utils/ArchHelpers/Arm64.h>
+ 
+@@ -10,17 +9,13 @@
+ namespace FEX::Windows {
+ class TSOHandlerConfig final {
+ public:
+-  TSOHandlerConfig(FEXCore::Context::Context& CTX) {
++  TSOHandlerConfig() {
+     if (HalfBarrierTSOEnabled()) {
+       UnalignedHandlerType = FEXCore::ArchHelpers::Arm64::UnalignedHandlerType::HalfBarrier;
+     } else {
+       UnalignedHandlerType = FEXCore::ArchHelpers::Arm64::UnalignedHandlerType::NonAtomic;
+     }
+ 
+-    if (TSOEnabled() && FEX::Windows::UnixLib::TryEnableHardwareTSO()) {
+-      CTX.SetHardwareTSOSupport(true);
+-    }
+-
+     uint64_t Flags = (StrictInProcessSplitLocks() ? FEX_UNALIGN_ATOMIC_STRICT_SPLIT_LOCKS : 0) |
+                      (KernelUnalignedAtomicBackpatching() ? FEX_UNALIGN_ATOMIC_BACKPATCH : 0) | FEX_UNALIGN_ATOMIC_EMULATE;
+ 
+@@ -34,7 +29,6 @@ public:
+   }
+ 
+ private:
+-  FEX_CONFIG_OPT(TSOEnabled, TSOENABLED);
+   FEX_CONFIG_OPT(HalfBarrierTSOEnabled, HALFBARRIERTSOENABLED);
+   FEX_CONFIG_OPT(StrictInProcessSplitLocks, STRICTINPROCESSSPLITLOCKS);
+   FEX_CONFIG_OPT(KernelUnalignedAtomicBackpatching, KERNELUNALIGNEDATOMICBACKPATCHING);
+diff --git a/Source/Windows/Common/WinAPI/IO.cpp b/Source/Windows/Common/WinAPI/IO.cpp
+index 27208430b07fa8c3a4dc9b6ab5c0b329e5850614..627eec93498aba1007dcda75d9ec77f1059f97e2 100644
+--- a/Source/Windows/Common/WinAPI/IO.cpp
++++ b/Source/Windows/Common/WinAPI/IO.cpp
+@@ -99,7 +99,7 @@ DLLEXPORT_FUNC(BOOL, DeleteFileW, (LPCWSTR lpFileName)) {
+ 
+   NTSTATUS Status =
+     NtCreateFile(&Handle, SYNCHRONIZE | DELETE, &ObjAttributes, &IOSB, nullptr, 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+-                 FILE_OPEN, FILE_DELETE_ON_CLOSE | FILE_NON_DIRECTORY_FILE, nullptr, 0);
++                 FILE_OPEN, FILE_DELETE_ON_CLOSE | FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT, nullptr, 0);
+   if (WinAPIReturn(Status)) {
+     Status = NtClose(Handle);
+   }
+diff --git a/Source/Windows/UnixLib/FEXUnixLib.cpp b/Source/Windows/UnixLib/FEXUnixLib.cpp
+index 1f149f8a9de6971201192c087c8edf607cb334dc..6017b7e6291752e35a5bc5a81b0cb593ad32b582 100644
+--- a/Source/Windows/UnixLib/FEXUnixLib.cpp
++++ b/Source/Windows/UnixLib/FEXUnixLib.cpp
+@@ -55,9 +55,7 @@ constexpr NTSTATUS STATUS_INTERNAL_ERROR = 0xC00000E5;
+ #endif
+ 
+ #ifdef __APPLE__
+-// macOS exposes no userspace control over Apple Silicon's hardware TSO mode, has no
+-// kernel unaligned-atomic emulation and no VMA naming. Report the first two as unsupported
+-// so FEX falls back to its software implementations.
++// macOS has no prctl interface for kernel unaligned-atomic emulation or VMA naming.
+ static int prctl(int, ...) {
+   errno = ENOSYS;
+   return -1;

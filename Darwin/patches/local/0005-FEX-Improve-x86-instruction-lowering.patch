@@ -1,0 +1,3791 @@
+Subject: [PATCH 3/9] x86 decoding and scalar/SIMD/atomic/x87 lowering
+
+Base-commit: 14c92681f4d62cf84d901460e0358de09c8847a7
+Prerequisites: five pinned Hadron patches, local/0001 and local/0002,
+and all earlier numbered patches in this series.
+
+Apply local/0003 through local/0011 in Portfile order before building.
+Shared declarations and frontend/backend changes cross patch boundaries;
+individual patches are not standalone builds.
+
+Provide x86 decoding and scalar, SIMD, atomic and x87 lowering.
+The existing Wine ABI, 64KB guards and default settings are preserved.
+The iOS-only relocated guest window has been removed.
+Rebuild and install both PE DLLs and native Unix helpers together.
+
+MIT License
+
+Copyright (c) 2026 dbc-hbin (Darwin modifications)
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+
+---
+diff --git a/FEXCore/Scripts/json_ir_generator.py b/FEXCore/Scripts/json_ir_generator.py
+index 4678ddd86475671bc0d0fb8cc84d7e8d33bd1b49..beb6fe5ed4dac46cf8e02d56e0cc69a76e24e9b9 100755
+--- a/FEXCore/Scripts/json_ir_generator.py
++++ b/FEXCore/Scripts/json_ir_generator.py
+@@ -797,7 +797,8 @@ def print_ir_allocator_helpers():
+                             elif inline == "Mem":
+                                 P += ["OffsetType", "OffsetScale"]
+                             elif inline == "Memtso":
+-                                P += ["OffsetType", "OffsetScale", "true /* TSO */"]
++                                # NEON TSO uses an ordinary LDR/STR with a separate barrier.
++                                P += ["OffsetType", "OffsetScale", "Class == RegClass::GPR || Size == OpSize::i256Bit"]
+                                 inline = "Mem"
+ 
+                             output_file.write(f"\t\t{arg.Name} = Inline{inline}({', '.join(P)});\n")
+diff --git a/FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.cpp b/FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.cpp
+index 3ebadb5aa88de9e5d1454eb88c3b041ff08bbb52..60c9396d2323de46573283a5d4e3a762cb538ef0 100644
+--- a/FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.cpp
++++ b/FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.cpp
+@@ -636,7 +636,7 @@ void Arm64Emitter::PopCalleeSavedRegisters() {
+ 
+ void Arm64Emitter::FillSpecialRegs(ARMEmitter::Register TmpReg, ARMEmitter::Register TmpReg2, const FillSpecialRegsOptions& Options) {
+ #ifndef VIXL_SIMULATOR
+-  if (EmitterCTX->HostFeatures.SupportsAFP) {
++  if (EmitterCTX->HostFeatures.SupportsAFP && Options.SetAFP) {
+     // Enable AFP features when filling JIT state.
+     mrs(TmpReg, ARMEmitter::SystemRegister::FPCR);
+ 
+@@ -680,7 +680,7 @@ void Arm64Emitter::FillSpecialRegs(ARMEmitter::Register TmpReg, ARMEmitter::Regi
+ 
+ void Arm64Emitter::SpillStaticRegs(ARMEmitter::Register TmpReg, SpillStaticRegOptions Options) {
+ #ifndef VIXL_SIMULATOR
+-  if (EmitterCTX->HostFeatures.SupportsAFP) {
++  if (EmitterCTX->HostFeatures.SupportsAFP && Options.FPCR) {
+     // Disable AFP features when spilling registers.
+     //
+     // Disable FPCR.NEP and FPCR.AH and FPCR.FIZ
+@@ -823,7 +823,7 @@ void Arm64Emitter::FillStaticRegs(FillStaticRegOptions Options) {
+     msr(ARMEmitter::SystemRegister::NZCV, TmpReg);
+   }
+ 
+-  FillSpecialRegs(TmpReg, TmpReg2, {.SetFIZ = true, .SetPredRegs = Options.FPRs});
++  FillSpecialRegs(TmpReg, TmpReg2, {.SetFIZ = true, .SetPredRegs = Options.FPRs, .SetAFP = Options.FPCR});
+ 
+   if (Options.FPRs) {
+     if (EmitterCTX->HostFeatures.SupportsAVX && EmitterCTX->HostFeatures.SupportsSVE256) {
+@@ -1022,7 +1022,7 @@ void Arm64Emitter::PopDynamicRegs() {
+   PopGeneralRegisters(GeneralRegistersNotPreserved);
+ }
+ 
+-size_t Arm64Emitter::SpillForPreserveAllABICall(ARMEmitter::Register TmpReg, bool FPRs) {
++size_t Arm64Emitter::SpillForPreserveAllABICall(ARMEmitter::Register TmpReg, bool FPRs, bool FPCR) {
+   const auto CanUseSVE256 = EmitterCTX->HostFeatures.SupportsSVE256;
+   const auto FPRRegSize = CanUseSVE256 ? 32 : 16;
+ 
+@@ -1061,6 +1061,7 @@ size_t Arm64Emitter::SpillForPreserveAllABICall(ARMEmitter::Register TmpReg, boo
+                             .GPRSpillMask = PreserveSRAMask,
+                             .FPRSpillMask = PreserveSRAFPRMask,
+                             .FPRs = FPRs,
++                            .FPCR = FPCR,
+                           });
+ 
+   sub(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::rsp, ARMEmitter::Reg::rsp, SPOffset);
+@@ -1077,7 +1078,7 @@ size_t Arm64Emitter::SpillForPreserveAllABICall(ARMEmitter::Register TmpReg, boo
+   return SPOffset;
+ }
+ 
+-void Arm64Emitter::FillForPreserveAllABICall(bool FPRs) {
++void Arm64Emitter::FillForPreserveAllABICall(bool FPRs, bool FPCR) {
+   const auto CanUseSVE256 = EmitterCTX->HostFeatures.SupportsSVE256;
+ 
+   std::span<const ARMEmitter::Register> DynamicGPRs {};
+@@ -1112,6 +1113,7 @@ void Arm64Emitter::FillForPreserveAllABICall(bool FPRs) {
+     .GPRFillMask = PreserveSRAMask,
+     .FPRFillMask = PreserveSRAFPRMask,
+     .FPRs = FPRs,
++    .FPCR = FPCR,
+   });
+ 
+   // Pop the vector registers.
+diff --git a/FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.h b/FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.h
+index 5ad6e7b195d26e0b7bb18cf4a5b69bc9b332248f..3722c2002aaa514295019d821678c6e4c78bbbfe 100644
+--- a/FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.h
++++ b/FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.h
+@@ -142,6 +142,10 @@ protected:
+     // with certain canned values that accelerate some operations. Will (obviously)
+     // not load predicates, even if set to true, on host systems that do not support SVE.
+     bool SetPredRegs {};
++
++    // Whether or not to set the guest AFP bits (NEP, AH and optionally FIZ) in FPCR.
++    // Only skippable when the matching spill also left FPCR untouched.
++    bool SetAFP {true};
+   };
+   void FillSpecialRegs(ARMEmitter::Register TmpReg, ARMEmitter::Register TmpReg2, const FillSpecialRegsOptions& Options);
+ 
+@@ -154,6 +158,8 @@ protected:
+     uint32_t FPRSpillMask {~0U};
+     bool FPRs {true};
+     bool NZCV {true};
++    // Clear the guest AFP bits in FPCR. Only skippable when the callee executes no FP arithmetic.
++    bool FPCR {true};
+   };
+ 
+   struct FillStaticRegOptions final {
+@@ -163,6 +169,8 @@ protected:
+     uint32_t FPRFillMask {~0U};
+     bool FPRs {true};
+     bool NZCV {true};
++    // Must match the FPCR option of the paired spill.
++    bool FPCR {true};
+   };
+ 
+   void SpillStaticRegs(ARMEmitter::Register TmpReg, SpillStaticRegOptions Options);
+@@ -210,26 +218,27 @@ protected:
+   // Callee Saved:
+   // - X9-X15, X19-X29, X31
+   // - Low 128-bits of v8-v31
+-  size_t SpillForPreserveAllABICall(ARMEmitter::Register TmpReg, bool FPRs = true);
+-  void FillForPreserveAllABICall(bool FPRs = true);
++  size_t SpillForPreserveAllABICall(ARMEmitter::Register TmpReg, bool FPRs = true, bool FPCR = true);
++  void FillForPreserveAllABICall(bool FPRs = true, bool FPCR = true);
+ 
+-  size_t SpillForABICall(bool SupportsPreserveAllABI, ARMEmitter::Register TmpReg, bool FPRs = true) {
++  size_t SpillForABICall(bool SupportsPreserveAllABI, ARMEmitter::Register TmpReg, bool FPRs = true, bool FPCR = true) {
+     if (SupportsPreserveAllABI) {
+-      return SpillForPreserveAllABICall(TmpReg, FPRs);
++      return SpillForPreserveAllABICall(TmpReg, FPRs, FPCR);
+     } else {
+       SpillStaticRegs(TmpReg, {
+                                 .FPRs = FPRs,
++                                .FPCR = FPCR,
+                               });
+       return PushDynamicRegs(TmpReg);
+     }
+   }
+ 
+-  void FillForABICall(bool SupportsPreserveAllABI, bool FPRs = true) {
++  void FillForABICall(bool SupportsPreserveAllABI, bool FPRs = true, bool FPCR = true) {
+     if (SupportsPreserveAllABI) {
+-      FillForPreserveAllABICall(FPRs);
++      FillForPreserveAllABICall(FPRs, FPCR);
+     } else {
+       PopDynamicRegs();
+-      FillStaticRegs({.FPRs = FPRs});
++      FillStaticRegs({.FPRs = FPRs, .FPCR = FPCR});
+     }
+   }
+ 
+diff --git a/FEXCore/Source/Interface/Core/CPUID.cpp b/FEXCore/Source/Interface/Core/CPUID.cpp
+index ddce98d66c6d4136e76856584b7d1dc2d5d7776c..0ea3f9023d8bb4aeb7f8c0a66d4cd14a7079dced 100644
+--- a/FEXCore/Source/Interface/Core/CPUID.cpp
++++ b/FEXCore/Source/Interface/Core/CPUID.cpp
+@@ -758,7 +758,7 @@ FEXCore::CPUID::FunctionResults CPUIDEmu::Function_07h(uint32_t Leaf) const {
+               (0 << 11) |                  // rtm-always-abort
+               (0 << 12) |                  // Reserved
+               (0 << 13) |                  // TSX Force Abort (TSX will force abort if attempted)
+-              (0 << 14) |                  // SERIALIZE instruction
++              (1 << 14) |                  // SERIALIZE instruction
+               ((Hybrid ? 1U : 0U) << 15) | // Hybrid
+               (0 << 16) |                  // TSXLDTRK (TSX Suspend load address tracking) - Allows untracked memory loads inside TSX region
+               (0 << 17) |                  // Reserved
+diff --git a/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp b/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp
+index 2f4babd70335ccae2a82264d9bc57cf4e890fce9..255f44e8356e7068a5aa991ac0a4a36c708769f6 100644
+--- a/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp
++++ b/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp
+@@ -572,44 +572,6 @@ void Dispatcher::EmitDispatcher() {
+     (void)b(&LoopTop);
+   }
+ 
+-  auto EmitLongALUOpHandler = [&](auto R, auto Offset) {
+-    auto Address = GetCursorAddress<uint64_t>();
+-
+-    PushDynamicRegs(TMP4);
+-    SpillStaticRegs(TMP4);
+-
+-    if (!TMP_ABIARGS) {
+-      mov(ARMEmitter::XReg::x0, TMP1);
+-      mov(ARMEmitter::XReg::x1, TMP2);
+-      mov(ARMEmitter::XReg::x2, TMP3);
+-    }
+-
+-    ldr(ARMEmitter::XReg::x3, R, Offset);
+-    if (!CTX->Config.DisableVixlIndirectCalls) [[unlikely]] {
+-      GenerateIndirectRuntimeCall<__uint128_t, uint64_t, uint64_t, uint64_t>(ARMEmitter::Reg::r3);
+-    } else {
+-      blr(ARMEmitter::Reg::r3);
+-    }
+-
+-    // Result is now in x0, x1
+-    if (!TMP_ABIARGS) {
+-      mov(TMP1, ARMEmitter::XReg::x0);
+-      mov(TMP2, ARMEmitter::XReg::x1);
+-    }
+-
+-    FillStaticRegs();
+-
+-    // Fix the stack and any values that were stepped on
+-    PopDynamicRegs();
+-
+-    // Go back to our code block
+-    ret();
+-    return Address;
+-  };
+-
+-  LUDIVHandlerAddress = EmitLongALUOpHandler(STATE_PTR(CpuStateFrame, Pointers.LUDIV));
+-  LDIVHandlerAddress = EmitLongALUOpHandler(STATE_PTR(CpuStateFrame, Pointers.LDIV));
+-
+   EmitF64Sin();
+   EmitF64Cos();
+   EmitF64Tan();
+@@ -2258,12 +2220,16 @@ uint64_t Dispatcher::GenerateABICall(FallbackABI ABI) {
+   constexpr static auto VABI1 = ARMEmitter::VReg::v0;
+   constexpr static auto VABI2 = ARMEmitter::VReg::v1;
+ 
++  // Only the F64 handlers call host libm. The F80 handlers use integer-only SoftFloat/cephes and the string compare
++  // handlers use integer SIMD, so they can run with the guest AFP bits still set in FPCR and skip both FPCR writes.
++  const bool FPCR = ABI == FABI_F64_F64_PTR || ABI == FABI_F64_F64_F64_PTR || ABI == FABI_F64x2_F64_PTR;
++
+   auto FillF80x2Result = [&]() {
+     if (!TMP_ABIARGS) {
+       mov(VTMP1.Q(), VABI1.Q());
+       mov(VTMP2.Q(), VABI2.Q());
+     }
+-    FillForABICall(CTX->HostFeatures.SupportsPreserveAllABI, true);
++    FillForABICall(CTX->HostFeatures.SupportsPreserveAllABI, true, FPCR);
+   };
+ 
+   auto FillF64x2Result = [&]() {
+@@ -2271,49 +2237,49 @@ uint64_t Dispatcher::GenerateABICall(FallbackABI ABI) {
+       fmov(VTMP1.D(), VABI1.D());
+       fmov(VTMP2.D(), VABI2.D());
+     }
+-    FillForABICall(CTX->HostFeatures.SupportsPreserveAllABI, true);
++    FillForABICall(CTX->HostFeatures.SupportsPreserveAllABI, true, FPCR);
+   };
+ 
+   auto FillF80Result = [&]() {
+     if (VTMP1 != VABI1) {
+       mov(VTMP1.Q(), VABI1.Q());
+     }
+-    FillForABICall(CTX->HostFeatures.SupportsPreserveAllABI, true);
++    FillForABICall(CTX->HostFeatures.SupportsPreserveAllABI, true, FPCR);
+   };
+ 
+   auto FillF64Result = [&]() {
+     if (!TMP_ABIARGS) {
+       fmov(VTMP1.D(), VABI1.D());
+     }
+-    FillForABICall(CTX->HostFeatures.SupportsPreserveAllABI, true);
++    FillForABICall(CTX->HostFeatures.SupportsPreserveAllABI, true, FPCR);
+   };
+ 
+   auto FillF32Result = [&]() {
+     if (!TMP_ABIARGS) {
+       fmov(VTMP1.S(), VABI1.S());
+     }
+-    FillForABICall(CTX->HostFeatures.SupportsPreserveAllABI, true);
++    FillForABICall(CTX->HostFeatures.SupportsPreserveAllABI, true, FPCR);
+   };
+ 
+   auto FillI64Result = [&]() {
+     if (!TMP_ABIARGS) {
+       mov(TMP1, ARMEmitter::XReg::x0);
+     }
+-    FillForABICall(CTX->HostFeatures.SupportsPreserveAllABI, true);
++    FillForABICall(CTX->HostFeatures.SupportsPreserveAllABI, true, FPCR);
+   };
+ 
+   auto FillI32Result = [&]() {
+     if (!TMP_ABIARGS) {
+       mov(TMP1.W(), ARMEmitter::WReg::w0);
+     }
+-    FillForABICall(CTX->HostFeatures.SupportsPreserveAllABI, true);
++    FillForABICall(CTX->HostFeatures.SupportsPreserveAllABI, true, FPCR);
+   };
+ 
+   auto FillI16Result = [&]() {
+     if (!TMP_ABIARGS) {
+       mov(TMP1, ARMEmitter::XReg::x0);
+     }
+-    FillForABICall(CTX->HostFeatures.SupportsPreserveAllABI, true);
++    FillForABICall(CTX->HostFeatures.SupportsPreserveAllABI, true, FPCR);
+   };
+ 
+   switch (ABI) {
+@@ -2351,7 +2317,7 @@ uint64_t Dispatcher::GenerateABICall(FallbackABI ABI) {
+     // tmp4 (x4/x13): FallbackHandler
+     // x30: return
+     // vtmp1 (v0/v16): source
+-    SpillForABICall(CTX->HostFeatures.SupportsPreserveAllABI, TMP3, true);
++    SpillForABICall(CTX->HostFeatures.SupportsPreserveAllABI, TMP3, true, FPCR);
+ 
+     ldrh(ARMEmitter::WReg::w0, STATE, offsetof(FEXCore::Core::CPUState, FCW));
+     if (!TMP_ABIARGS) {
+@@ -2372,7 +2338,7 @@ uint64_t Dispatcher::GenerateABICall(FallbackABI ABI) {
+     // tmp4 (x4/x13): FallbackHandler
+     // x30: return
+     // vtmp1 (v0/v16): source
+-    SpillForABICall(CTX->HostFeatures.SupportsPreserveAllABI, TMP3, true);
++    SpillForABICall(CTX->HostFeatures.SupportsPreserveAllABI, TMP3, true, FPCR);
+ 
+     ldrh(ARMEmitter::WReg::w0, STATE, offsetof(FEXCore::Core::CPUState, FCW));
+     if (!TMP_ABIARGS) {
+@@ -2393,7 +2359,7 @@ uint64_t Dispatcher::GenerateABICall(FallbackABI ABI) {
+     // tmp4 (x4/x13): FallbackHandler
+     // x30: return
+     // vtmp1 (v0/v16): vector source
+-    SpillForABICall(CTX->HostFeatures.SupportsPreserveAllABI, TMP3, true);
++    SpillForABICall(CTX->HostFeatures.SupportsPreserveAllABI, TMP3, true, FPCR);
+ 
+     if (!TMP_ABIARGS) {
+       fmov(VABI1.D(), VTMP1.D());
+@@ -2414,7 +2380,7 @@ uint64_t Dispatcher::GenerateABICall(FallbackABI ABI) {
+     // x30: return
+     // vtmp1 (v0/v16): vector source 1
+     // vtmp2 (v1/v17): vector source 2
+-    SpillForABICall(CTX->HostFeatures.SupportsPreserveAllABI, TMP3, true);
++    SpillForABICall(CTX->HostFeatures.SupportsPreserveAllABI, TMP3, true, FPCR);
+ 
+     if (!TMP_ABIARGS) {
+       fmov(VABI1.D(), VTMP1.D());
+@@ -2435,7 +2401,7 @@ uint64_t Dispatcher::GenerateABICall(FallbackABI ABI) {
+     // tmp4 (x4/x13): FallbackHandler
+     // x30: return
+     // vtmp1 (v0/v16): source
+-    SpillForABICall(CTX->HostFeatures.SupportsPreserveAllABI, TMP3, true);
++    SpillForABICall(CTX->HostFeatures.SupportsPreserveAllABI, TMP3, true, FPCR);
+ 
+     ldrh(ARMEmitter::WReg::w0, STATE, offsetof(FEXCore::Core::CPUState, FCW));
+     if (!TMP_ABIARGS) {
+@@ -2456,7 +2422,7 @@ uint64_t Dispatcher::GenerateABICall(FallbackABI ABI) {
+     // tmp4 (x4/x13): FallbackHandler
+     // x30: return
+     // vtmp1 (v0/v16): source
+-    SpillForABICall(CTX->HostFeatures.SupportsPreserveAllABI, TMP3, true);
++    SpillForABICall(CTX->HostFeatures.SupportsPreserveAllABI, TMP3, true, FPCR);
+ 
+     ldrh(ARMEmitter::WReg::w0, STATE, offsetof(FEXCore::Core::CPUState, FCW));
+     if (!TMP_ABIARGS) {
+@@ -2477,7 +2443,7 @@ uint64_t Dispatcher::GenerateABICall(FallbackABI ABI) {
+     // tmp4 (x4/x13): FallbackHandler
+     // x30: return
+     // vtmp1 (v0/v16): source
+-    SpillForABICall(CTX->HostFeatures.SupportsPreserveAllABI, TMP3, true);
++    SpillForABICall(CTX->HostFeatures.SupportsPreserveAllABI, TMP3, true, FPCR);
+ 
+     ldrh(ARMEmitter::WReg::w0, STATE, offsetof(FEXCore::Core::CPUState, FCW));
+     if (!TMP_ABIARGS) {
+@@ -2499,7 +2465,7 @@ uint64_t Dispatcher::GenerateABICall(FallbackABI ABI) {
+     // x30: return
+     // vtmp1 (v0/v16): vector source 1
+     // vtmp2 (v1/v17): vector source 2
+-    SpillForABICall(CTX->HostFeatures.SupportsPreserveAllABI, TMP3, true);
++    SpillForABICall(CTX->HostFeatures.SupportsPreserveAllABI, TMP3, true, FPCR);
+ 
+     ldrh(ARMEmitter::WReg::w0, STATE, offsetof(FEXCore::Core::CPUState, FCW));
+     if (!TMP_ABIARGS) {
+@@ -2521,7 +2487,7 @@ uint64_t Dispatcher::GenerateABICall(FallbackABI ABI) {
+     // tmp4 (x4/x13): FallbackHandler
+     // x30: return
+     // vtmp1 (v0/v16): vector source 1
+-    SpillForABICall(CTX->HostFeatures.SupportsPreserveAllABI, TMP3, true);
++    SpillForABICall(CTX->HostFeatures.SupportsPreserveAllABI, TMP3, true, FPCR);
+ 
+     ldrh(ARMEmitter::WReg::w0, STATE, offsetof(FEXCore::Core::CPUState, FCW));
+     mov(ARMEmitter::XReg::x1, STATE);
+@@ -2543,7 +2509,7 @@ uint64_t Dispatcher::GenerateABICall(FallbackABI ABI) {
+     // x30: return
+     // vtmp1 (v0/v16): vector source 1
+     // vtmp2 (v1/v17): vector source 2
+-    SpillForABICall(CTX->HostFeatures.SupportsPreserveAllABI, TMP3, true);
++    SpillForABICall(CTX->HostFeatures.SupportsPreserveAllABI, TMP3, true, FPCR);
+ 
+     ldrh(ARMEmitter::WReg::w0, STATE, offsetof(FEXCore::Core::CPUState, FCW));
+     if (!TMP_ABIARGS) {
+@@ -2567,7 +2533,7 @@ uint64_t Dispatcher::GenerateABICall(FallbackABI ABI) {
+     // vtmp1 (v0/v16): vector source 1
+     // vtmp2 (v1/v16): vector source 2
+ 
+-    SpillForABICall(CTX->HostFeatures.SupportsPreserveAllABI, TMP3, true);
++    SpillForABICall(CTX->HostFeatures.SupportsPreserveAllABI, TMP3, true, FPCR);
+ 
+     ldrh(ARMEmitter::WReg::w0, STATE, offsetof(FEXCore::Core::CPUState, FCW));
+     mov(ARMEmitter::XReg::x1, STATE);
+@@ -2590,7 +2556,7 @@ uint64_t Dispatcher::GenerateABICall(FallbackABI ABI) {
+     // vtmp1 (v0/v16): vector source 1
+     // vtmp2 (v1/v16): vector source 2
+ 
+-    SpillForABICall(CTX->HostFeatures.SupportsPreserveAllABI, TMP3, true);
++    SpillForABICall(CTX->HostFeatures.SupportsPreserveAllABI, TMP3, true, FPCR);
+ 
+     mov(ARMEmitter::XReg::x0, STATE);
+     if (!TMP_ABIARGS) {
+@@ -2615,7 +2581,7 @@ uint64_t Dispatcher::GenerateABICall(FallbackABI ABI) {
+     // tmp2 (x1/x11): source 2
+     // tmp3 (x2/x12): source 3
+ 
+-    const size_t OriginalSPOffset = SpillForABICall(CTX->HostFeatures.SupportsPreserveAllABI, TMP4, true);
++    const size_t OriginalSPOffset = SpillForABICall(CTX->HostFeatures.SupportsPreserveAllABI, TMP4, true, FPCR);
+ 
+     // Load the Fallback handler pointer from the stack.
+     ldr(FallbackPointerReg, ARMEmitter::XReg::rsp, OriginalSPOffset);
+@@ -2643,7 +2609,7 @@ uint64_t Dispatcher::GenerateABICall(FallbackABI ABI) {
+     // vtmp1 (v0/v16): vector source 1
+     // vtmp2 (v1/v17): vector source 2
+     // tmp1 (x0/x10): source 1
+-    SpillForABICall(CTX->HostFeatures.SupportsPreserveAllABI, TMP3, true);
++    SpillForABICall(CTX->HostFeatures.SupportsPreserveAllABI, TMP3, true, FPCR);
+ 
+     if (!TMP_ABIARGS) {
+       mov(VABI1.Q(), VTMP1.Q());
+diff --git a/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.h b/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.h
+index 9df667efb76dc739bfcd23eebe3dfd000001067e..8b1f7ff4002a26202b17ca79ce62594cfe69c480 100644
+--- a/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.h
++++ b/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.h
+@@ -97,10 +97,6 @@ private:
+   uint64_t Start {};
+   uint64_t End {};
+ 
+-  // Long division helpers
+-  uint64_t LUDIVHandlerAddress {};
+-  uint64_t LDIVHandlerAddress {};
+-
+   // F64 reduced-precision shared handlers
+   uint64_t F64SinHandlerAddress {};
+   uint64_t F64CosHandlerAddress {};
+diff --git a/FEXCore/Source/Interface/Core/Frontend.cpp b/FEXCore/Source/Interface/Core/Frontend.cpp
+index 78d5f1a2eca17f23c5b01c03036d8960a279239f..617541dde7c74ae846dff317e77d1d388ab11788 100644
+--- a/FEXCore/Source/Interface/Core/Frontend.cpp
++++ b/FEXCore/Source/Interface/Core/Frontend.cpp
+@@ -728,9 +728,9 @@ Decoder::DecodedBlockStatus Decoder::NormalOpHeader(const FEXCore::X86Tables::X8
+     const FEXCore::X86Tables::X86InstInfo* LocalInfo = &SecondInstGroupOps[LocalOp];
+ #undef OPD
+     if (LocalInfo->Type == FEXCore::X86Tables::TYPE_SECOND_GROUP_MODRM && ModRM.mod == 0b11) {
+-      // Everything in this group is privileged instructions aside from XGETBV
++      // Everything in this group is privileged instructions aside from XGETBV and SERIALIZE
+       constexpr std::array<uint8_t, 8> RegToField = {
+-        255, 0, 1, 2, 255, 255, 255, 3,
++        255, 0, 1, 2, 255, 4, 255, 3,
+       };
+       uint8_t Field = RegToField[ModRM.reg];
+       if (Field == 255) {
+@@ -739,6 +739,9 @@ Decoder::DecodedBlockStatus Decoder::NormalOpHeader(const FEXCore::X86Tables::X8
+ 
+       LocalOp = (Field << 3) | ModRM.rm;
+       return NormalOp(&SecondModRMTableOps[LocalOp], LocalOp);
++    } else if (LocalInfo->Type == FEXCore::X86Tables::TYPE_SECOND_GROUP_MODRM && ModRM.reg == 5) {
++      // Only register forms of NP 0F 01 /5 (SERIALIZE) exist.
++      return DecodedBlockStatus::INVALID_INST;
+     } else {
+       return NormalOp(&SecondInstGroupOps[LocalOp], LocalOp);
+     }
+@@ -942,23 +945,24 @@ Decoder::DecodedBlockStatus Decoder::DecodeInstructionImpl(uint64_t PC) {
+           // If any of these three prefixes are used then it falls down the subtable
+           // Additionally: If you hit repeat of differnt prefixes then only the LAST one before this one works for subtable selection
+ 
+-          bool NoOverlay = (FEXCore::X86Tables::SecondBaseOps[EscapeOp].Flags & InstFlags::FLAGS_NO_OVERLAY) != 0;
+-          bool NoOverlay66 = (FEXCore::X86Tables::SecondBaseOps[EscapeOp].Flags & InstFlags::FLAGS_NO_OVERLAY66) != 0;
++          const bool NoOverlay = (FEXCore::X86Tables::SecondBaseOps[EscapeOp].Flags & InstFlags::FLAGS_NO_OVERLAY) != 0;
++          const bool NoOverlay66 = (FEXCore::X86Tables::SecondBaseOps[EscapeOp].Flags & InstFlags::FLAGS_NO_OVERLAY66) != 0;
++          const bool NoPrefixOrder = (FEXCore::X86Tables::SecondBaseOps[EscapeOp].Flags & InstFlags::FLAGS_NO_PREFIX_ORDER) != 0;
+ 
+           DecodeREXIfValid(-2);
+           if (NoOverlay) { // This section of the table ignores prefix extention
+             return NormalOpHeader(&FEXCore::X86Tables::SecondBaseOps[EscapeOp], EscapeOp);
+-          } else if (LastEscapePrefix == 0xF3) { // REP
++          } else if (LastEscapePrefix == 0xF3 || (NoPrefixOrder && DecodeInst->Flags & DecodeFlags::FLAG_REP_PREFIX)) { // REP
+             // Remove prefix so it doesn't effect calculations.
+             // This is only an escape prefix rather tan modifier now
+             DecodeInst->Flags &= ~DecodeFlags::FLAG_REP_PREFIX;
+             return NormalOpHeader(&FEXCore::X86Tables::RepModOps[EscapeOp], EscapeOp);
+-          } else if (LastEscapePrefix == 0xF2) { // REPNE
++          } else if (LastEscapePrefix == 0xF2 || (NoPrefixOrder && DecodeInst->Flags & DecodeFlags::FLAG_REPNE_PREFIX)) { // REPNE
+             // Remove prefix so it doesn't effect calculations.
+             // This is only an escape prefix rather tan modifier now
+             DecodeInst->Flags &= ~DecodeFlags::FLAG_REPNE_PREFIX;
+             return NormalOpHeader(&FEXCore::X86Tables::RepNEModOps[EscapeOp], EscapeOp);
+-          } else if (LastEscapePrefix == 0x66 && !NoOverlay66) { // Operand Size
++          } else if ((LastEscapePrefix == 0x66 || (NoPrefixOrder && DecodeInst->Flags & DecodeFlags::FLAG_OPERAND_SIZE)) && !NoOverlay66) { // Operand Size
+             // Remove prefix so it doesn't effect calculations.
+             // This is only an escape prefix rather tan modifier now
+             DecodeInst->Flags &= ~DecodeFlags::FLAG_OPERAND_SIZE;
+diff --git a/FEXCore/Source/Interface/Core/JIT/ALUOps.cpp b/FEXCore/Source/Interface/Core/JIT/ALUOps.cpp
+index b65bf80fce77580ebc2cf4cd84a4968d0600ba25..39d8b20ea2eff32af608cb6bff9478e6a7e78ce0 100644
+--- a/FEXCore/Source/Interface/Core/JIT/ALUOps.cpp
++++ b/FEXCore/Source/Interface/Core/JIT/ALUOps.cpp
+@@ -756,7 +756,88 @@ DEF_OP(PDep) {
+       bdep(ARMEmitter::SubRegSize::i64Bit, VTMP1.Z(), VTMP1.Z(), VTMP2.Z());
+       umov<ARMEmitter::SubRegSize::i64Bit>(Dest, VTMP1, 0);
+     }
+-  } else {
++    return;
++  }
++
++  ARMEmitter::ForwardLabel Loop;
++  ARMEmitter::ForwardLabel Done;
++
++  if (CTX->HostFeatures.SupportsPMULL_128Bit && CTX->HostFeatures.SupportsCSSC) {
++    // Branchless expand from Hacker's Delight 7-5. The mask half is the PEXT compress rounds
++    // (prefix-XOR via carry-less multiply with all-ones), recording the moved-bit mask of each
++    // round; the value is then expanded by replaying those masks in reverse with left shifts.
++    // The recorded masks do not fit in the scratch registers, so they go to a small host stack
++    // frame. It costs a constant ~75 instructions, so masks with few set bits still take the
++    // loop below. In guest measurements on M5 Pro the two break even at about 13 set bits for
++    // 64-bit and 11 for 32-bit.
++    // Only non-flag-setting instructions are used, so NZCV is untouched.
++    const uint32_t LoopMaxPopCount = EmitSize == ARMEmitter::Size::i32Bit ? 11 : 13;
++    const auto MoveKeep = TMP1.R(); // mk, then the expanded value once the mask rounds are done
++    const auto MaskCur = TMP2.R();
++    const auto MoveVal = TMP3.R();
++    const auto Temp = TMP4.R();
++    const auto Prefix = VTMP1;
++    const auto AllOnes = VTMP2;
++    const int Rounds = EmitSize == ARMEmitter::Size::i32Bit ? 5 : 6;
++    constexpr uint32_t FrameSize = 48;
++
++    cnt(EmitSize, TMP1, OrigMask);
++    sub(ARMEmitter::Size::i64Bit, TMP1, TMP1, LoopMaxPopCount);
++    (void)tbnz(TMP1, 63, &Loop);
++
++    sub(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::rsp, ARMEmitter::Reg::rsp, FrameSize);
++    movi(ARMEmitter::SubRegSize::i64Bit, AllOnes.Q(), ~0ULL);
++    mvn(EmitSize, MoveKeep, OrigMask);
++    lsl(EmitSize, MoveKeep, MoveKeep, 1);
++    mov(EmitSize, MaskCur, OrigMask);
++
++    for (int Round = 0; Round < Rounds; ++Round) {
++      const int Shift = 1 << Round;
++      // A 32-bit move zero-extends, and the upper half of the product is discarded by the
++      // 32-bit operations that follow.
++      if (EmitSize == ARMEmitter::Size::i32Bit) {
++        fmov(ARMEmitter::Size::i32Bit, Prefix.S(), MoveKeep.W());
++      } else {
++        fmov(ARMEmitter::Size::i64Bit, Prefix.D(), MoveKeep.X());
++      }
++      pmull(ARMEmitter::SubRegSize::i128Bit, Prefix.D(), Prefix.D(), AllOnes.D());
++      if (EmitSize == ARMEmitter::Size::i32Bit) {
++        fmov(ARMEmitter::Size::i32Bit, MoveVal.W(), Prefix.S());
++      } else {
++        fmov(ARMEmitter::Size::i64Bit, MoveVal.X(), Prefix.D());
++      }
++      if (Round != Rounds - 1) {
++        bic(EmitSize, MoveKeep, MoveKeep, MoveVal);
++      }
++      and_(EmitSize, MoveVal, MoveVal, MaskCur);
++      if (Round != Rounds - 1) {
++        eor(EmitSize, MaskCur, MaskCur, MoveVal);
++        orr(EmitSize, MaskCur, MaskCur, MoveVal, ARMEmitter::ShiftType::LSR, Shift);
++        str(MoveVal.X(), ARMEmitter::Reg::rsp, Round * 8);
++      }
++    }
++
++    // Expand, last round first. The last round's moved-bit mask is still in MoveVal.
++    const auto Value = MoveKeep;
++    mov(ARMEmitter::Size::i64Bit, Value, OrigInput);
++    for (int Round = Rounds - 1; Round >= 0; --Round) {
++      const int Shift = 1 << Round;
++      if (Round != Rounds - 1) {
++        ldr(MoveVal.X(), ARMEmitter::Reg::rsp, Round * 8);
++      }
++      lsl(EmitSize, Temp, Value, Shift);
++      bic(EmitSize, Value, Value, MoveVal);
++      and_(EmitSize, Temp, Temp, MoveVal);
++      orr(EmitSize, Value, Value, Temp);
++    }
++    add(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::rsp, ARMEmitter::Reg::rsp, FrameSize);
++    // Dest may alias the input or mask, so it is written last.
++    and_(EmitSize, Dest, Value, OrigMask);
++    (void)b(&Done);
++    (void)Bind(&Loop);
++  }
++
++  {
+     // PDep implementation follows the ideas from
+     // http://0x80.pl/articles/pdep-soft-emu.html ... Basically, iterate the *set*
+     // bits only, which will be faster than the naive implementation as long as
+@@ -777,7 +858,6 @@ DEF_OP(PDep) {
+     const auto T1 = TMP4.R();
+ 
+     ARMEmitter::BackwardLabel NextBit;
+-    ARMEmitter::ForwardLabel Done;
+ 
+     // First, copy the input/mask, since we'll be clobbering. Copy as 64-bit to
+     // make this 0-uop on Firestorm.
+@@ -832,14 +912,73 @@ DEF_OP(PExt) {
+       bext(ARMEmitter::SubRegSize::i64Bit, VTMP1.Z(), VTMP1.Z(), VTMP2.Z());
+       umov<ARMEmitter::SubRegSize::i64Bit>(Dest, VTMP1, 0);
+     }
+-  } else {
++    return;
++  }
++
++  ARMEmitter::ForwardLabel Loop;
++  ARMEmitter::ForwardLabel Done;
++  const bool Branchless = CTX->HostFeatures.SupportsPMULL_128Bit && CTX->HostFeatures.SupportsCSSC;
++
++  if (Branchless) {
++    // Branchless compress from Hacker's Delight 7-4, with the prefix-XOR of each round computed
++    // by a carry-less multiply with all-ones. Each round moves every selected bit right by
++    // 1, 2, 4, ... positions according to the parity of the zero mask bits below it.
++    // It costs a constant ~60 instructions, so masks with few set bits still take the loop
++    // below. In guest measurements on M5 Pro the two break even at about 10 set bits for
++    // 64-bit and 8 for 32-bit.
++    // Only non-flag-setting instructions are used, so NZCV is untouched.
++    const uint32_t LoopMaxPopCount = EmitSize == ARMEmitter::Size::i32Bit ? 8 : 10;
++    const auto MoveKeep = TMP1.R();  // mk: bits whose zero-count parity is still pending
++    const auto MaskCur = TMP2.R();   // m, compressed alongside the value
++    const auto MoveVal = TMP3.R();   // mv
++    const auto Prefix = VTMP1;
++    const auto AllOnes = VTMP2;
++    const auto RegSize = EmitSize == ARMEmitter::Size::i32Bit ? 32 : 64;
++
++    cnt(EmitSize, TMP1, Mask);
++    sub(ARMEmitter::Size::i64Bit, TMP1, TMP1, LoopMaxPopCount);
++    (void)tbnz(TMP1, 63, &Loop);
++
++    movi(ARMEmitter::SubRegSize::i64Bit, AllOnes.Q(), ~0ULL);
++    mvn(EmitSize, MoveKeep, Mask);
++    lsl(EmitSize, MoveKeep, MoveKeep, 1);
++    mov(EmitSize, MaskCur, Mask);
++    // Dest may alias Input or Mask, so it is written only after both are consumed.
++    and_(EmitSize, Dest, Input, Mask);
++
++    for (int Shift = 1; Shift < RegSize; Shift <<= 1) {
++      // mp = prefix_xor(mk). A 32-bit move zero-extends, and the upper half of the product
++      // is discarded by the 32-bit operations that follow.
++      if (EmitSize == ARMEmitter::Size::i32Bit) {
++        fmov(ARMEmitter::Size::i32Bit, Prefix.S(), MoveKeep.W());
++      } else {
++        fmov(ARMEmitter::Size::i64Bit, Prefix.D(), MoveKeep.X());
++      }
++      pmull(ARMEmitter::SubRegSize::i128Bit, Prefix.D(), Prefix.D(), AllOnes.D());
++      if (EmitSize == ARMEmitter::Size::i32Bit) {
++        fmov(ARMEmitter::Size::i32Bit, MoveVal.W(), Prefix.S());
++      } else {
++        fmov(ARMEmitter::Size::i64Bit, MoveVal.X(), Prefix.D());
++      }
++      bic(EmitSize, MoveKeep, MoveKeep, MoveVal);
++      and_(EmitSize, MoveVal, MoveVal, MaskCur);
++      eor(EmitSize, MaskCur, MaskCur, MoveVal);
++      orr(EmitSize, MaskCur, MaskCur, MoveVal, ARMEmitter::ShiftType::LSR, Shift);
++      and_(EmitSize, MoveVal, Dest, MoveVal);
++      eor(EmitSize, Dest, Dest, MoveVal);
++      orr(EmitSize, Dest, Dest, MoveVal, ARMEmitter::ShiftType::LSR, Shift);
++    }
++    (void)b(&Done);
++    (void)Bind(&Loop);
++  }
++
++  {
+     const auto MaskReg = TMP1;
+     const auto BitReg = TMP2;
+     const auto ValueReg = TMP3;
+ 
+     ARMEmitter::ForwardLabel EarlyExit;
+     ARMEmitter::BackwardLabel NextBit;
+-    ARMEmitter::ForwardLabel Done;
+ 
+     (void)cbz(EmitSize, Mask, &EarlyExit);
+     mov(EmitSize, MaskReg, Mask);
+@@ -865,12 +1004,134 @@ DEF_OP(PExt) {
+   }
+ }
+ 
++// Divide a uint128_t by a uint64_t, producing the low 64 bits of the quotient.
++//
++// Adapted from divllu() in libdivide: https://github.com/ridiculousfish/libdivide/blob/master/doc/divlu.c
++// divllu() specifically is licensed as public domain, despite the zlib license that covers the rest of libdivide.
++// divllu() is itself an adaptation of Knuth's classic Algorithm D for long division, with some optimizations.
++// The C comments below follow divllu().
++//
++// Unlike upstream FEX, this never uses the remainder destination as a temporary: it may be invalid when the
++// DIV remainder is unobserved. It needs only TMP1-TMP4 and Quotient. The partial remainder is derived from the
++// estimate correction (rem = c2 - c1 + k * den) instead of a multiply, and q1 is parked in the dead high digit
++// of numlo. Clobbers NZCV.
++//
++// Additional reading:
++// https://ridiculousfish.com/blog/posts/labor-of-division-episode-iv.html
++// https://ridiculousfish.com/blog/posts/labor-of-division-episode-v.html
++void Arm64JITCore::EmitDivllu(ARMEmitter::Register Quotient, ARMEmitter::Register Upper, ARMEmitter::Register Lower,
++                              ARMEmitter::Register Divisor) {
++  const auto EmitSize = ARMEmitter::Size::i64Bit;
++  ARMEmitter::ForwardLabel UpperReduced {};
++  ARMEmitter::ForwardLabel HighDigitDone {};
++  ARMEmitter::ForwardLabel LowDigitDone {};
++
++  // We work in base 2**32. Our numerator is conceptually [num3, num2, num1, num0], our denominator [den1, den0].
++  const auto Shift = TMP1;
++  const auto Den = TMP2;
++  const auto NumHi = TMP3;
++  const auto NumLo = TMP4;
++
++  // An x86 quotient overflow keeps the low 64 bits of the quotient, like the previous helper call:
++  // reduce numhi modulo den first so that numhi < den.
++  if (NumHi != Upper) {
++    mov(EmitSize, NumHi, Upper);
++  }
++  cmp(EmitSize, Upper, Divisor);
++  (void)b(ARMEmitter::Condition::CC_LO, &UpperReduced);
++  udiv(EmitSize, Quotient, Upper, Divisor);
++  msub(EmitSize, NumHi, Quotient, Divisor, Upper);
++  (void)Bind(&UpperReduced);
++
++  // shift = divlu_count_leading_zeros64(den);
++  clz(EmitSize, Shift, Divisor);
++  // den <<= shift;
++  lslv(EmitSize, Den, Divisor, Shift);
++  // numhi <<= shift;
++  lslv(EmitSize, NumHi, NumHi, Shift);
++  // numhi |= (numlo >> (-shift & 63)) & (-(int64_t)shift >> 63);
++  // Computed as (numlo >> (63 - shift)) >> 1, which is zero when shift is zero.
++  mvn(EmitSize, Quotient, Shift);
++  lsrv(EmitSize, Quotient, Lower, Quotient);
++  orr(EmitSize, NumHi, NumHi, Quotient, ARMEmitter::ShiftType::LSR, 1);
++  // numlo <<= shift;
++  lslv(EmitSize, NumLo, Lower, Shift);
++
++  // q1 = [n3 n2 n1] / [d1 d0], estimated as [n3 n2] / [d1] and then corrected.
++  {
++    const auto Den1 = TMP1;
++    const auto Den0 = TMP1;
++    const auto C1 = TMP1;
++    const auto RHat = NumHi;
++    const auto C2 = NumHi;
++
++    // qhat = numhi / den1;
++    lsr(EmitSize, Den1, Den, 32);
++    udiv(EmitSize, Quotient, NumHi, Den1);
++    // rhat = numhi % den1;
++    msub(EmitSize, RHat, Quotient, Den1, NumHi);
++    // c1 = qhat * den0;
++    mov(ARMEmitter::Size::i32Bit, Den0, Den);
++    mul(EmitSize, C1, Quotient, Den0);
++    // c2 = rhat * b + num1;
++    extr(EmitSize, C2, RHat, NumLo, 32);
++    // if (c1 > c2) qhat -= (c1 - c2 > den) ? 2 : 1;
++    // C1 holds c1 - c2 - k * den, where k is the number of corrections.
++    subs(EmitSize, C1, C1, C2);
++    (void)b(ARMEmitter::Condition::CC_LS, &HighDigitDone);
++    sub(EmitSize, Quotient, Quotient, 1);
++    subs(EmitSize, C1, C1, Den);
++    (void)b(ARMEmitter::Condition::CC_LS, &HighDigitDone);
++    sub(EmitSize, Quotient, Quotient, 1);
++    sub(EmitSize, C1, C1, Den);
++    (void)Bind(&HighDigitDone);
++  }
++
++  // rem = numhi * b + num1 - q1 * den = c2 - c1 + k * den;
++  const auto Rem = NumHi;
++  neg(EmitSize, Rem, TMP1);
++  // num1 is dead: numlo = [num0, q1].
++  orr(EmitSize, NumLo, Quotient, NumLo, ARMEmitter::ShiftType::LSL, 32);
++
++  // q0 = [rem1 rem0 n0] / [d1 d0], estimated as [rem1 rem0] / [d1] and then corrected.
++  {
++    const auto Den1 = TMP1;
++    const auto Den0 = TMP1;
++    const auto C1 = TMP1;
++    const auto RHat = Rem;
++    const auto C2 = Rem;
++
++    // qhat = rem / den1;
++    lsr(EmitSize, Den1, Den, 32);
++    udiv(EmitSize, Quotient, Rem, Den1);
++    // rhat = rem % den1;
++    msub(EmitSize, RHat, Quotient, Den1, Rem);
++    // c1 = qhat * den0;
++    mov(ARMEmitter::Size::i32Bit, Den0, Den);
++    mul(EmitSize, C1, Quotient, Den0);
++    // c2 = rhat * b + num0;
++    extr(EmitSize, C2, RHat, NumLo, 32);
++    // if (c1 > c2) qhat -= (c1 - c2 > den) ? 2 : 1;
++    subs(EmitSize, C1, C1, C2);
++    (void)b(ARMEmitter::Condition::CC_LS, &LowDigitDone);
++    sub(EmitSize, Quotient, Quotient, 1);
++    cmp(EmitSize, C1, Den);
++    (void)b(ARMEmitter::Condition::CC_LS, &LowDigitDone);
++    sub(EmitSize, Quotient, Quotient, 1);
++    (void)Bind(&LowDigitDone);
++  }
++
++  // q = ((uint64_t)q1 << 32) | q0;
++  orr(EmitSize, Quotient, Quotient, NumLo, ARMEmitter::ShiftType::LSL, 32);
++}
++
+ DEF_OP(Div) {
+   auto Op = IROp->C<IR::IROp_Div>();
+   const auto OpSize = IROp->Size;
+ 
+   const auto Quotient = GetReg(Op->OutQuotient);
+-  const auto Remainder = GetReg(Op->OutRemainder);
++  const bool NeedsRemainder = !Op->OutRemainder.IsInvalid();
++  const auto Remainder = NeedsRemainder ? GetReg(Op->OutRemainder) : ARMEmitter::Reg::zr;
+   auto Lower = GetReg(Op->Lower);
+   auto Divisor = GetReg(Op->Divisor);
+ 
+@@ -892,7 +1153,9 @@ DEF_OP(Div) {
+     }
+ 
+     sdiv(EmitSize, Quotient, Lower, Divisor);
+-    msub(EmitSize, Remainder, Quotient, Divisor, Lower);
++    if (NeedsRemainder) {
++      msub(EmitSize, Remainder, Quotient, Divisor, Lower);
++    }
+     return;
+   }
+ 
+@@ -907,7 +1170,9 @@ DEF_OP(Div) {
+     bfi(EmitSize, TMP1, Upper, 16, 16);
+     sxth(EmitSize, TMP2, Divisor);
+     sdiv(EmitSize, Quotient, TMP1, TMP2);
+-    msub(EmitSize, Remainder, Quotient, TMP2, TMP1);
++    if (NeedsRemainder) {
++      msub(EmitSize, Remainder, Quotient, TMP2, TMP1);
++    }
+     break;
+   }
+   case IR::OpSize::i32Bit: {
+@@ -916,7 +1181,9 @@ DEF_OP(Div) {
+     bfi(EmitSize, TMP1, Upper, 32, 32);
+     sxtw(TMP2, Divisor.W());
+     sdiv(EmitSize, Quotient, TMP1, TMP2);
+-    msub(EmitSize, Remainder, Quotient, TMP2, TMP1);
++    if (NeedsRemainder) {
++      msub(EmitSize, Remainder, Quotient, TMP2, TMP1);
++    }
+     break;
+   }
+   case IR::OpSize::i64Bit: {
+@@ -930,22 +1197,37 @@ DEF_OP(Div) {
+ 
+     // If the sign bit matches then the result is zero
+     (void)cbz(EmitSize, TMP1, &Only64Bit);
++    // x86 raises #DE here, which FEX does not emulate; keep the 64-bit sdiv result.
++    (void)cbz(EmitSize, Divisor, &Only64Bit);
+ 
+-    // Long divide
++    // Long divide: divide the magnitudes unsigned, then apply the sign.
++    // Quotient and Remainder never alias the sources, and nothing here can fault.
+     {
+-      mov(EmitSize, TMP1, Upper);
+-      mov(EmitSize, TMP2, Lower);
+-      mov(EmitSize, TMP3, Divisor);
++      const auto Sign = TMP1;
++      const auto AbsUpper = TMP3;
++      const auto AbsLower = TMP4;
++      const auto AbsDivisor = TMP2;
++
++      mrs(TMP1, ARMEmitter::SystemRegister::NZCV);
++      str(TMP1.W(), STATE.R(), offsetof(FEXCore::Core::CpuStateFrame, State.flags[X86State::RFLAG_NZCV_LOC]));
++
++      asr(EmitSize, Sign, Upper, 63);
++      eor(EmitSize, AbsLower, Lower, Sign);
++      eor(EmitSize, AbsUpper, Upper, Sign);
++      subs(EmitSize, AbsLower, AbsLower, Sign);
++      sbc(EmitSize, AbsUpper, AbsUpper, Sign);
++      cmp(EmitSize, Divisor, 0);
++      cneg(EmitSize, AbsDivisor, Divisor, ARMEmitter::Condition::CC_LT);
+ 
+-      ldr(TMP4, STATE, offsetof(FEXCore::Core::CpuStateFrame, Pointers.LDIVHandler));
++      EmitDivllu(Quotient, AbsUpper, AbsLower, AbsDivisor);
+ 
+-      str<ARMEmitter::IndexType::PRE>(ARMEmitter::XReg::lr, ARMEmitter::Reg::rsp, -16);
+-      blr(TMP4);
+-      ldr<ARMEmitter::IndexType::POST>(ARMEmitter::XReg::lr, ARMEmitter::Reg::rsp, 16);
++      // The quotient is negative when the dividend and the divisor have different signs.
++      eor(EmitSize, TMP1, Upper, Divisor);
++      cmp(EmitSize, TMP1, 0);
++      cneg(EmitSize, Quotient, Quotient, ARMEmitter::Condition::CC_LT);
+ 
+-      // Move results to the destination registers
+-      mov(EmitSize, Quotient, TMP1);
+-      mov(EmitSize, Remainder, TMP2);
++      ldr(TMP1.W(), STATE.R(), offsetof(FEXCore::Core::CpuStateFrame, State.flags[X86State::RFLAG_NZCV_LOC]));
++      msr(ARMEmitter::SystemRegister::NZCV, TMP1);
+ 
+       // Skip 64-bit path
+       (void)b(&LongDIVRet);
+@@ -953,12 +1235,12 @@ DEF_OP(Div) {
+ 
+     (void)Bind(&Only64Bit);
+     // 64-Bit only
+-    {
+-      sdiv(EmitSize, Quotient, Lower, Divisor);
+-      msub(EmitSize, Remainder, Quotient, Divisor, Lower);
+-    }
++    sdiv(EmitSize, Quotient, Lower, Divisor);
+ 
+     (void)Bind(&LongDIVRet);
++    if (NeedsRemainder) {
++      msub(EmitSize, Remainder, Quotient, Divisor, Lower);
++    }
+     break;
+   }
+   default: LOGMAN_MSG_A_FMT("Unknown DIV Size: {}", OpSize); break;
+@@ -970,7 +1252,8 @@ DEF_OP(UDiv) {
+   const auto OpSize = IROp->Size;
+ 
+   const auto Quotient = GetReg(Op->OutQuotient);
+-  const auto Remainder = GetReg(Op->OutRemainder);
++  const bool NeedsRemainder = !Op->OutRemainder.IsInvalid();
++  const auto Remainder = NeedsRemainder ? GetReg(Op->OutRemainder) : ARMEmitter::Reg::zr;
+   const auto Lower = GetReg(Op->Lower);
+   const auto Divisor = GetReg(Op->Divisor);
+ 
+@@ -979,7 +1262,9 @@ DEF_OP(UDiv) {
+   if (Op->Upper.IsInvalid()) {
+     const auto EmitSize = ConvertSize(IROp);
+     udiv(EmitSize, Quotient, Lower, Divisor);
+-    msub(EmitSize, Remainder, Quotient, Divisor, Lower);
++    if (NeedsRemainder) {
++      msub(EmitSize, Remainder, Quotient, Divisor, Lower);
++    }
+     return;
+   }
+ 
+@@ -991,7 +1276,9 @@ DEF_OP(UDiv) {
+     uxth(EmitSize, TMP1, Lower);
+     bfi(EmitSize, TMP1, Upper, 16, 16);
+     udiv(EmitSize, Quotient, TMP1, Divisor);
+-    msub(EmitSize, Remainder, Quotient, Divisor, TMP1);
++    if (NeedsRemainder) {
++      msub(EmitSize, Remainder, Quotient, Divisor, TMP1);
++    }
+     break;
+   }
+   case IR::OpSize::i32Bit: {
+@@ -1003,7 +1290,9 @@ DEF_OP(UDiv) {
+     mov(EmitSize, TMP1, Lower);
+     bfi(EmitSize, TMP1, Upper, 32, 32);
+     udiv(EmitSize, Quotient, TMP1, TMP2);
+-    msub(EmitSize, Remainder, Quotient, TMP2, TMP1);
++    if (NeedsRemainder) {
++      msub(EmitSize, Remainder, Quotient, TMP2, TMP1);
++    }
+     break;
+   }
+   case IR::OpSize::i64Bit: {
+@@ -1013,22 +1302,18 @@ DEF_OP(UDiv) {
+     // Check the upper bits for zero
+     // If the upper bits are zero then we can do a 64-bit divide
+     (void)cbz(EmitSize, Upper, &Only64Bit);
++    // x86 raises #DE here, which FEX does not emulate; keep the 64-bit udiv result.
++    (void)cbz(EmitSize, Divisor, &Only64Bit);
+ 
+-    // Long divide
++    // Long divide. Quotient and Remainder never alias the sources, and nothing here can fault.
+     {
+-      mov(EmitSize, TMP1, Upper);
+-      mov(EmitSize, TMP2, Lower);
+-      mov(EmitSize, TMP3, Divisor);
+-
+-      ldr(TMP4, STATE, offsetof(FEXCore::Core::CpuStateFrame, Pointers.LUDIVHandler));
++      mrs(TMP1, ARMEmitter::SystemRegister::NZCV);
++      str(TMP1.W(), STATE.R(), offsetof(FEXCore::Core::CpuStateFrame, State.flags[X86State::RFLAG_NZCV_LOC]));
+ 
+-      str<ARMEmitter::IndexType::PRE>(ARMEmitter::XReg::lr, ARMEmitter::Reg::rsp, -16);
+-      blr(TMP4);
+-      ldr<ARMEmitter::IndexType::POST>(ARMEmitter::XReg::lr, ARMEmitter::Reg::rsp, 16);
++      EmitDivllu(Quotient, Upper, Lower, Divisor);
+ 
+-      // Move results to the destination registers
+-      mov(EmitSize, Quotient, TMP1);
+-      mov(EmitSize, Remainder, TMP2);
++      ldr(TMP1.W(), STATE.R(), offsetof(FEXCore::Core::CpuStateFrame, State.flags[X86State::RFLAG_NZCV_LOC]));
++      msr(ARMEmitter::SystemRegister::NZCV, TMP1);
+ 
+       // Skip 64-bit path
+       (void)b(&LongDIVRet);
+@@ -1036,12 +1321,12 @@ DEF_OP(UDiv) {
+ 
+     (void)Bind(&Only64Bit);
+     // 64-Bit only
+-    {
+-      udiv(EmitSize, Quotient, Lower, Divisor);
+-      msub(EmitSize, Remainder, Quotient, Divisor, Lower);
+-    }
++    udiv(EmitSize, Quotient, Lower, Divisor);
+ 
+     (void)Bind(&LongDIVRet);
++    if (NeedsRemainder) {
++      msub(EmitSize, Remainder, Quotient, Divisor, Lower);
++    }
+     break;
+   }
+   default: LOGMAN_MSG_A_FMT("Unknown LUDIV Size: {}", OpSize); break;
+@@ -1117,10 +1402,13 @@ DEF_OP(FindLSB) {
+   const auto Dst = GetReg(Node);
+   const auto Src = GetReg(Op->Src);
+ 
+-  // We assume the source is nonzero, so we can just rbit+clz without worrying
+-  // about upper garbage for smaller types.
+-  rbit(EmitSize, TMP1, Src);
+-  clz(EmitSize, Dst, TMP1);
++  // For a nonzero narrow operand, upper garbage cannot affect the first set bit.
++  if (CTX->HostFeatures.SupportsCSSC) {
++    ctz(EmitSize, Dst, Src);
++  } else {
++    rbit(EmitSize, TMP1, Src);
++    clz(EmitSize, Dst, TMP1);
++  }
+ }
+ 
+ DEF_OP(FindMSB) {
+@@ -1134,8 +1422,6 @@ DEF_OP(FindMSB) {
+   const auto Dst = GetReg(Node);
+   const auto Src = GetReg(Op->Src);
+ 
+-  movz(ARMEmitter::Size::i64Bit, TMP1, IR::OpSizeAsBits(OpSize) - 1);
+-
+   if (OpSize == IR::OpSize::i16Bit) {
+     lsl(EmitSize, Dst, Src, 16);
+     clz(EmitSize, Dst, Dst);
+@@ -1143,7 +1429,8 @@ DEF_OP(FindMSB) {
+     clz(EmitSize, Dst, Src);
+   }
+ 
+-  sub(ARMEmitter::Size::i64Bit, Dst, TMP1, Dst);
++  // For a nonzero input, width - 1 - clz equals clz XOR (width - 1).
++  eor(EmitSize, Dst, Dst, IR::OpSizeAsBits(OpSize) - 1);
+ }
+ 
+ DEF_OP(FindTrailingZeroes) {
+@@ -1157,6 +1444,17 @@ DEF_OP(FindTrailingZeroes) {
+   const auto Dst = GetReg(Node);
+   const auto Src = GetReg(Op->Src);
+ 
++  if (CTX->HostFeatures.SupportsCSSC) {
++    if (OpSize == IR::OpSize::i16Bit) {
++      // With bit 16 set, a zero low word returns 16 regardless of the upper bits.
++      orr(EmitSize, Dst, Src, 1U << 16);
++      ctz(EmitSize, Dst, Dst);
++    } else {
++      ctz(EmitSize, Dst, Src);
++    }
++    return;
++  }
++
+   rbit(EmitSize, Dst, Src);
+ 
+   if (OpSize == IR::OpSize::i16Bit) {
+diff --git a/FEXCore/Source/Interface/Core/JIT/AtomicOps.cpp b/FEXCore/Source/Interface/Core/JIT/AtomicOps.cpp
+index 014a8c690593e3db86d4abb59c4294a9c63e589b..70707fdf4ef190813c03224f5417612e84203cf2 100644
+--- a/FEXCore/Source/Interface/Core/JIT/AtomicOps.cpp
++++ b/FEXCore/Source/Interface/Core/JIT/AtomicOps.cpp
+@@ -23,70 +23,31 @@ DEF_OP(CASPair) {
+   auto MemSrc = GetReg(Op->Addr);
+ 
+   const auto EmitSize = IROp->ElementSize == IR::OpSize::i64Bit ? ARMEmitter::Size::i64Bit : ARMEmitter::Size::i32Bit;
+-  if (CTX->HostFeatures.SupportsAtomics) {
+-    // RA has heuristics to try to pair sources, but we need to handle the cases
+-    // where they fail. We do so by moving to temporaries. Note we use 64-bit
+-    // moves here even for 32-bit cmpxchg, for the Firestorm register renamer.
+-    if (Desired1.Idx() != (Desired0.Idx() + 1) || Desired0.Idx() & 1) {
+-      mov(ARMEmitter::Size::i64Bit, TMP1, Desired0);
+-      mov(ARMEmitter::Size::i64Bit, TMP2, Desired1);
+-      Desired0 = TMP1;
+-      Desired1 = TMP2;
+-    }
+-
+-    auto CaspalDst0 = Dst0;
+-    auto CaspalDst1 = Dst1;
+-    if (CaspalDst1.Idx() != (CaspalDst0.Idx() + 1) || CaspalDst0.Idx() & 1) {
+-      CaspalDst0 = TMP3;
+-      CaspalDst1 = TMP4;
+-    }
+-
+-    // We can't clobber the source, these moves are inherently required due to
+-    // ISA limitations. But by making them 64-bit, Firestorm can rename.
+-    mov(ARMEmitter::Size::i64Bit, CaspalDst0, Expected0);
+-    mov(ARMEmitter::Size::i64Bit, CaspalDst1, Expected1);
+-    caspal(EmitSize, CaspalDst0, CaspalDst1, Desired0, Desired1, MemSrc);
+-
+-    if (CaspalDst0 != Dst0) {
+-      mov(ARMEmitter::Size::i64Bit, Dst0, CaspalDst0);
+-      mov(ARMEmitter::Size::i64Bit, Dst1, CaspalDst1);
+-    }
+-  } else {
+-    // Save NZCV so we don't have to mark this op as clobbering NZCV (the
+-    // SupportsAtomics does not clobber atomics and this !SupportsAtomics path
+-    // is so slow it's not worth the complexity of splitting the IR op.). We
+-    // clobber NZCV inside the hot loop and we can't replace cmp/ccmp/b.ne with
+-    // something NZCV-preserving without requiring an extra instruction.
+-    mrs(TMP1, ARMEmitter::SystemRegister::NZCV);
+-
+-    ARMEmitter::BackwardLabel LoopTop;
+-    ARMEmitter::ForwardLabel LoopNotExpected;
+-    ARMEmitter::ForwardLabel LoopExpected;
+-    (void)Bind(&LoopTop);
+ 
+-    // This instruction sequence must be synced with HandleCASPAL_Armv8.
+-    ldaxp(EmitSize, TMP2, TMP3, MemSrc);
+-    cmp(EmitSize, TMP2, Expected0);
+-    ccmp(EmitSize, TMP3, Expected1, ARMEmitter::StatusFlags::None, ARMEmitter::Condition::CC_EQ);
+-    (void)b(ARMEmitter::Condition::CC_NE, &LoopNotExpected);
+-    stlxp(EmitSize, TMP2, Desired0, Desired1, MemSrc);
+-    (void)cbnz(EmitSize, TMP2, &LoopTop);
+-    mov(EmitSize, Dst0, Expected0);
+-    mov(EmitSize, Dst1, Expected1);
+-
+-    (void)b(&LoopExpected);
+-
+-    (void)Bind(&LoopNotExpected);
+-    mov(EmitSize, Dst0, TMP2.R());
+-    mov(EmitSize, Dst1, TMP3.R());
+-    // exclusive monitor needs to be cleared here
+-    // Might have hit the case where ldaxr was hit but stlxr wasn't
+-    clrex();
+-    (void)Bind(&LoopExpected);
+-
+-    // Restore
+-    msr(ARMEmitter::SystemRegister::NZCV, TMP1);
+-  }
++  // LL/SC on every host, including LSE ones: under contention caspal costs about 3x more than this loop on
++  // Apple cores. The loop always stores, writing the observed value back on mismatch, as x86 locked CMPXCHG
++  // does; that keeps the line exclusive. The trailing dmb ish makes it a full barrier. Comparing with
++  // eor/orr/cbnz leaves NZCV untouched, so a fault on the store still exposes the exact guest flags.
++  // This instruction sequence must be synced with HandleCASPair_LLSC.
++  ARMEmitter::BackwardLabel LoopTop;
++  ARMEmitter::ForwardLabel LoopNotExpected;
++  ARMEmitter::ForwardLabel LoopDone;
++  (void)Bind(&LoopTop);
++  ldxp(EmitSize, TMP2, TMP3, MemSrc);
++  eor(EmitSize, TMP4, TMP2, Expected0);
++  eor(EmitSize, TMP1, TMP3, Expected1);
++  orr(EmitSize, TMP4, TMP4, TMP1);
++  (void)cbnz(EmitSize, TMP4, &LoopNotExpected);
++  stlxp(EmitSize, TMP4, Desired0, Desired1, MemSrc);
++  (void)cbnz(ARMEmitter::Size::i32Bit, TMP4, &LoopTop);
++  (void)b(&LoopDone);
++  (void)Bind(&LoopNotExpected);
++  stlxp(EmitSize, TMP4, TMP2, TMP3, MemSrc);
++  (void)cbnz(ARMEmitter::Size::i32Bit, TMP4, &LoopTop);
++  (void)Bind(&LoopDone);
++  dmb(ARMEmitter::BarrierScope::ISH);
++  mov(EmitSize, Dst0, TMP2.R());
++  mov(EmitSize, Dst1, TMP3.R());
+ }
+ 
+ DEF_OP(CAS) {
+@@ -102,40 +63,30 @@ DEF_OP(CAS) {
+   auto MemSrc = GetReg(Op->Addr);
+   auto Dst = GetReg(Node);
+ 
+-  if (CTX->HostFeatures.SupportsAtomics) {
+-    if (Expected == Dst && Dst != MemSrc && Dst != Desired) {
+-      casal(SubEmitSize, Dst, Desired, MemSrc);
+-    } else {
+-      mov(EmitSize, TMP2, Expected);
+-      casal(SubEmitSize, TMP2, Desired, MemSrc);
+-      mov(EmitSize, Dst, TMP2.R());
+-    }
++  // LL/SC on every host, including LSE ones; see CASPair for why. sub/cbnz leaves NZCV untouched.
++  // This instruction sequence must be synced with HandleCAS_LLSC.
++  ARMEmitter::BackwardLabel LoopTop;
++  ARMEmitter::ForwardLabel LoopNotExpected;
++  ARMEmitter::ForwardLabel LoopDone;
++  (void)Bind(&LoopTop);
++  ldxr(SubEmitSize, TMP2, MemSrc);
++  if (IROp->Size == IR::OpSize::i8Bit) {
++    sub(EmitSize, TMP3, TMP2, Expected, ARMEmitter::ExtendedType::UXTB, 0);
++  } else if (IROp->Size == IR::OpSize::i16Bit) {
++    sub(EmitSize, TMP3, TMP2, Expected, ARMEmitter::ExtendedType::UXTH, 0);
+   } else {
+-    ARMEmitter::BackwardLabel LoopTop;
+-    ARMEmitter::ForwardLabel LoopNotExpected;
+-    ARMEmitter::ForwardLabel LoopExpected;
+-    (void)Bind(&LoopTop);
+-    ldaxr(SubEmitSize, TMP2, MemSrc);
+-    if (IROp->Size == IR::OpSize::i8Bit) {
+-      cmp(EmitSize, TMP2, Expected, ARMEmitter::ExtendedType::UXTB, 0);
+-    } else if (IROp->Size == IR::OpSize::i16Bit) {
+-      cmp(EmitSize, TMP2, Expected, ARMEmitter::ExtendedType::UXTH, 0);
+-    } else {
+-      cmp(EmitSize, TMP2, Expected);
+-    }
+-    (void)b(ARMEmitter::Condition::CC_NE, &LoopNotExpected);
+-    stlxr(SubEmitSize, TMP3, Desired, MemSrc);
+-    (void)cbnz(EmitSize, TMP3, &LoopTop);
+-    mov(EmitSize, Dst, Expected);
+-    (void)b(&LoopExpected);
+-
+-    (void)Bind(&LoopNotExpected);
+-    mov(EmitSize, Dst, TMP2.R());
+-    // exclusive monitor needs to be cleared here
+-    // Might have hit the case where ldaxr was hit but stlxr wasn't
+-    clrex();
+-    (void)Bind(&LoopExpected);
++    sub(EmitSize, TMP3, TMP2, Expected);
+   }
++  (void)cbnz(EmitSize, TMP3, &LoopNotExpected);
++  stlxr(SubEmitSize, TMP3, Desired, MemSrc);
++  (void)cbnz(ARMEmitter::Size::i32Bit, TMP3, &LoopTop);
++  (void)b(&LoopDone);
++  (void)Bind(&LoopNotExpected);
++  stlxr(SubEmitSize, TMP3, TMP2, MemSrc);
++  (void)cbnz(ARMEmitter::Size::i32Bit, TMP3, &LoopTop);
++  (void)Bind(&LoopDone);
++  dmb(ARMEmitter::BarrierScope::ISH);
++  mov(EmitSize, Dst, TMP2.R());
+ }
+ 
+ DEF_OP(AtomicSwap) {
+diff --git a/FEXCore/Source/Interface/Core/JIT/JIT.cpp b/FEXCore/Source/Interface/Core/JIT/JIT.cpp
+index ff17db5fc9e3a4d3d766ecb4dd757914b5bc675b..50bcd9df3d32073a0c70748601af93b9a3dc19e0 100644
+--- a/FEXCore/Source/Interface/Core/JIT/JIT.cpp
++++ b/FEXCore/Source/Interface/Core/JIT/JIT.cpp
+@@ -47,30 +47,6 @@ $end_info$
+ #endif
+ 
+ namespace {
+-struct DivRem {
+-  uint64_t Quotient;
+-  uint64_t Remainder;
+-};
+-
+-static struct DivRem LUDIV(uint64_t SrcHigh, uint64_t SrcLow, uint64_t Divisor) {
+-  __uint128_t Source = (static_cast<__uint128_t>(SrcHigh) << 64) | SrcLow;
+-
+-  return {
+-    .Quotient = (uint64_t)(Source / Divisor),
+-    .Remainder = (uint64_t)(Source % Divisor),
+-  };
+-}
+-
+-static struct DivRem
+-LDIV(uint64_t SrcHigh, uint64_t SrcLow, int64_t Divisor) {
+-  __int128_t Source = (static_cast<__uint128_t>(SrcHigh) << 64) | SrcLow;
+-
+-  return {
+-    .Quotient = (uint64_t)(Source / Divisor),
+-    .Remainder = (uint64_t)(Source % Divisor),
+-  };
+-}
+-
+ #ifndef _WIN32
+ 
+ static std::optional<uint64_t>
+diff --git a/FEXCore/Source/Interface/Core/JIT/JITClass.h b/FEXCore/Source/Interface/Core/JIT/JITClass.h
+index a66d29919c40e74bc162609467af343aa33f1202..18a92a93ee4c19de302c72b67cb256af8057b8f9 100644
+--- a/FEXCore/Source/Interface/Core/JIT/JITClass.h
++++ b/FEXCore/Source/Interface/Core/JIT/JITClass.h
+@@ -635,7 +635,10 @@ private:
+ 
+   void EmitTFCheck();
+ 
++  void EmitDivllu(ARMEmitter::Register Quotient, ARMEmitter::Register Upper, ARMEmitter::Register Lower, ARMEmitter::Register Divisor);
++
+   void EmitSuspendInterruptCheck();
++  void EmitSuspendCheckedBackwardBranch(ARMEmitter::BiDirectionalLabel* Target);
+ 
+   void EmitEntryPoint(ARMEmitter::BackwardLabel& HeaderLabel, bool CheckTF);
+ 
+diff --git a/FEXCore/Source/Interface/Core/JIT/MemoryOps.cpp b/FEXCore/Source/Interface/Core/JIT/MemoryOps.cpp
+index 16a81f3db860907b5e95a6677f67a6b3b3b2ef7a..7d87fd3f3c29cf2990bafcd804cd19e9c6eb762d 100644
+--- a/FEXCore/Source/Interface/Core/JIT/MemoryOps.cpp
++++ b/FEXCore/Source/Interface/Core/JIT/MemoryOps.cpp
+@@ -1398,6 +1398,82 @@ DEF_OP(VLoadVectorElement) {
+   }
+ }
+ 
++DEF_OP(VGatherLanes) {
++  const auto Op = IROp->C<IR::IROp_VGatherLanes>();
++  LOGMAN_THROW_A_FMT(!HostSupportsAVX256, "VGatherLanes is the split-AVX 64-bit lowering");
++  const auto DataBytes = IR::OpSizeToSize(Op->DataSize);
++  const auto IndexBytes = IR::OpSizeToSize(Op->IndexSize);
++  const auto Dest = StaticFPRegisters[Op->DestReg];
++  const auto Mask = StaticFPRegisters[Op->MaskReg];
++  const auto DestHigh = offsetof(FEXCore::Core::CPUState, avx_high) + Op->DestReg * 16;
++  const auto MaskHigh = offsetof(FEXCore::Core::CPUState, avx_high) + Op->MaskReg * 16;
++  const auto SubSize = DataBytes == 8 ? ARMEmitter::SubRegSize::i64Bit : ARMEmitter::SubRegSize::i32Bit;
++  const auto Addr = TMP1;
++  const auto Value = TMP2;
++
++  for (unsigned Lane = 0; Lane < Op->Lanes; ++Lane) {
++    const bool DataHigh = Lane * DataBytes >= 16;
++    const unsigned DataLane = Lane % (16 / DataBytes);
++    const unsigned DataOffset = DataLane * DataBytes;
++
++    // The guest mask was normalized to all-ones/zero per lane; only its sign bit matters.
++    // A half known to be all ones has every lane active, but each lane still clears its mask
++    // lane below so a fault leaves completed lanes cleared.
++    ARMEmitter::ForwardLabel Skip;
++    if (!(DataHigh ? Op->MaskAllOnesHigh : Op->MaskAllOnesLow)) {
++      if (DataHigh) {
++        ldr(SubSize, Value, STATE, MaskHigh + DataOffset);
++      } else if (DataBytes == 8) {
++        umov<ARMEmitter::SubRegSize::i64Bit>(Value, Mask, DataLane);
++      } else {
++        umov<ARMEmitter::SubRegSize::i32Bit>(Value, Mask, DataLane);
++      }
++      (void)tbz(Value, DataBytes * 8 - 1, &Skip);
++    }
++
++    const auto Index = GetVReg(Lane * IndexBytes >= 16 ? Op->IndexHigh : Op->IndexLow);
++    const unsigned IndexLane = Lane % (16 / IndexBytes);
++    if (IndexBytes == 8) {
++      umov<ARMEmitter::SubRegSize::i64Bit>(Addr, Index, IndexLane);
++    } else {
++      smov<ARMEmitter::SubRegSize::i32Bit>(Addr, Index, IndexLane);
++    }
++    if (!Op->Base.IsInvalid()) {
++      add(ARMEmitter::Size::i64Bit, Addr, GetReg(Op->Base), Addr, ARMEmitter::ShiftType::LSL, Op->ScaleShift);
++    } else if (Op->ScaleShift) {
++      lsl(ARMEmitter::Size::i64Bit, Addr, Addr, Op->ScaleShift);
++    }
++    if (Op->Address32) {
++      mov(ARMEmitter::Size::i32Bit, Addr, Addr);
++    }
++    if (!Op->Segment.IsInvalid()) {
++      add(ARMEmitter::Size::i64Bit, Addr, Addr, GetReg(Op->Segment));
++    }
++
++    // A fault here leaves earlier lanes committed and this lane untouched.
++    if (Op->TSO) {
++      if (CTX->HostFeatures.SupportsRCPC) {
++        DataBytes == 8 ? ldapr(Value, Addr) : ldapr(Value.W(), Addr);
++      } else {
++        DataBytes == 8 ? ldar(Value, Addr) : ldar(Value.W(), Addr);
++      }
++      // Half-barrier once back-patched.
++      nop();
++    } else {
++      ldr(SubSize, Value, Addr, 0);
++    }
++
++    if (DataHigh) {
++      str(SubSize, Value, STATE, DestHigh + DataOffset);
++      str(SubSize, ARMEmitter::Reg::zr, STATE, MaskHigh + DataOffset);
++    } else {
++      ins(SubSize, Dest, DataLane, Value);
++      ins(SubSize, Mask, DataLane, ARMEmitter::Reg::zr);
++    }
++    (void)Bind(&Skip);
++  }
++}
++
+ DEF_OP(VStoreVectorElement) {
+   const auto Op = IROp->C<IR::IROp_VStoreVectorElement>();
+   const auto OpSize = IROp->Size;
+diff --git a/FEXCore/Source/Interface/Core/JIT/MiscOps.cpp b/FEXCore/Source/Interface/Core/JIT/MiscOps.cpp
+index f00aeb440cc92939095d82e944f6a008e6affc01..71b170c8d8508dcdee1c5b627332a3cd16296b9e 100644
+--- a/FEXCore/Source/Interface/Core/JIT/MiscOps.cpp
++++ b/FEXCore/Source/Interface/Core/JIT/MiscOps.cpp
+@@ -131,7 +131,8 @@ DEF_OP(SetRoundingMode) {
+   // and extract
+   lsr(ARMEmitter::Size::i32Bit, TMP2, TMP2, 30);
+ 
+-  mrs(TMP1, ARMEmitter::SystemRegister::FPCR);
++  mrs(TMP3, ARMEmitter::SystemRegister::FPCR);
++  mov(ARMEmitter::Size::i64Bit, TMP1, TMP3);
+ 
+   // vixl simulator doesn't support anything beyond ties-to-even rounding
+   if (CTX->Config.DisableVixlIndirectCalls) [[likely]] {
+@@ -148,8 +149,13 @@ DEF_OP(SetRoundingMode) {
+     bfxil(ARMEmitter::Size::i64Bit, TMP1, MXCSR, 6, 1);
+   }
+ 
+-  // Now save the new FPCR
++  // Now save the new FPCR, skipping the write when nothing changed: a same-value FPCR write still costs
++  // several times more than this flag-neutral compare.
++  ARMEmitter::ForwardLabel Unchanged;
++  eor(ARMEmitter::Size::i64Bit, TMP2, TMP1, TMP3);
++  (void)cbz(ARMEmitter::Size::i64Bit, TMP2, &Unchanged);
+   msr(ARMEmitter::SystemRegister::FPCR, TMP1);
++  (void)Bind(&Unchanged);
+ }
+ 
+ DEF_OP(PushRoundingMode) {
+@@ -176,13 +182,25 @@ DEF_OP(PushRoundingMode) {
+     orr(ARMEmitter::Size::i64Bit, TMP1, TMP1, (Op->RoundMode == 2 ? 1 : 2) << 22);
+   }
+ 
+-  // Now save the new FPCR
++  // Now save the new FPCR, unless the requested mode is already active.
++  ARMEmitter::ForwardLabel Unchanged;
++  eor(ARMEmitter::Size::i64Bit, TMP2, TMP1, Dest);
++  (void)cbz(ARMEmitter::Size::i64Bit, TMP2, &Unchanged);
+   msr(ARMEmitter::SystemRegister::FPCR, TMP1);
++  (void)Bind(&Unchanged);
+ }
+ 
+ DEF_OP(PopRoundingMode) {
+   auto Op = IROp->C<IR::IROp_PopRoundingMode>();
+-  msr(ARMEmitter::SystemRegister::FPCR, GetReg(Op->FPCR));
++  auto FPCR = GetReg(Op->FPCR);
++
++  // Skip the restore when PushRoundingMode did not change FPCR.
++  ARMEmitter::ForwardLabel Unchanged;
++  mrs(TMP1, ARMEmitter::SystemRegister::FPCR);
++  eor(ARMEmitter::Size::i64Bit, TMP1, TMP1, FPCR);
++  (void)cbz(ARMEmitter::Size::i64Bit, TMP1, &Unchanged);
++  msr(ARMEmitter::SystemRegister::FPCR, FPCR);
++  (void)Bind(&Unchanged);
+ }
+ 
+ DEF_OP(Print) {
+@@ -349,7 +367,9 @@ DEF_OP(RDRAND) {
+ }
+ 
+ DEF_OP(Yield) {
+-  yield();
++  // YIELD is a nop on Apple cores. Throttle polling without waiting for an event
++  // that PAUSE, unlike an exclusive-load spin loop, has no way to arrange.
++  isb();
+ }
+ 
+ DEF_OP(MonoBackpatcherWrite) {
+diff --git a/FEXCore/Source/Interface/Core/JIT/VectorOps.cpp b/FEXCore/Source/Interface/Core/JIT/VectorOps.cpp
+index 43e38d8dd7bd1637491dab2e13cdab37f9ddedc3..51555df0d515b4785501d3a29c8a069750471726 100644
+--- a/FEXCore/Source/Interface/Core/JIT/VectorOps.cpp
++++ b/FEXCore/Source/Interface/Core/JIT/VectorOps.cpp
+@@ -193,6 +193,12 @@ namespace FEXCore::CPU {
+     const auto Vector1 = GetVReg(Op->Vector1);                                                                                \
+     const auto Vector2 = GetVReg(Op->Vector2);                                                                                \
+                                                                                                                               \
++    /* FPCR.NEP takes the rest of the 128-bit result from the first source of these arithmetic operations. */                 \
++    if (HostSupportsAFP && IROp->Size == IR::OpSize::i128Bit && ElementSize != IR::OpSize::i16Bit) {                          \
++      ScalarEmit(Dst, Vector1, Vector2);                                                                                      \
++      return;                                                                                                                 \
++    }                                                                                                                         \
++                                                                                                                              \
+     VFScalarOperation(IROp->Size, ElementSize, Op->ZeroUpperBits, ScalarEmit, Dst, Vector1, Vector2);                         \
+   }
+ 
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp b/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
+index a6c3f3c2a1dce1c5dab74e31729235ad0df9da13..febc527cc20393d7873fa99762d1f02078e5dcd6 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
+@@ -185,30 +185,35 @@ void OpDispatchBuilder::SecondaryALUOp(OpcodeArgs) {
+   switch (Op->OP) {
+   case OPD(FEXCore::X86Tables::TYPE_GROUP_1, OpToIndex(0x80), 0):
+   case OPD(FEXCore::X86Tables::TYPE_GROUP_1, OpToIndex(0x81), 0):
++  case OPD(FEXCore::X86Tables::TYPE_GROUP_1, OpToIndex(0x82), 0):
+   case OPD(FEXCore::X86Tables::TYPE_GROUP_1, OpToIndex(0x83), 0):
+     IROp = FEXCore::IR::IROps::OP_ADD;
+     AtomicIROp = FEXCore::IR::IROps::OP_ATOMICFETCHADD;
+     break;
+   case OPD(FEXCore::X86Tables::TYPE_GROUP_1, OpToIndex(0x80), 1):
+   case OPD(FEXCore::X86Tables::TYPE_GROUP_1, OpToIndex(0x81), 1):
++  case OPD(FEXCore::X86Tables::TYPE_GROUP_1, OpToIndex(0x82), 1):
+   case OPD(FEXCore::X86Tables::TYPE_GROUP_1, OpToIndex(0x83), 1):
+     IROp = FEXCore::IR::IROps::OP_OR;
+     AtomicIROp = FEXCore::IR::IROps::OP_ATOMICFETCHOR;
+     break;
+   case OPD(FEXCore::X86Tables::TYPE_GROUP_1, OpToIndex(0x80), 4):
+   case OPD(FEXCore::X86Tables::TYPE_GROUP_1, OpToIndex(0x81), 4):
++  case OPD(FEXCore::X86Tables::TYPE_GROUP_1, OpToIndex(0x82), 4):
+   case OPD(FEXCore::X86Tables::TYPE_GROUP_1, OpToIndex(0x83), 4):
+     IROp = FEXCore::IR::IROps::OP_ANDWITHFLAGS;
+     AtomicIROp = FEXCore::IR::IROps::OP_ATOMICFETCHAND;
+     break;
+   case OPD(FEXCore::X86Tables::TYPE_GROUP_1, OpToIndex(0x80), 5):
+   case OPD(FEXCore::X86Tables::TYPE_GROUP_1, OpToIndex(0x81), 5):
++  case OPD(FEXCore::X86Tables::TYPE_GROUP_1, OpToIndex(0x82), 5):
+   case OPD(FEXCore::X86Tables::TYPE_GROUP_1, OpToIndex(0x83), 5):
+     IROp = FEXCore::IR::IROps::OP_SUB;
+     AtomicIROp = FEXCore::IR::IROps::OP_ATOMICFETCHSUB;
+     break;
+   case OPD(FEXCore::X86Tables::TYPE_GROUP_1, OpToIndex(0x80), 6):
+   case OPD(FEXCore::X86Tables::TYPE_GROUP_1, OpToIndex(0x81), 6):
++  case OPD(FEXCore::X86Tables::TYPE_GROUP_1, OpToIndex(0x82), 6):
+   case OPD(FEXCore::X86Tables::TYPE_GROUP_1, OpToIndex(0x83), 6):
+     IROp = FEXCore::IR::IROps::OP_XOR;
+     AtomicIROp = FEXCore::IR::IROps::OP_ATOMICFETCHXOR;
+@@ -3103,7 +3108,38 @@ void OpDispatchBuilder::SMSWOp(OpcodeArgs) {
+   }
+ 
+   if (IsMemDst) {
+-    // Memory destinatino always writes only 16-bits.
++    // Memory destination always writes only 16-bits.
++    DstSize = OpSize::i16Bit;
++  }
++
++  StoreResultGPR_WithOpSize(Op, Op->Dest, Const, DstSize);
++}
++
++void OpDispatchBuilder::SLDTOp(OpcodeArgs) {
++  const bool IsMemDst = DestIsMem(Op);
++
++  IR::OpSize DstSize {OpSize::iInvalid};
++  Ref Const = _Constant(0);
++
++  const auto OpAddr = X86Tables::DecodeFlags::GetOpAddr(Op->Flags, 0);
++  if (Is64BitMode) {
++    DstSize = OpAddr == X86Tables::DecodeFlags::FLAG_OPERAND_SIZE_LAST  ? OpSize::i16Bit :
++              OpAddr == X86Tables::DecodeFlags::FLAG_WIDENING_SIZE_LAST ? OpSize::i64Bit :
++                                                                          OpSize::i32Bit;
++
++    if (!IsMemDst && DstSize == OpSize::i32Bit) {
++      // Special-case version of `sldt ebx`. This instruction does an insert in to the lower 32-bits on 64-bit hosts.
++      // Override and insert.
++      auto Dest = LoadSourceGPR_WithOpSize(Op, Op->Dest, GetGPROpSize(), Op->Flags);
++      Const = _Bfi(OpSize::i64Bit, 32, 0, Dest, Const);
++      DstSize = OpSize::i64Bit;
++    }
++  } else {
++    DstSize = OpAddr == X86Tables::DecodeFlags::FLAG_OPERAND_SIZE_LAST ? OpSize::i16Bit : OpSize::i32Bit;
++  }
++
++  if (IsMemDst) {
++    // Memory destination always writes only 16-bits.
+     DstSize = OpSize::i16Bit;
+   }
+ 
+@@ -5028,6 +5064,12 @@ void OpDispatchBuilder::StoreFenceOrCLFlush(OpcodeArgs) {
+   }
+ }
+ 
++void OpDispatchBuilder::SerializeOp(OpcodeArgs) {
++  // Drain earlier memory accesses like MFENCE, then refetch later instructions.
++  _Fence(FenceType::LoadStore);
++  _Fence(FenceType::Inst);
++}
++
+ void OpDispatchBuilder::UMonitorOrCLRSSBSY(OpcodeArgs) {
+   if (DestIsMem(Op) || !CTX->HostFeatures.SupportsWFXT) {
+     // CLRSSBSY
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher.h b/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
+index 71766e01005e140b7fc73732c1b26d0761c75510..3782e7d29842a22567e9cfee2afcaf2dfad300a3 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
+@@ -488,6 +488,7 @@ public:
+   void SGDTOp(OpcodeArgs);
+   void SIDTOp(OpcodeArgs);
+   void SMSWOp(OpcodeArgs);
++  void SLDTOp(OpcodeArgs);
+ 
+   enum class VectorOpType {
+     MMX,
+@@ -828,6 +829,7 @@ public:
+   void LoadFenceOrXRSTOR(OpcodeArgs);
+   void MemFenceOrXSAVEOPT(OpcodeArgs);
+   void StoreFenceOrCLFlush(OpcodeArgs);
++  void SerializeOp(OpcodeArgs);
+   void UMonitorOrCLRSSBSY(OpcodeArgs);
+   void UMWaitOp(OpcodeArgs);
+   void CLZeroOp(OpcodeArgs);
+@@ -857,14 +859,6 @@ public:
+   void VFMAImpl(OpcodeArgs, IROps IROp, bool Scalar, uint8_t Src1Idx, uint8_t Src2Idx, uint8_t AddendIdx);
+   void VFMAddSubImpl(OpcodeArgs, bool AddSub, uint8_t Src1Idx, uint8_t Src2Idx, uint8_t AddendIdx);
+ 
+-  struct RefVSIB {
+-    Ref Low, High;
+-    Ref BaseAddr;
+-    int32_t Displacement;
+-    uint8_t Scale;
+-  };
+-
+-  RefVSIB LoadVSIB(const X86Tables::DecodedOp& Op, const X86Tables::DecodedOperand& Operand, uint32_t Flags);
+   void VPGATHER(OpcodeArgs, OpSize AddrElementSize);
+ 
+   void AVXExtendVectorElements(OpcodeArgs, IR::OpSize ElementSize, IR::OpSize DstElementSize, bool Signed);
+@@ -876,6 +870,7 @@ public:
+   void VectorBlend(OpcodeArgs, IR::OpSize ElementSize);
+ 
+   void VectorVariableBlend(OpcodeArgs, IR::OpSize ElementSize);
++  void SetSelfPTestFlags(OpSize Size, Ref Bits);
+   void PTestOpImpl(OpSize Size, Ref Dest, Ref Src);
+   void PTestOp(OpcodeArgs);
+ 
+@@ -961,7 +956,6 @@ public:
+   void AVX128_VBROADCAST(OpcodeArgs, IR::OpSize ElementSize);
+   void AVX128_VPUNPCKL(OpcodeArgs, IR::OpSize ElementSize);
+   void AVX128_VPUNPCKH(OpcodeArgs, IR::OpSize ElementSize);
+-  void AVX128_MOVVectorUnaligned(OpcodeArgs);
+   void AVX128_InsertCVTGPR_To_FPR(OpcodeArgs, IR::OpSize DstElementSize);
+   void AVX128_CVTFPR_To_GPR(OpcodeArgs, IR::OpSize SrcElementSize, bool HostRoundingMode);
+   void AVX128_VANDN(OpcodeArgs);
+@@ -1084,11 +1078,6 @@ public:
+   void AVX128_VFMAScalarImpl(OpcodeArgs, IROps IROp, uint8_t Src1Idx, uint8_t Src2Idx, uint8_t AddendIdx);
+   void AVX128_VFMAddSubImpl(OpcodeArgs, bool AddSub, uint8_t Src1Idx, uint8_t Src2Idx, uint8_t AddendIdx);
+ 
+-  RefPair AVX128_VPGatherQPSImpl(OpcodeArgs, Ref Dest, Ref Mask, RefVSIB VSIB, bool MaskAllOnes);
+-  RefPair AVX128_VPGatherImpl(OpcodeArgs, OpSize Size, OpSize ElementLoadSize, OpSize AddrElementSize, RefPair Dest, RefPair Mask,
+-                              RefVSIB VSIB, bool MaskAllOnesLow = false, bool MaskAllOnesHigh = false);
+-
+-  void AVX128_VPGATHER(OpcodeArgs, OpSize AddrElementSize);
+ 
+   void AVX128_VCVTPH2PS(OpcodeArgs);
+   void AVX128_VCVTPS2PH(OpcodeArgs);
+@@ -1970,9 +1959,22 @@ private:
+ 
+     Ref Value[64];
+ 
+-    // Keep track of where each register was last written to within the current block,
+-    // for use in peephole optimizations.
++    // Per-register write counters and last written value within the current block, for
++    // cross-instruction peepholes. Counters only need to be compared for equality.
++    uint32_t WriteCount[64];
+     Ref LastDef[64];
++
++    // Pending first half of a SHA256RNDS2 pair. A is null when nothing is pending.
++    struct {
++      Ref A;
++      Ref B;
++      Ref Block;
++      uint32_t DestCount;
++      uint32_t SrcCount;
++      uint32_t KeyCount;
++      uint8_t DestReg;
++      uint8_t SrcReg;
++    } SHA256Rounds;
+   } RegCache {};
+ 
+   void InvalidateReg(uint8_t Index) {
+@@ -2095,15 +2097,10 @@ private:
+     RegCache.Value[Index] = Value;
+     RegCache.Cached |= Bit;
+     RegCache.Written |= Bit;
++    ++RegCache.WriteCount[Index];
+     RegCache.LastDef[Index] = Value;
+   }
+ 
+-  void InvalidateHighAVXRegisters() {
+-    for (size_t i = 0; i < 16; ++i) {
+-      InvalidateReg(AVXHigh0Index + i);
+-    }
+-  }
+-
+   void StoreRegister(uint8_t Reg, bool FPR, Ref Value) {
+     StoreContext(Reg + (FPR ? FPR0Index : GPR0Index), Value);
+   }
+@@ -2538,18 +2535,23 @@ private:
+     return _LoadMemAutoTSO(RegClass::FPR, Size, A, Align);
+   }
+ 
+-  AddressMode SelectPairAddressMode(AddressMode A, IR::OpSize Size) {
++  AddressMode SelectPairAddressMode(AddressMode A, IR::OpSize Size, bool SplitVector) {
+     LOGMAN_THROW_A_FMT(Size != IR::OpSize::iUnsized, "Invalid size!");
+     const auto SizeInt = IR::OpSizeToSize(Size);
+     AddressMode Out {};
+ 
+-    signed OffsetEl = A.Offset / SizeInt;
+-    if ((A.Offset % SizeInt) == 0 && OffsetEl >= -64 && OffsetEl < 64) {
++    const auto OffsetEl = A.Offset / SizeInt;
++    const bool Scaled = (A.Offset % SizeInt) == 0;
++    // LDP/STP take signed imm7. Two ordered Q accesses can use two signed imm9
++    // or unsigned scaled imm12 offsets, provided both halves are encodable.
++    const bool Fits = SplitVector ? ((A.Offset >= -256 && A.Offset <= 255 - SizeInt) || (Scaled && OffsetEl >= 0 && OffsetEl < 4095)) :
++                                    (Scaled && OffsetEl >= -64 && OffsetEl < 64);
++    if (A.AddrSize == OpSize::i64Bit && Fits) {
+       Out.Offset = A.Offset;
+       A.Offset = 0;
+     }
+ 
+-    Out.Base = LoadEffectiveAddress(this, A, GetGPROpSize(), true, false);
++    Out.Base = LoadEffectiveAddress(this, A, A.AddrSize == OpSize::i64Bit ? OpSize::i64Bit : GetGPROpSize(), true, false);
+     return Out;
+   }
+ 
+@@ -2567,18 +2569,19 @@ private:
+     const bool AtomicTSO = IsTSOEnabled(Class) && !A.NonTSO;
+ 
+     // Use ldp if possible, otherwise fallback on two loads.
+-    if (!AtomicTSO && !A.Segment && Size >= OpSize::i32Bit && Size <= OpSize::i128Bit) {
+-      const auto B = SelectPairAddressMode(A, Size);
++    const auto B = SelectPairAddressMode(A, Size, AtomicTSO && Class == RegClass::FPR);
++    if (!AtomicTSO && Size >= OpSize::i32Bit && Size <= OpSize::i128Bit) {
+       return LoadMemPair(Class, Size, B.Base, B.Offset);
+     }
+ 
+-    AddressMode HighA = A;
+-    HighA.Offset += 16;
+-
+-    return {
+-      .Low = _LoadMemAutoTSO(Class, Size, A, Align),
+-      .High = _LoadMemAutoTSO(Class, Size, HighA, Align),
+-    };
++    const auto LowOffset = Constant(B.Offset);
++    const auto HighOffset = Constant(B.Offset + IR::OpSizeToSize(Size));
++    if (AtomicTSO) {
++      return {_LoadMemTSO(Class, Size, B.Base, LowOffset, Align, MemOffsetType::SXTX, 1),
++              _LoadMemTSO(Class, Size, B.Base, HighOffset, Align, MemOffsetType::SXTX, 1)};
++    }
++    return {_LoadMem(Class, Size, B.Base, LowOffset, Align, MemOffsetType::SXTX, 1),
++            _LoadMem(Class, Size, B.Base, HighOffset, Align, MemOffsetType::SXTX, 1)};
+   }
+   RefPair _LoadMemPairFPRAutoTSO(OpSize Size, const AddressMode& A, OpSize Align = OpSize::i8Bit) {
+     return _LoadMemPairAutoTSO(RegClass::FPR, Size, A, Align);
+@@ -2606,15 +2609,19 @@ private:
+     const bool AtomicTSO = IsTSOEnabled(Class) && !A.NonTSO;
+ 
+     // Use stp if possible, otherwise fallback on two stores.
+-    if (!AtomicTSO && !A.Segment && Size >= OpSize::i32Bit && Size <= OpSize::i128Bit) {
+-      const auto B = SelectPairAddressMode(A, Size);
++    const auto B = SelectPairAddressMode(A, Size, AtomicTSO && Class == RegClass::FPR);
++    if (!AtomicTSO && Size >= OpSize::i32Bit && Size <= OpSize::i128Bit) {
+       _StoreMemPair(Class, Size, Value1, Value2, B.Base, B.Offset);
+     } else {
+-      auto B = A;
+-
+-      _StoreMemAutoTSO(Class, Size, B, Value1, OpSize::i8Bit);
+-      B.Offset += SizeInt;
+-      _StoreMemAutoTSO(Class, Size, B, Value2, OpSize::i8Bit);
++      const auto LowOffset = Constant(B.Offset);
++      const auto HighOffset = Constant(B.Offset + SizeInt);
++      if (AtomicTSO) {
++        _StoreMemTSO(Class, Size, Value1, B.Base, LowOffset, Align, MemOffsetType::SXTX, 1);
++        _StoreMemTSO(Class, Size, Value2, B.Base, HighOffset, Align, MemOffsetType::SXTX, 1);
++      } else {
++        _StoreMem(Class, Size, Value1, B.Base, LowOffset, Align, MemOffsetType::SXTX, 1);
++        _StoreMem(Class, Size, Value2, B.Base, HighOffset, Align, MemOffsetType::SXTX, 1);
++      }
+     }
+   }
+   void _StoreMemPairFPRAutoTSO(OpSize Size, const AddressMode& A, Ref Value1, Ref Value2, OpSize Align = OpSize::i8Bit) {
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher/AVX_128.cpp b/FEXCore/Source/Interface/Core/OpcodeDispatcher/AVX_128.cpp
+index e4d9a9e203851276f563dea577dd5aa078b7f79f..53b05c926d5eec2e7d01802108fe5ce1d5dbb407 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher/AVX_128.cpp
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher/AVX_128.cpp
+@@ -63,42 +63,6 @@ OpDispatchBuilder::RefPair OpDispatchBuilder::AVX128_LoadSource_WithOpSize(
+   }
+ }
+ 
+-OpDispatchBuilder::RefVSIB
+-OpDispatchBuilder::AVX128_LoadVSIB(const X86Tables::DecodedOp& Op, const X86Tables::DecodedOperand& Operand, uint32_t Flags, bool NeedsHigh) {
+-  const bool IsVSIB = (Op->Flags & X86Tables::DecodeFlags::FLAG_VSIB_BYTE) != 0;
+-  LOGMAN_THROW_A_FMT((Operand.IsSIB() || Operand.IsSIBRelocation()) && IsVSIB, "Trying to load VSIB for something that isn't the correct "
+-                                                                               "type!");
+-
+-  // VSIB is a very special case which has a ton of encoded data.
+-  // Get it in a format we can reason about.
+-
+-  const auto Index_gpr = Operand.Data.SIB.Index;
+-  const auto Base_gpr = Operand.Data.SIB.Base;
+-  LOGMAN_THROW_A_FMT(Index_gpr >= FEXCore::X86State::REG_XMM_0 && Index_gpr <= FEXCore::X86State::REG_XMM_15, "must be AVX reg");
+-  LOGMAN_THROW_A_FMT(Base_gpr == FEXCore::X86State::REG_INVALID || (Base_gpr >= FEXCore::X86State::REG_RAX && Base_gpr <= FEXCore::X86State::REG_R15),
+-                     "Base must be a GPR.");
+-  const auto Index_XMM_gpr = Index_gpr - X86State::REG_XMM_0;
+-
+-  OpDispatchBuilder::RefVSIB A {
+-    .Low = AVX128_LoadXMMRegister(Index_XMM_gpr, false),
+-    .High = NeedsHigh ? AVX128_LoadXMMRegister(Index_XMM_gpr, true) : Invalid(),
+-    .BaseAddr = Base_gpr != FEXCore::X86State::REG_INVALID ? LoadGPRRegister(Base_gpr, OpSize::i64Bit, 0, false) : nullptr,
+-    .Scale = Operand.Data.SIB.Scale,
+-  };
+-
+-  if (Operand.IsSIBRelocation()) {
+-    auto EPOffset = _EntrypointOffset(OpSize::i64Bit, Operand.Data.SIB.Offset);
+-    if (A.BaseAddr) {
+-      A.BaseAddr = Add(OpSize::i64Bit, EPOffset, A.BaseAddr);
+-    } else {
+-      A.BaseAddr = EPOffset;
+-    }
+-  } else {
+-    A.Displacement = static_cast<int32_t>(Operand.Data.SIB.Offset);
+-  }
+-
+-  return A;
+-}
+ 
+ void OpDispatchBuilder::AVX128_StoreResult_WithOpSize(FEXCore::X86Tables::DecodedOp Op, const FEXCore::X86Tables::DecodedOperand& Operand,
+                                                       const RefPair Src, MemoryAccessType AccessType) {
+@@ -135,31 +99,29 @@ Ref OpDispatchBuilder::AVX128_LoadXMMRegister(uint32_t XMM, bool High) {
+ 
+ void OpDispatchBuilder::AVX128_StoreXMMRegister(uint32_t XMM, const Ref Src, bool High) {
+   if (High) {
+-    StoreContext(AVXHigh0Index + XMM, Src);
++    const auto Index = AVXHigh0Index + XMM;
++    if (!(RegCache.Cached & (1ULL << Index)) || RegCache.Value[Index] != Src) {
++      StoreContext(Index, Src);
++    }
+   } else {
+     StoreXMMRegister(XMM, Src);
+   }
+ }
+ 
+ void OpDispatchBuilder::AVX128_VMOVAPS(OpcodeArgs) {
+-  // Reg <- Mem or Reg <- Reg
+-  const auto SrcSize = GetSrcSize(Op);
+-  const auto Is128Bit = SrcSize == Core::CPUState::XMM_SSE_REG_SIZE;
+-
+-  if (Is128Bit) {
+-    // Zero upper 128-bits
+-    auto Src = AVX128_LoadSource_WithOpSize(Op, Op->Src[0], Op->Flags, false);
+-
+-    ///< Zero upper bits when destination is GPR.
+-    if (Op->Dest.IsGPR()) {
+-      Src.High = LoadZeroVector(OpSize::i128Bit);
++  const bool Is128Bit = GetSrcSize(Op) == Core::CPUState::XMM_SSE_REG_SIZE;
++  if (Op->Dest.IsGPR() && Op->Src[0].IsGPR() && Op->Dest.Data.GPR.GPR == Op->Src[0].Data.GPR.GPR) {
++    if (Is128Bit) {
++      AVX128_StoreXMMRegister(Op->Dest.Data.GPR.GPR - X86State::REG_XMM_0, LoadZeroVector(OpSize::i128Bit), true);
+     }
+-    AVX128_StoreResult_WithOpSize(Op, Op->Dest, Src);
+-  } else {
+-    // Copy or memory load
+-    auto Src = AVX128_LoadSource_WithOpSize(Op, Op->Src[0], Op->Flags, true);
+-    AVX128_StoreResult_WithOpSize(Op, Op->Dest, Src);
++    return;
++  }
++
++  auto Src = AVX128_LoadSource_WithOpSize(Op, Op->Src[0], Op->Flags, !Is128Bit);
++  if (Is128Bit && Op->Dest.IsGPR()) {
++    Src.High = LoadZeroVector(OpSize::i128Bit);
+   }
++  AVX128_StoreResult_WithOpSize(Op, Op->Dest, Src);
+ }
+ 
+ void OpDispatchBuilder::AVX128_VMOVScalarImpl(OpcodeArgs, IR::OpSize ElementSize) {
+@@ -354,12 +316,34 @@ void OpDispatchBuilder::AVX128_VZERO(OpcodeArgs) {
+       AVX128_StoreXMMRegister(i, ZeroVector, false);
+     }
+ 
+-    InvalidateHighAVXRegisters();
++  }
++
++  // Publish the clear immediately. Only clean cache entries prove the corresponding
++  // context memory already holds zero, including across adjacent VZEROUPPERs.
++  const Ref Zero = LoadZeroVector(OpSize::i128Bit);
++  const uint64_t Clean = RegCache.Cached & ~RegCache.Written;
++  uint32_t NeedsClear = 0;
++  for (unsigned i = 0; i < NumRegs; ++i) {
++    const unsigned Index = AVXHigh0Index + i;
++    if (!(Clean & (1ULL << Index)) || RegCache.Value[Index] != Zero) {
++      NeedsClear |= 1U << i;
++      StoreContext(Index, Zero);
++      RegCache.Written &= ~(1ULL << Index);
++    }
++  }
++
++  if (NeedsClear == (1U << NumRegs) - 1) {
+     _ContextClear(offsetof(FEXCore::Core::CPUState, avx_high), sizeof(FEXCore::Core::CPUState::avx_high[0]) * NumRegs);
+   } else {
+-    // Likewise, VZEROUPPER will only ever zero only up to the first 16 registers
+-    InvalidateHighAVXRegisters();
+-    _ContextClear(offsetof(FEXCore::Core::CPUState, avx_high), sizeof(FEXCore::Core::CPUState::avx_high[0]) * NumRegs);
++    // Pair adjacent unknown lanes. A single 128-bit zero uses STP XZR, XZR.
++    for (unsigned i = 0; NeedsClear; i += 2, NeedsClear >>= 2) {
++      auto Pair = NeedsClear & 3;
++      if (Pair == 3) {
++        _StoreContextPair(OpSize::i128Bit, RegClass::FPR, Zero, Zero, CacheIndexToContextOffset(AVXHigh0Index + i));
++      } else if (Pair) {
++        StoreContextHelper(OpSize::i128Bit, RegClass::FPR, Zero, CacheIndexToContextOffset(AVXHigh0Index + i + (Pair >> 1)));
++      }
++    }
+   }
+ }
+ 
+@@ -549,24 +533,6 @@ void OpDispatchBuilder::AVX128_VPUNPCKH(OpcodeArgs, IR::OpSize ElementSize) {
+                           [this](IR::OpSize _ElementSize, Ref Src1, Ref Src2) { return _VZip2(OpSize::i128Bit, _ElementSize, Src1, Src2); });
+ }
+ 
+-void OpDispatchBuilder::AVX128_MOVVectorUnaligned(OpcodeArgs) {
+-  const auto SrcSize = GetSrcSize(Op);
+-  const auto Is128Bit = SrcSize == Core::CPUState::XMM_SSE_REG_SIZE;
+-
+-  if (!Is128Bit && Op->Dest.IsGPR() && Op->Src[0].IsGPR() && Op->Dest.Data.GPR.GPR == Op->Src[0].Data.GPR.GPR) {
+-    // Nop
+-    return;
+-  }
+-
+-  auto Src = AVX128_LoadSource_WithOpSize(Op, Op->Src[0], Op->Flags, !Is128Bit);
+-
+-  if (Is128Bit) {
+-    Src.High = LoadZeroVector(OpSize::i128Bit);
+-  }
+-
+-  AVX128_StoreResult_WithOpSize(Op, Op->Dest, Src);
+-}
+-
+ void OpDispatchBuilder::AVX128_InsertCVTGPR_To_FPR(OpcodeArgs, IR::OpSize DstElementSize) {
+   const auto SrcSize = OpSizeFromSrc(Op);
+   const auto DstSize = OpSizeFromDst(Op);
+@@ -898,25 +864,19 @@ void OpDispatchBuilder::AVX128_MOVMSKB(OpcodeArgs) {
+   auto Src = AVX128_LoadSource_WithOpSize(Op, Op->Src[0], Op->Flags, !Is128Bit);
+   Ref VMask = LoadAndCacheNamedVectorConstant(OpSize::i128Bit, NAMED_VECTOR_MOVMASKB);
+ 
+-  auto Mask1Byte = [this](Ref Src, Ref VMask) {
++  auto MaskBytes = [this, VMask](Ref Src) -> Ref {
+     auto VCMP = _VCMPLTZ(OpSize::i128Bit, OpSize::i8Bit, Src);
+-    auto VAnd = _VAnd(OpSize::i128Bit, VCMP, VMask);
+-
+-    auto VAdd1 = _VAddP(OpSize::i128Bit, OpSize::i8Bit, VAnd, VAnd);
+-    auto VAdd2 = _VAddP(OpSize::i128Bit, OpSize::i8Bit, VAdd1, VAdd1);
+-    auto VAdd3 = _VAddP(OpSize::i64Bit, OpSize::i8Bit, VAdd2, VAdd2);
+-
+-    ///< 16-bits of data per 128-bit
+-    return _VExtractToGPR(OpSize::i128Bit, OpSize::i16Bit, VAdd3, 0);
++    return _VAnd(OpSize::i128Bit, VCMP, VMask);
+   };
+ 
+-  Ref Result = Mask1Byte(Src.Low, VMask);
+-
+-  if (!Is128Bit) {
+-    auto ResultHigh = Mask1Byte(Src.High, VMask);
+-    Result = _Orlshl(OpSize::i64Bit, Result, ResultHigh, 16);
+-  }
+-
++  // ADDP concatenates the pair sums from both inputs. Keep the complete
++  // 32-byte mask together through the remaining two horizontal reductions.
++  Ref Low = MaskBytes(Src.Low);
++  Ref High = Is128Bit ? Low : MaskBytes(Src.High);
++  Ref Pairs = _VAddP(OpSize::i128Bit, OpSize::i8Bit, Low, High);
++  Ref Quads = _VAddP(OpSize::i128Bit, OpSize::i8Bit, Pairs, Pairs);
++  Ref Octets = _VAddP(OpSize::i64Bit, OpSize::i8Bit, Quads, Quads);
++  Ref Result = _VExtractToGPR(OpSize::i128Bit, Is128Bit ? OpSize::i16Bit : OpSize::i32Bit, Octets, 0);
+   StoreResultGPR(Op, Result);
+ }
+ 
+@@ -1766,6 +1726,12 @@ void OpDispatchBuilder::AVX128_VTESTP(OpcodeArgs, IR::OpSize ElementSize) {
+   }
+ 
+   // For 256-bit, we need to split up the operation. This is nontrivial.
++  if (Src1.Low == Src2.Low && Src1.High == Src2.High) {
++    Ref Both = _VOr(OpSize::i128Bit, Src1.Low, Src1.High);
++    SetSelfPTestFlags(OpSize::i128Bit, _VUShrI(OpSize::i128Bit, ElementSize, Both, IR::OpSizeAsBits(ElementSize) - 1));
++    return;
++  }
++
+   // Let's go the simple route here.
+   Ref ZF, CFInv;
+ 
+@@ -1832,6 +1798,11 @@ void OpDispatchBuilder::AVX128_PTest(OpcodeArgs) {
+   }
+ 
+   // For 256-bit, we need to unroll. This is nontrivial.
++  if (Src1.Low == Src2.Low && Src1.High == Src2.High) {
++    SetSelfPTestFlags(OpSize::i128Bit, _VOr(OpSize::i128Bit, Src1.Low, Src1.High));
++    return;
++  }
++
+   Ref Test1Low = _VAnd(OpSize::i128Bit, Src1.Low, Src2.Low);
+   Ref Test2Low = _VAndn(OpSize::i128Bit, Src2.Low, Src1.Low);
+ 
+@@ -2065,236 +2036,7 @@ void OpDispatchBuilder::AVX128_VFMAddSubImpl(OpcodeArgs, bool AddSub, uint8_t Sr
+   AVX128_StoreResult_WithOpSize(Op, Op->Dest, Result);
+ }
+ 
+-OpDispatchBuilder::RefPair OpDispatchBuilder::AVX128_VPGatherImpl(OpcodeArgs, OpSize Size, OpSize ElementLoadSize, OpSize AddrElementSize,
+-                                                                  RefPair Dest, RefPair Mask, RefVSIB VSIB, bool MaskAllOnesLow,
+-                                                                  bool MaskAllOnesHigh) {
+-  LOGMAN_THROW_A_FMT(AddrElementSize == OpSize::i32Bit || AddrElementSize == OpSize::i64Bit, "Unknown address element size");
+-  const auto Is128Bit = Size == OpSize::i128Bit;
+ 
+-  ///< BaseAddr doesn't need to exist, calculate that here.
+-  Ref BaseAddr = VSIB.BaseAddr;
+-  if (BaseAddr && VSIB.Displacement) {
+-    BaseAddr = Add(OpSize::i64Bit, BaseAddr, VSIB.Displacement);
+-  } else if (VSIB.Displacement) {
+-    BaseAddr = Constant(VSIB.Displacement);
+-  } else if (!BaseAddr) {
+-    BaseAddr = Invalid();
+-  }
+-
+-  if (CTX->HostFeatures.SupportsSVE128) {
+-    if (ElementLoadSize == OpSize::i64Bit && AddrElementSize == OpSize::i32Bit) {
+-      // In the case that FEX is loading double the amount of data than the number of address bits then we can optimize this case.
+-      // For 256-bits of data we need to sign extend all four 32-bit address elements to be 64-bit.
+-      // For 128-bits of data we only need to sign extend the lower two 32-bit address elements.
+-      LOGMAN_THROW_A_FMT(VSIB.High == Invalid(), "Need to not have a high VSIB source");
+-
+-      if (!Is128Bit) {
+-        VSIB.High = _VSSHLL2(OpSize::i128Bit, OpSize::i32Bit, VSIB.Low, FEXCore::ilog2(VSIB.Scale));
+-      }
+-      VSIB.Low = _VSSHLL(OpSize::i128Bit, OpSize::i32Bit, VSIB.Low, FEXCore::ilog2(VSIB.Scale));
+-
+-      ///< Set the scale to one now that it has been prescaled as well.
+-      VSIB.Scale = 1;
+-
+-      // Set the address element size to 64-bit now that the elements are extended.
+-      AddrElementSize = OpSize::i64Bit;
+-    } else if (ElementLoadSize == OpSize::i64Bit && AddrElementSize == OpSize::i64Bit && (VSIB.Scale == 2 || VSIB.Scale == 4)) {
+-      // SVE gather instructions don't support scaling their vector elements by anything other than 1 or the address element size.
+-      // Pre-scale 64-bit addresses in the case that scale doesn't match in-order to hit SVE code paths more frequently.
+-      // Only hit this path if the host supports SVE. Otherwise it's a degradation for the ASIMD codepath.
+-      VSIB.Low = _VShlI(OpSize::i128Bit, OpSize::i64Bit, VSIB.Low, FEXCore::ilog2(VSIB.Scale));
+-      if (!Is128Bit) {
+-        VSIB.High = _VShlI(OpSize::i128Bit, OpSize::i64Bit, VSIB.High, FEXCore::ilog2(VSIB.Scale));
+-      }
+-      ///< Set the scale to one now that it has been prescaled.
+-      VSIB.Scale = 1;
+-    }
+-  }
+-
+-  const auto GPRSize = GetGPROpSize();
+-  auto AddrSize = (Op->Flags & X86Tables::DecodeFlags::FLAG_ADDRESS_SIZE) != 0 ? (GPRSize >> 1) : GPRSize;
+-
+-  RefPair Result {};
+-  ///< Calculate the low-half.
+-  Result.Low = _VLoadVectorGatherMasked(OpSize::i128Bit, ElementLoadSize, Dest.Low, Mask.Low, BaseAddr, VSIB.Low, VSIB.High,
+-                                        AddrElementSize, VSIB.Scale, 0, 0, AddrSize, MaskAllOnesLow);
+-
+-  if (Is128Bit) {
+-    Result.High = LoadZeroVector(OpSize::i128Bit);
+-    if (AddrElementSize == OpSize::i64Bit && ElementLoadSize == OpSize::i32Bit) {
+-      // Special case for the 128-bit gather load using 64-bit address indexes with 32-bit results.
+-      // Only loads two 32-bit elements in to the lower 64-bits of the first destination.
+-      // Bits [255:65] all become zero.
+-      Result.Low = _VZip(OpSize::i128Bit, OpSize::i64Bit, Result.Low, Result.High);
+-    }
+-  } else {
+-    RefPair AddrAddressing {};
+-
+-    Ref DestReg = Dest.High;
+-    Ref MaskReg = Mask.High;
+-    bool MaskAllOnes = MaskAllOnesHigh;
+-    uint8_t IndexElementOffset {};
+-    uint8_t DataElementOffset {};
+-    if (AddrElementSize == ElementLoadSize) {
+-      // If the address size matches the loading element size then it will be fetching at the same rate between low and high
+-      AddrAddressing.Low = VSIB.High;
+-      AddrAddressing.High = Invalid();
+-    } else if (AddrElementSize == OpSize::i32Bit && ElementLoadSize == OpSize::i64Bit) {
+-      // If the address element size if half the size of the Element load size then we need to start fetching half-way through the low register.
+-      AddrAddressing.Low = VSIB.Low;
+-      AddrAddressing.High = VSIB.High;
+-      IndexElementOffset = IR::NumElements(OpSize::i128Bit, AddrElementSize) / 2;
+-    } else if (AddrElementSize == OpSize::i64Bit && ElementLoadSize == OpSize::i32Bit) {
+-      AddrAddressing.Low = VSIB.High;
+-      AddrAddressing.High = Invalid();
+-      DestReg = Result.Low; ///< Start mixing with the low register.
+-      MaskReg = Mask.Low;   ///< Mask starts with the low mask here.
+-      MaskAllOnes = MaskAllOnesLow;
+-      IndexElementOffset = 0;
+-      DataElementOffset = IR::NumElements(OpSize::i128Bit, ElementLoadSize) / 2;
+-    }
+-
+-    ///< Calculate the high-half.
+-    auto ResultHigh =
+-      _VLoadVectorGatherMasked(OpSize::i128Bit, ElementLoadSize, DestReg, MaskReg, BaseAddr, AddrAddressing.Low, AddrAddressing.High,
+-                               AddrElementSize, VSIB.Scale, DataElementOffset, IndexElementOffset, AddrSize, MaskAllOnes);
+-
+-    if (AddrElementSize == OpSize::i64Bit && ElementLoadSize == OpSize::i32Bit) {
+-      // If we only fetched 128-bits worth of data then the upper-result is all zero.
+-      Result = AVX128_Zext(ResultHigh);
+-    } else {
+-      Result.High = ResultHigh;
+-    }
+-  }
+-
+-  return Result;
+-}
+-
+-OpDispatchBuilder::RefPair OpDispatchBuilder::AVX128_VPGatherQPSImpl(OpcodeArgs, Ref Dest, Ref Mask, RefVSIB VSIB, bool MaskAllOnes) {
+-
+-  ///< BaseAddr doesn't need to exist, calculate that here.
+-  Ref BaseAddr = VSIB.BaseAddr;
+-  if (BaseAddr && VSIB.Displacement) {
+-    BaseAddr = Add(OpSize::i64Bit, BaseAddr, VSIB.Displacement);
+-  } else if (VSIB.Displacement) {
+-    BaseAddr = Constant(VSIB.Displacement);
+-  } else if (!BaseAddr) {
+-    BaseAddr = Invalid();
+-  }
+-
+-  bool NeedsSVEScale = (VSIB.Scale == 2 || VSIB.Scale == 8) || (BaseAddr == Invalid() && VSIB.Scale != 1);
+-
+-  if (CTX->HostFeatures.SupportsSVE128 && NeedsSVEScale) {
+-    // SVE gather instructions don't support scaling their vector elements by anything other than 1 or the address element size.
+-    // Pre-scale 64-bit addresses in the case that scale doesn't match in-order to hit SVE code paths more frequently.
+-    // Only hit this path if the host supports SVE. Otherwise it's a degradation for the ASIMD codepath.
+-    VSIB.Low = _VShlI(OpSize::i128Bit, OpSize::i64Bit, VSIB.Low, FEXCore::ilog2(VSIB.Scale));
+-    if (VSIB.High != Invalid()) {
+-      VSIB.High = _VShlI(OpSize::i128Bit, OpSize::i64Bit, VSIB.High, FEXCore::ilog2(VSIB.Scale));
+-    }
+-    ///< Set the scale to one now that it has been prescaled.
+-    VSIB.Scale = 1;
+-  }
+-
+-  RefPair Result {};
+-
+-  const auto GPRSize = GetGPROpSize();
+-  auto AddrSize = (Op->Flags & X86Tables::DecodeFlags::FLAG_ADDRESS_SIZE) != 0 ? (GPRSize >> 1) : GPRSize;
+-
+-  ///< Calculate the low-half.
+-  Result.Low =
+-    _VLoadVectorGatherMaskedQPS(OpSize::i128Bit, OpSize::i32Bit, Dest, Mask, BaseAddr, VSIB.Low, VSIB.High, VSIB.Scale, AddrSize, MaskAllOnes);
+-  Result.High = LoadZeroVector(OpSize::i128Bit);
+-  if (VSIB.High == Invalid()) {
+-    // Special case for only loading two floats.
+-    // The upper 64-bits of the lower lane also gets zero.
+-    Result.Low = _VZip(OpSize::i128Bit, OpSize::i64Bit, Result.Low, Result.High);
+-  }
+-
+-  return Result;
+-}
+-
+-void OpDispatchBuilder::AVX128_VPGATHER(OpcodeArgs, OpSize AddrElementSize) {
+-
+-  const auto Size = OpSizeFromDst(Op);
+-  const auto Is128Bit = Size == OpSize::i128Bit;
+-
+-  ///< Element size is determined by W flag.
+-  const OpSize ElementLoadSize = Op->Flags & X86Tables::DecodeFlags::FLAG_OPTION_AVX_W ? OpSize::i64Bit : OpSize::i32Bit;
+-
+-  // We only need the high address register if the number of data elements is more than what the low half can consume.
+-  // But also the number of address elements is clamped by the destination size as well.
+-  const size_t NumDataElements = IR::NumElements(Size, ElementLoadSize);
+-  const size_t NumAddrElementBytes = std::min<size_t>(IR::OpSizeToSize(Size), (NumDataElements * IR::OpSizeToSize(AddrElementSize)));
+-  const bool NeedsHighAddrBytes = NumAddrElementBytes > IR::OpSizeToSize(OpSize::i128Bit);
+-
+-  auto Dest = AVX128_LoadSource_WithOpSize(Op, Op->Dest, Op->Flags, !Is128Bit);
+-  auto VSIB = AVX128_LoadVSIB(Op, Op->Src[0], Op->Flags, NeedsHighAddrBytes);
+-  auto Mask = AVX128_LoadSource_WithOpSize(Op, Op->Src[1], Op->Flags, !Is128Bit);
+-
+-  // Check if the mask was computed from a self comparison, which indicates an all-ones mask.
+-  // This is a compiler idiom for an unmasked gather. In this case, we can apply a peephole and skip
+-  // all mask checks in the codegen, reducing codesize substantially.
+-  bool MaskAllOnesLow = false;
+-  bool MaskAllOnesHigh = false;
+-  if (Op->Src[1].IsGPR()) {
+-    const auto MaskXMM = Op->Src[1].Data.GPR.GPR - X86State::REG_XMM_0;
+-
+-    const Ref LowDef = RegCache.LastDef[FPR0Index + MaskXMM];
+-    const Ref HighDef = RegCache.LastDef[AVXHigh0Index + MaskXMM];
+-
+-    MaskAllOnesLow = LowDef && IsValueVectorAllOnes(WrapNode(LowDef));
+-    MaskAllOnesHigh = !Is128Bit && HighDef && IsValueVectorAllOnes(WrapNode(HighDef));
+-  }
+-
+-  bool NeedsSVEScale = (VSIB.Scale == 2 || VSIB.Scale == 8) || (VSIB.BaseAddr == Invalid() && VSIB.Scale != 1);
+-
+-  const bool NeedsExplicitSVEPath =
+-    CTX->HostFeatures.SupportsSVE128 && AddrElementSize == OpSize::i32Bit && ElementLoadSize == OpSize::i32Bit && NeedsSVEScale;
+-
+-  RefPair Result {};
+-  if (NeedsExplicitSVEPath) {
+-    // Special case for VGATHERDPS/VPGATHERDD (32-bit addresses loading 32-bit elements) that can't use the SVE codepath.
+-    // The problem is due to the scale not matching SVE limitations, we need to prescale the addresses to be 64-bit.
+-    auto ScaleVSIBHalf = [this](Ref VSIB, Ref BaseAddr, int32_t Displacement, uint8_t Scale) -> RefVSIB {
+-      RefVSIB Result {};
+-      Result.High = _VSSHLL2(OpSize::i128Bit, OpSize::i32Bit, VSIB, FEXCore::ilog2(Scale));
+-      Result.Low = _VSSHLL(OpSize::i128Bit, OpSize::i32Bit, VSIB, FEXCore::ilog2(Scale));
+-
+-      Result.Displacement = Displacement;
+-      Result.BaseAddr = BaseAddr;
+-
+-      ///< Set the scale to one now that it has been prescaled as well.
+-      Result.Scale = 1;
+-      return Result;
+-    };
+-
+-    RefVSIB VSIBLow = ScaleVSIBHalf(VSIB.Low, VSIB.BaseAddr, VSIB.Displacement, VSIB.Scale);
+-    RefVSIB VSIBHigh {};
+-
+-    if (NeedsHighAddrBytes) {
+-      VSIBHigh = ScaleVSIBHalf(VSIB.High, VSIB.BaseAddr, VSIB.Displacement, VSIB.Scale);
+-    }
+-
+-    ///< AddressElementSize is now OpSize::i64Bit
+-    Result = AVX128_VPGatherQPSImpl(Op, Dest.Low, Mask.Low, VSIBLow, MaskAllOnesLow);
+-    if (NeedsHighAddrBytes) {
+-      auto Res = AVX128_VPGatherQPSImpl(Op, Dest.High, Mask.High, VSIBHigh, MaskAllOnesHigh);
+-      Result.High = Res.Low;
+-    }
+-  } else if (AddrElementSize == OpSize::i64Bit && ElementLoadSize == OpSize::i32Bit) {
+-    Result = AVX128_VPGatherQPSImpl(Op, Dest.Low, Mask.Low, VSIB, MaskAllOnesLow);
+-  } else {
+-    Result = AVX128_VPGatherImpl(Op, Size, ElementLoadSize, AddrElementSize, Dest, Mask, VSIB, MaskAllOnesLow, MaskAllOnesHigh);
+-  }
+-  AVX128_StoreResult_WithOpSize(Op, Op->Dest, Result);
+-
+-  ///< Assume non-faulting behaviour and clear the mask register.
+-  RefPair ZeroPair {};
+-  ZeroPair.Low = LoadZeroVector(OpSize::i128Bit);
+-  ZeroPair.High = ZeroPair.Low;
+-  AVX128_StoreResult_WithOpSize(Op, Op->Src[1], ZeroPair);
+-}
+ 
+ void OpDispatchBuilder::AVX128_VCVTPH2PS(OpcodeArgs) {
+   const auto DstSize = OpSizeFromDst(Op);
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher/BaseTables.h b/FEXCore/Source/Interface/Core/OpcodeDispatcher/BaseTables.h
+index e328c40abb940ad50e0a6e305cc2994c6da2ec92..464acc46966191eaa010ed391c59d7db9dec5d9d 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher/BaseTables.h
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher/BaseTables.h
+@@ -55,11 +55,11 @@ constexpr inline DispatchTableEntry OpDispatch_BaseOpTable[] = {
+   {0x9D, 1, &OpDispatchBuilder::POPFOp},
+   {0x9E, 1, &OpDispatchBuilder::SAHFOp},
+   {0x9F, 1, &OpDispatchBuilder::LAHFOp},
+-  {0xA4, 2, &OpDispatchBuilder::MOVSOp},
++  {0xA4, 2, &OpDispatchBuilder::Bind<&OpDispatchBuilder::StringMemOp, true>},
+ 
+   {0xA6, 2, &OpDispatchBuilder::CMPSOp},
+   {0xA8, 2, &OpDispatchBuilder::Bind<&OpDispatchBuilder::TESTOp, 0, true>},
+-  {0xAA, 2, &OpDispatchBuilder::STOSOp},
++  {0xAA, 2, &OpDispatchBuilder::Bind<&OpDispatchBuilder::StringMemOp, false>},
+   {0xAC, 2, &OpDispatchBuilder::LODSOp},
+   {0xAE, 2, &OpDispatchBuilder::SCASOp},
+   {0xB0, 16, &OpDispatchBuilder::Bind<&OpDispatchBuilder::MOVGPROp, 0>},
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher/Crypto.cpp b/FEXCore/Source/Interface/Core/OpcodeDispatcher/Crypto.cpp
+index a7bc09cdd91de816c7726cda3e465eb8710c0bd2..ee64d72071bf0d26a7e15210c9727c779c177b53 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher/Crypto.cpp
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher/Crypto.cpp
+@@ -175,17 +175,68 @@ void OpDispatchBuilder::SHA256RNDS2Op(OpcodeArgs) {
+     return _VRev64(OpSize::i128Bit, OpSize::i32Bit, Tmp);
+   };
+ 
++  // ARM64 SHA256H/SHA256H2 run four rounds; x86 SHA256RNDS2 runs two. Lanes 2-3 of the
++  // ARM64 output hold the state after rounds 1-2, which only consume key lanes 0-1, so the
++  // full xmm0 can be passed as the key. Lanes 0-1 then hold rounds 3-4 using key lanes 2-3.
++  //
++  // That lets us fold the OpenSSL/Intel idiom:
++  //   sha256rnds2 X, Y
++  //   pshufd xmm0, xmm0, 0xe (or psrldq xmm0, 8)
++  //   sha256rnds2 Y, X
++  // The second instruction is exactly rounds 3-4 of the first instruction's ARM64 result when,
++  // within the same IR block:
++  //   - the second Src (X) is the first Dest and still holds the first result,
++  //   - the second Dest (Y) is the first Src and was not written since,
++  //   - xmm0 was written exactly once since, by an 8-byte VExtr of the previous xmm0.
++  // A per-instruction SRA flush means operands are reloaded, so this tracks register writes
++  // instead of SSA identity. All tracking is reset by full register-cache flushes.
++  const bool DestIsXMM = Op->Dest.IsGPR() && Op->Dest.Data.GPR.GPR >= X86State::REG_XMM_0 && Op->Dest.Data.GPR.GPR <= X86State::REG_XMM_15;
++  const bool SrcIsXMM =
++    Op->Src[0].IsGPR() && Op->Src[0].Data.GPR.GPR >= X86State::REG_XMM_0 && Op->Src[0].Data.GPR.GPR <= X86State::REG_XMM_15;
++  const uint8_t DestReg = DestIsXMM ? Op->Dest.Data.GPR.GPR - X86State::REG_XMM_0 : 0;
++  const uint8_t SrcReg = SrcIsXMM ? Op->Src[0].Data.GPR.GPR - X86State::REG_XMM_0 : 0;
++  auto& Pending = RegCache.SHA256Rounds;
++
++  if (Pending.A && Pending.Block == GetCurrentBlock() && DestIsXMM && SrcIsXMM && SrcReg == Pending.DestReg && DestReg == Pending.SrcReg &&
++      RegCache.WriteCount[FPR0Index + SrcReg] == Pending.DestCount && RegCache.WriteCount[FPR0Index + DestReg] == Pending.SrcCount &&
++      RegCache.WriteCount[FPR0Index] == Pending.KeyCount + 1) {
++    const auto* KeyShift = GetOpHeader(WrapNode(RegCache.LastDef[FPR0Index]));
++    if (KeyShift->Op == IR::OP_VEXTR && KeyShift->Size == OpSize::i128Bit) {
++      const auto* Extr = KeyShift->C<IR::IROp_VExtr>();
++      const auto* Upper = GetOpHeader(Extr->VectorUpper);
++      if (Extr->Index * IR::OpSizeToSize(KeyShift->ElementSize) == 8 && Upper->Op == IR::OP_LOADREGISTER &&
++          Upper->C<IR::IROp_LoadRegister>()->Class == RegClass::FPR && Upper->C<IR::IROp_LoadRegister>()->Reg == 0) {
++        Ref A = Pending.A;
++        Ref B = Pending.B;
++        Pending.A = nullptr;
++        StoreResult_WithAVXInsert(VectorOpType::SSE, RegClass::FPR, Op, shuffle_efgh(A, B));
++        return;
++      }
++    }
++  }
++
+   auto ABCD = shuffle_abcd(Dest, Src);
+   auto EFGH = shuffle_efgh(Dest, Src);
+ 
+-  // x86 uses only the bottom 64-bits of the key, so duplicate to match ARM64 semantics.
+-  auto Key = _VDupElement(OpSize::i128Bit, OpSize::i64Bit, XMM0, 0);
+-
+-  auto A = _VSha256H(ABCD, EFGH, Key);
+-  auto B = _VSha256H2(EFGH, ABCD, Key);
++  auto A = _VSha256H(ABCD, EFGH, XMM0);
++  auto B = _VSha256H2(EFGH, ABCD, XMM0);
+   auto Result = shuffle_abcd(A, B);
+ 
+   StoreResult_WithAVXInsert(VectorOpType::SSE, RegClass::FPR, Op, Result);
++
++  // Record this instruction as a possible first half. Aliased operands or xmm0 operands
++  // would make the second half's inputs differ from what the fold assumes.
++  Pending.A = nullptr;
++  if (DestIsXMM && SrcIsXMM && DestReg != SrcReg && DestReg != 0 && SrcReg != 0) {
++    Pending.A = A;
++    Pending.B = B;
++    Pending.Block = GetCurrentBlock();
++    Pending.DestReg = DestReg;
++    Pending.SrcReg = SrcReg;
++    Pending.DestCount = RegCache.WriteCount[FPR0Index + DestReg];
++    Pending.SrcCount = RegCache.WriteCount[FPR0Index + SrcReg];
++    Pending.KeyCount = RegCache.WriteCount[FPR0Index];
++  }
+ }
+ 
+ void OpDispatchBuilder::AESImcOp(OpcodeArgs, bool IsAVX) {
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher/Flags.cpp b/FEXCore/Source/Interface/Core/OpcodeDispatcher/Flags.cpp
+index 858e7a4aea2527137a2812f6f41a50bab001d1c9..6208982eb654d97e4a93c781bb927b56e0092a84 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher/Flags.cpp
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher/Flags.cpp
+@@ -80,12 +80,22 @@ Ref OpDispatchBuilder::GetPackedRFLAG(uint32_t FlagsMask) {
+   static_assert(FEXCore::X86State::RFLAG_CF_RAW_LOC == 0);
+   Ref Original = GetRFLAG(FEXCore::X86State::RFLAG_CF_RAW_LOC);
+ 
++  // RF, VM, AC, VIF, VIP and ID live in consecutive context bytes flags[16..21], each holding 0 or 1.
++  // Gather them with one 64-bit load instead of one byte load per flag.
++  static_assert(FEXCore::X86State::RFLAG_RF_LOC == 16 && FEXCore::X86State::RFLAG_ID_LOC == 21);
++  constexpr uint32_t HighFlagsMask = 0b111111U << FEXCore::X86State::RFLAG_RF_LOC;
++  const bool GatherHighFlags = (FlagsMask & HighFlagsMask) == HighFlagsMask;
++
+   for (size_t i = 0; i < FlagOffsets.size(); ++i) {
+     const auto FlagOffset = FlagOffsets[i];
+     if (!((1U << FlagOffset) & FlagsMask)) {
+       continue;
+     }
+ 
++    if (GatherHighFlags && ((1U << FlagOffset) & HighFlagsMask)) {
++      continue;
++    }
++
+     if ((GetNZ && (FlagOffset == FEXCore::X86State::RFLAG_SF_RAW_LOC || FlagOffset == FEXCore::X86State::RFLAG_ZF_RAW_LOC)) ||
+         FlagOffset == FEXCore::X86State::RFLAG_CF_RAW_LOC || FlagOffset == FEXCore::X86State::RFLAG_PF_RAW_LOC) {
+       // Already handled
+@@ -104,6 +114,17 @@ Ref OpDispatchBuilder::GetPackedRFLAG(uint32_t FlagsMask) {
+     Original = _Orlshl(OpSize::i64Bit, Original, Flag, FlagOffset);
+   }
+ 
++  if (GatherHighFlags) {
++    // Keep bit 0 of each byte, then fold byte k's bit into bit k of byte 0.
++    // Bits 0..5 of the result are flags[16..21]; bits 6..7 hold flags[22..23] and are not inserted.
++    Ref High = _LoadContextGPR(OpSize::i64Bit, ARRAY_OFFSETOF(Core::CPUState, flags, FEXCore::X86State::RFLAG_RF_LOC));
++    High = _And(OpSize::i64Bit, High, _InlineConstant(0x0101'0101'0101'0101ULL));
++    High = _Orlshr(OpSize::i64Bit, High, High, 7);
++    High = _Orlshr(OpSize::i64Bit, High, High, 14);
++    High = _Orlshr(OpSize::i64Bit, High, High, 28);
++    Original = _Bfi(OpSize::i64Bit, 6, FEXCore::X86State::RFLAG_RF_LOC, Original, High);
++  }
++
+   // Raw PF value needs to have its bottom bit masked out and inverted. The
+   // naive sequence is and/eor/orlshl. But we can do the inversion implicitly
+   // instead.
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher/SecondaryGroupTables.h b/FEXCore/Source/Interface/Core/OpcodeDispatcher/SecondaryGroupTables.h
+index 2e8ad544ae5624c5ddd9177a5a3926cb7cb2c2d2..0d53ca4407f8d4cac722ce141fbe18b5ce4c2ff3 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher/SecondaryGroupTables.h
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher/SecondaryGroupTables.h
+@@ -10,6 +10,11 @@ constexpr uint16_t PF_66 = 2;
+ constexpr uint16_t PF_F2 = 3;
+ constexpr DispatchTableEntry OpDispatch_SecondaryGroupTables[] = {
+   // GROUP 6
++  {OPD(FEXCore::X86Tables::TYPE_GROUP_6, PF_NONE, 0), 1, &OpDispatchBuilder::SLDTOp},
++  {OPD(FEXCore::X86Tables::TYPE_GROUP_6, PF_F3, 0), 1, &OpDispatchBuilder::SLDTOp},
++  {OPD(FEXCore::X86Tables::TYPE_GROUP_6, PF_66, 0), 1, &OpDispatchBuilder::SLDTOp},
++  {OPD(FEXCore::X86Tables::TYPE_GROUP_6, PF_F2, 0), 1, &OpDispatchBuilder::SLDTOp},
++
+   {OPD(FEXCore::X86Tables::TYPE_GROUP_6, PF_NONE, 3), 1, &OpDispatchBuilder::PermissionRestrictedOp},
+   {OPD(FEXCore::X86Tables::TYPE_GROUP_6, PF_F3, 3), 1, &OpDispatchBuilder::PermissionRestrictedOp},
+   {OPD(FEXCore::X86Tables::TYPE_GROUP_6, PF_66, 3), 1, &OpDispatchBuilder::PermissionRestrictedOp},
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher/SecondaryModRMTables.h b/FEXCore/Source/Interface/Core/OpcodeDispatcher/SecondaryModRMTables.h
+index 73868476913637c590413e02fbb77f7a2b330b9f..8d0645b3b659c5293acbaa38b52215b868efa2a7 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher/SecondaryModRMTables.h
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher/SecondaryModRMTables.h
+@@ -15,9 +15,11 @@ constexpr DispatchTableEntry OpDispatch_SecondaryModRMTables[] = {
+   {((2 << 3) | 7), 1, &OpDispatchBuilder::PermissionRestrictedOp},
+ 
+   // REG /7
+-  {((3 << 3) | 0), 1, &OpDispatchBuilder::PermissionRestrictedOp},
+   {((3 << 3) | 1), 1, &OpDispatchBuilder::RDTSCPOp},
+   {((3 << 3) | 4), 1, &OpDispatchBuilder::CLZeroOp},
++
++  // REG /5
++  {((4 << 3) | 0), 1, &OpDispatchBuilder::SerializeOp},
+ };
+ 
+ } // namespace FEXCore::IR
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher/Vector.cpp b/FEXCore/Source/Interface/Core/OpcodeDispatcher/Vector.cpp
+index ab473b671d4b7d9fb72997862889ec2ec6cae177..708e530adda1145f8f6a3f4807defee014df61c2 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher/Vector.cpp
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher/Vector.cpp
+@@ -1515,9 +1515,8 @@ Ref OpDispatchBuilder::Single128Bit4ByteVectorShuffle(Ref Src, uint8_t Shuffle)
+   }
+   case 0b00'00'10'10: {
+     // Weird reverse low elements and broadcast to each half of the register
+-    Ref Tmp = _VUnZip(OpSize::i128Bit, OpSize::i32Bit, Src, Src);
+-    Tmp = _VRev64(OpSize::i128Bit, OpSize::i32Bit, Tmp);
+-    return _VZip(OpSize::i128Bit, OpSize::i32Bit, Tmp, Tmp);
++    Ref Tmp = _VExtr(OpSize::i128Bit, OpSize::i8Bit, Src, Src, 4);
++    return _VTrn2(OpSize::i128Bit, OpSize::i32Bit, Tmp, Tmp);
+   }
+   case 0b00'00'11'10: {
+     // First element duplicated and shifted in to the top.
+@@ -1546,8 +1545,7 @@ Ref OpDispatchBuilder::Single128Bit4ByteVectorShuffle(Ref Src, uint8_t Shuffle)
+   }
+   case 0b00'10'10'00: {
+     // Weird reversed low elements in upper half of the register
+-    Ref Tmp = _VUnZip(OpSize::i128Bit, OpSize::i32Bit, Src, Src);
+-    Tmp = _VZip(OpSize::i128Bit, OpSize::i32Bit, Tmp, Tmp);
++    Ref Tmp = _VTrn(OpSize::i128Bit, OpSize::i32Bit, Src, Src);
+     return _VExtr(OpSize::i128Bit, OpSize::i8Bit, Tmp, Tmp, 4);
+   }
+   case 0b00'11'00'11: {
+@@ -1797,7 +1795,6 @@ Ref OpDispatchBuilder::SHUFOpImpl(IR::OpSize DstSize, IR::OpSize ElementSize, Re
+ 
+   const auto SingleLane = [&](Ref LHS, Ref RHS, uint32_t LaneShuffle) -> Ref {
+     if (LHS == RHS && LaneShuffle == 0) {
+-      // TODO: We can optimize significantly more shuffles when we know the sources match.
+       // Special case broadcast element 0.
+       return _VDupElement(DstSize, ElementSize, LHS, LaneShuffle & SelectionMask);
+     }
+@@ -1872,6 +1869,9 @@ Ref OpDispatchBuilder::SHUFOpImpl(IR::OpSize DstSize, IR::OpSize ElementSize, Re
+         return _VZip2(OpSize::i128Bit, OpSize::i64Bit, LHS, DupRHS);
+       }
+       case 0b01'00'01'11: {
++        if (LHS == RHS) {
++          return Single128Bit4ByteVectorShuffle(LHS, LaneShuffle);
++        }
+         // TODO: This doesn't generate optimal code.
+         // RA doesn't understand that Src1 is dead after VInsElement due to SRA class differences.
+         // With RA fixes this would be 2 instructions.
+@@ -1880,6 +1880,9 @@ Ref OpDispatchBuilder::SHUFOpImpl(IR::OpSize DstSize, IR::OpSize ElementSize, Re
+         return _VZip(OpSize::i128Bit, OpSize::i64Bit, InsLHS, RHS);
+       }
+       case 0b11'10'01'11: {
++        if (LHS == RHS) {
++          return Single128Bit4ByteVectorShuffle(LHS, LaneShuffle);
++        }
+         // TODO: This doesn't generate optimal code.
+         // RA doesn't understand that Src1 is dead after VInsElement due to SRA class differences.
+         // With RA fixes this would be 2 instructions.
+@@ -1893,6 +1896,9 @@ Ref OpDispatchBuilder::SHUFOpImpl(IR::OpSize DstSize, IR::OpSize ElementSize, Re
+         return _VZip(OpSize::i128Bit, OpSize::i64Bit, RevLHS, RHS);
+       }
+       case 0b11'10'00'01: {
++        if (LHS == RHS) {
++          return Single128Bit4ByteVectorShuffle(LHS, LaneShuffle);
++        }
+         // TODO: This doesn't generate optimal code.
+         // RA doesn't understand that Src1 is dead after VInsElement due to SRA class differences.
+         // With RA fixes this would be 2 instructions.
+@@ -1900,9 +1906,14 @@ Ref OpDispatchBuilder::SHUFOpImpl(IR::OpSize DstSize, IR::OpSize ElementSize, Re
+         auto RevLHS = _VRev64(OpSize::i128Bit, OpSize::i32Bit, LHS);
+         return _VInsElement(OpSize::i128Bit, OpSize::i64Bit, 1, 1, RevLHS, RHS);
+       }
++      case 0b00'00'10'10: {
++        if (LHS == RHS) {
++          return Single128Bit4ByteVectorShuffle(LHS, LaneShuffle);
++        }
++        [[fallthrough]];
++      }
+       case 0b00'00'00'00:
+       case 0b00'00'01'01:
+-      case 0b00'00'10'10:
+       case 0b00'00'11'11:
+       case 0b01'01'00'00:
+       case 0b01'01'01'01:
+@@ -1917,6 +1928,9 @@ Ref OpDispatchBuilder::SHUFOpImpl(IR::OpSize DstSize, IR::OpSize ElementSize, Re
+       case 0b11'11'10'10:
+       case 0b11'11'11'11: {
+         // Duplicate element in upper and lower across each 64-bit segment.
++        if (LHS == RHS && (LaneShuffle & 0b11) == ((LaneShuffle >> 4) & 0b11)) {
++          return _VDupElement(OpSize::i128Bit, ElementSize, LHS, LaneShuffle & 0b11);
++        }
+         auto DupSrc1 = _VDupElement(OpSize::i128Bit, ElementSize, LHS, LaneShuffle & 0b11);
+         auto DupSrc2 = _VDupElement(OpSize::i128Bit, ElementSize, RHS, (LaneShuffle >> 4) & 0b11);
+         return _VZip(OpSize::i128Bit, OpSize::i64Bit, DupSrc1, DupSrc2);
+@@ -3208,7 +3222,7 @@ void OpDispatchBuilder::XRstorOpImpl(OpcodeArgs) {
+     Ref Base = XSaveBase(Op);
+     Ref Mask = _LoadMemGPR(OpSize::i64Bit, Base, Constant(512), OpSize::i64Bit, MemOffsetType::SXTX, 1);
+ 
+-    Ref BitFlag = _Bfe(OpSize, FieldSize, BitIndex, Mask);
++    Ref BitFlag = _Bfe(OpSize, 1, BitIndex, Mask);
+     auto CondJump_ = CondJump(BitFlag, CondClass::NEQ);
+ 
+     auto RestoreBlock = CreateNewCodeBlockAfter(GetCurrentBlock());
+@@ -3218,7 +3232,6 @@ void OpDispatchBuilder::XRstorOpImpl(OpcodeArgs) {
+     { restore_fn(); }
+     auto RestoreExitJump = Jump();
+     auto DefaultBlock = CreateNewCodeBlockAfter(RestoreBlock);
+-    auto ExitBlock = CreateNewCodeBlockAfter(DefaultBlock);
+     SetJumpTarget(RestoreExitJump, ExitBlock);
+     SetFalseJumpTarget(CondJump_, DefaultBlock);
+     SetCurrentCodeBlock(DefaultBlock);
+@@ -3245,15 +3258,22 @@ void OpDispatchBuilder::XRstorOpImpl(OpcodeArgs) {
+   }
+ 
+   {
+-    // We need to restore the MXCSR if either SSE or AVX are requested to be saved
+-    RestoreIfFlagSetOrDefault(
+-      1,
+-      [this, Op] {
+-        Ref Base = XSaveBase(Op);
+-        Ref MXCSR = _LoadMemGPR(OpSize::i32Bit, Base, Constant(24), OpSize::i32Bit, MemOffsetType::SXTX, 1);
+-        RestoreMXCSRState(MXCSR);
+-      },
+-      [] { /* Intentionally do nothing*/ }, 2);
++    // MXCSR is restored for a requested SSE/AVX component even when its
++    // XSTATE_BV bit is clear. Unsupported AVX requests do not select MXCSR.
++    Ref Requested = _And(OpSize, LoadGPRRegister(X86State::REG_RAX), Constant(CTX->HostFeatures.SupportsAVX ? 6 : 2));
++    auto RequestedJump = CondJump(Requested, CondClass::NEQ);
++    auto RestoreBlock = CreateNewCodeBlockAfter(GetCurrentBlock());
++    auto ExitBlock = CreateNewCodeBlockAfter(RestoreBlock);
++    SetTrueJumpTarget(RequestedJump, RestoreBlock);
++    SetFalseJumpTarget(RequestedJump, ExitBlock);
++    SetCurrentCodeBlock(RestoreBlock);
++    StartNewBlock();
++    Ref Base = XSaveBase(Op);
++    Ref MXCSR = _LoadMemGPR(OpSize::i32Bit, Base, Constant(24), OpSize::i32Bit, MemOffsetType::SXTX, 1);
++    RestoreMXCSRState(MXCSR);
++    Jump(ExitBlock);
++    SetCurrentCodeBlock(ExitBlock);
++    StartNewBlock();
+   }
+ }
+ 
+@@ -4462,7 +4482,23 @@ void OpDispatchBuilder::AVXVectorVariableBlend(OpcodeArgs, IR::OpSize ElementSiz
+   StoreResultFPR(Op, Result);
+ }
+ 
++void OpDispatchBuilder::SetSelfPTestFlags(OpSize Size, Ref Bits) {
++  Ref Max = _VUMaxV(Size, OpSize::i16Bit, Bits);
++  Ref Any = _VExtractToGPR(Size, OpSize::i16Bit, Max, 0);
++  // CMP with zero sets host C (the self-test always sets guest CF).
++  // Any fits in 16 bits, so the same comparison also clears N and V.
++  HandleNZCVWrite();
++  _SubNZCV(OpSize::i32Bit, Any, Constant(0));
++  CFInverted = false;
++  ZeroPF_AF();
++}
++
+ void OpDispatchBuilder::PTestOpImpl(OpSize Size, Ref Dest, Ref Src) {
++  if (Dest == Src) {
++    SetSelfPTestFlags(Size, Src);
++    return;
++  }
++
+   Ref Test1 = _VAnd(Size, Dest, Src);
+   Ref Test2 = _VAndn(Size, Src, Dest);
+ 
+@@ -4496,6 +4532,11 @@ void OpDispatchBuilder::VTESTOpImpl(OpSize SrcSize, IR::OpSize ElementSize, Ref
+   const auto ElementSizeInBits = IR::OpSizeAsBits(ElementSize);
+   const auto MaskConstant = uint64_t {1} << (ElementSizeInBits - 1);
+ 
++  if (Src1 == Src2) {
++    SetSelfPTestFlags(SrcSize, _VUShrI(SrcSize, ElementSize, Src1, ElementSizeInBits - 1));
++    return;
++  }
++
+   Ref Mask = _VDupFromGPR(SrcSize, ElementSize, Constant(MaskConstant));
+ 
+   Ref AndTest = _VAnd(SrcSize, Src2, Src1);
+@@ -5846,130 +5887,110 @@ void OpDispatchBuilder::VFMAddSubImpl(OpcodeArgs, bool AddSub, uint8_t Src1Idx,
+   StoreResultFPR(Op, Result);
+ }
+ 
+-OpDispatchBuilder::RefVSIB OpDispatchBuilder::LoadVSIB(const X86Tables::DecodedOp& Op, const X86Tables::DecodedOperand& Operand, uint32_t Flags) {
+-  const bool IsVSIB = (Op->Flags & X86Tables::DecodeFlags::FLAG_VSIB_BYTE) != 0;
+-  LOGMAN_THROW_A_FMT((Operand.IsSIB() || Operand.IsSIBRelocation()) && IsVSIB, "Trying to load VSIB for something that isn't the correct "
+-                                                                               "type!");
+-
+-  // VSIB is a very special case which has a ton of encoded data.
+-  // Get it in a format we can reason about.
+-
+-  const auto Index_gpr = Operand.Data.SIB.Index;
+-  const auto Base_gpr = Operand.Data.SIB.Base;
+-  LOGMAN_THROW_A_FMT(Index_gpr >= FEXCore::X86State::REG_XMM_0 && Index_gpr <= FEXCore::X86State::REG_XMM_15, "must be AVX reg");
+-  LOGMAN_THROW_A_FMT(Base_gpr == FEXCore::X86State::REG_INVALID || (Base_gpr >= FEXCore::X86State::REG_RAX && Base_gpr <= FEXCore::X86State::REG_R15),
+-                     "Base must be a GPR.");
+-  const auto Index_XMM_gpr = Index_gpr - X86State::REG_XMM_0;
+-
+-  OpDispatchBuilder::RefVSIB A {
+-    .Low = LoadXMMRegister(Index_XMM_gpr),
+-    .BaseAddr = Base_gpr != FEXCore::X86State::REG_INVALID ? LoadGPRRegister(Base_gpr, OpSize::i64Bit, 0, false) : nullptr,
+-    .Scale = Operand.Data.SIB.Scale,
+-  };
+-
+-  if (Operand.IsSIBRelocation()) {
+-    auto EPOffset = _EntrypointOffset(OpSize::i64Bit, Operand.Data.SIB.Offset);
+-    if (A.BaseAddr) {
+-      A.BaseAddr = Add(OpSize::i64Bit, EPOffset, A.BaseAddr);
+-    } else {
+-      A.BaseAddr = EPOffset;
+-    }
+-  } else {
+-    A.Displacement = static_cast<int32_t>(Operand.Data.SIB.Offset);
+-  }
+-
+-  return A;
+-}
+-
+ void OpDispatchBuilder::VPGATHER(OpcodeArgs, OpSize AddrElementSize) {
+-  LOGMAN_THROW_A_FMT(AddrElementSize == OpSize::i32Bit || AddrElementSize == OpSize::i64Bit, "Unknown address element size");
+-
++  const auto& Operand = Op->Src[0];
++  LOGMAN_THROW_A_FMT((Operand.IsSIB() || Operand.IsSIBRelocation()) && (Op->Flags & X86Tables::DecodeFlags::FLAG_VSIB_BYTE), "Expected VSIB operand");
+   const auto Size = OpSizeFromDst(Op);
+-  const auto Is128Bit = Size == OpSize::i128Bit;
+-  const auto GPRSize = GetGPROpSize();
+-  auto AddrSize = (Op->Flags & X86Tables::DecodeFlags::FLAG_ADDRESS_SIZE) != 0 ? (GPRSize >> 1) : GPRSize;
+-
+-  ///< Element size is determined by W flag.
+-  const OpSize ElementLoadSize = Op->Flags & X86Tables::DecodeFlags::FLAG_OPTION_AVX_W ? OpSize::i64Bit : OpSize::i32Bit;
+-
+-  // We only need the high address register if the number of data elements is more than what the low half can consume.
+-  // But also the number of address elements is clamped by the destination size as well.
+-  const size_t NumDataElements = IR::NumElements(Size, ElementLoadSize);
+-  const size_t NumAddrElementBytes = std::min<size_t>(IR::OpSizeToSize(Size), (NumDataElements * IR::OpSizeToSize(AddrElementSize)));
+-  const bool Needs128BitHighAddrBytes = NumAddrElementBytes > IR::OpSizeToSize(OpSize::i128Bit);
+-
+-  auto VSIB = LoadVSIB(Op, Op->Src[0], Op->Flags);
+-
+-  const bool SupportsSVELoad = (VSIB.Scale == 1 || VSIB.Scale == IR::OpSizeToSize(AddrElementSize)) && (AddrElementSize == ElementLoadSize);
+-
+-  Ref Dest = LoadSourceFPR(Op, Op->Dest, Op->Flags);
+-  Ref Mask = LoadSourceFPR(Op, Op->Src[1], Op->Flags);
+-
+-  Ref Result {};
+-  if (!SupportsSVELoad) {
+-    // We need to go down the fallback path in the case that we don't hit the backend's SVE mode.
+-    RefPair Dest128 {
+-      .Low = Dest,
+-      .High = _VDupElement(OpSize::i256Bit, OpSize::i128Bit, Dest, 1),
+-    };
+-
+-    RefPair Mask128 {
+-      .Low = Mask,
+-      .High = _VDupElement(OpSize::i256Bit, OpSize::i128Bit, Mask, 1),
+-    };
+-
+-    RefVSIB VSIB128 = VSIB;
+-    VSIB128.High = Invalid();
+-
+-    if (Needs128BitHighAddrBytes) {
+-      if (Is128Bit) {
+-        ///< A bit careful for the VSIB index register duplicating.
+-        VSIB128.High = VSIB128.Low;
+-      } else {
+-        VSIB128.High = _VDupElement(OpSize::i256Bit, OpSize::i128Bit, VSIB128.Low, 1);
+-      }
++  const auto ElementSize = Op->Flags & X86Tables::DecodeFlags::FLAG_OPTION_AVX_W ? OpSize::i64Bit : OpSize::i32Bit;
++  const auto AddrSize = Op->Flags & X86Tables::DecodeFlags::FLAG_ADDRESS_SIZE ? GetGPROpSize() >> 1 : GetGPROpSize();
++  const auto DestReg = Op->Dest.Data.GPR.GPR - X86State::REG_XMM_0;
++  const auto MaskReg = Op->Src[1].Data.GPR.GPR - X86State::REG_XMM_0;
++  const auto IndexReg = Operand.Data.SIB.Index - X86State::REG_XMM_0;
++  const auto BaseReg = Operand.Data.SIB.Base;
++  if (AddrSize == OpSize::i16Bit || DestReg == MaskReg || DestReg == IndexReg || MaskReg == IndexReg) {
++    DecodeFailure = true;
++    return;
++  }
++  const unsigned ElementBytes = IR::OpSizeToSize(ElementSize);
++  const unsigned IndexBytes = IR::OpSizeToSize(AddrElementSize);
++  const unsigned Lanes = IR::OpSizeToSize(Size) / std::max(ElementBytes, IndexBytes);
++  const bool Split = !CTX->HostFeatures.SupportsSVE256;
++  auto LoadHalf = [&](uint32_t Reg, unsigned Half) -> Ref {
++    if (Split) return AVX128_LoadXMMRegister(Reg, Half);
++    Ref Full = LoadXMMRegister(Reg);
++    return Half ? _VDupElement(OpSize::i256Bit, OpSize::i128Bit, Full, 1) : Full;
++  };
++  auto StoreHalf = [&](uint32_t Reg, unsigned Half, Ref Value) {
++    if (Split) {
++      AVX128_StoreXMMRegister(Reg, Value, Half);
++    } else {
++      StoreXMMRegister(Reg, _VInsElement(OpSize::i256Bit, OpSize::i128Bit, Half, 0, LoadXMMRegister(Reg), Value));
+     }
++  };
+ 
+-    auto Result128 = AVX128_VPGatherImpl(Op, Size, ElementLoadSize, AddrElementSize, Dest128, Mask128, VSIB128);
+-    // The registers are current split, need to merge them.
+-    Result = _VInsElement(OpSize::i256Bit, OpSize::i128Bit, 1, 0, Result128.Low, Result128.High);
+-  } else {
+-    ///< Calculate the full operation.
+-    ///< BaseAddr doesn't need to exist, calculate that here.
+-    Ref BaseAddr = VSIB.BaseAddr;
+-    if (BaseAddr && VSIB.Displacement) {
+-      BaseAddr = Add(OpSize::i64Bit, BaseAddr, VSIB.Displacement);
+-    } else if (VSIB.Displacement) {
+-      BaseAddr = Constant(VSIB.Displacement);
+-    } else if (!BaseAddr) {
+-      BaseAddr = Invalid();
++  // A mask whose last in-block definition is a full-width integer self-compare (the compiler idiom for an
++  // unmasked gather) is all ones. Read this before normalization below redefines the mask register.
++  auto IsAllOnes = [&](uint8_t Index) {
++    const Ref Def = RegCache.LastDef[Index];
++    if (!Def) return false;
++    const auto* Header = GetOpHeader(WrapNode(Def));
++    return Header->Op == IR::OP_VCMPEQ && Header->Size == OpSize::i128Bit && Header->Args[0].ID() == Header->Args[1].ID();
++  };
++  const bool MaskAllOnesLow = Split && IsAllOnes(FPR0Index + MaskReg);
++  const bool MaskAllOnesHigh = Split && IsAllOnes(AVXHigh0Index + MaskReg);
++
++  // VEX gathers normalize masks and zero unused lanes before the first faulting access.
++  for (unsigned Half = 0; Half < 2; ++Half) {
++    Ref Dest = LoadHalf(DestReg, Half);
++    Ref Mask = _VSShrI(OpSize::i128Bit, ElementSize, LoadHalf(MaskReg, Half), ElementBytes * 8 - 1);
++    if (Lanes * ElementBytes <= Half * 16) {
++      Dest = Mask = LoadZeroVector(OpSize::i128Bit);
++    } else if (Lanes * ElementBytes - Half * 16 == 8) {
++      Dest = _VMov(OpSize::i64Bit, Dest);
++      Mask = _VMov(OpSize::i64Bit, Mask);
+     }
+-
+-    Result =
+-      _VLoadVectorGatherMasked(Size, ElementLoadSize, Dest, Mask, BaseAddr, VSIB.Low, Invalid(), AddrElementSize, VSIB.Scale, 0, 0, AddrSize);
++    StoreHalf(DestReg, Half, Dest);
++    StoreHalf(MaskReg, Half, Mask);
++  }
++
++  const auto DefaultSegment = BaseReg == X86State::REG_RBP || BaseReg == X86State::REG_RSP
++    ? X86Tables::DecodeFlags::FLAG_SS_PREFIX : X86Tables::DecodeFlags::FLAG_DS_PREFIX;
++  if (Split && Is64BitMode) {
++    // One op commits each lane to the flushed guest registers, so a fault keeps x86 partial state without block splits.
++    FlushRegisterCache();
++    Ref Base = BaseReg != X86State::REG_INVALID ? LoadGPRRegister(BaseReg) : nullptr;
++    Ref Displacement = Operand.IsSIBRelocation() ? _EntrypointOffset(OpSize::i64Bit, Operand.Data.SIB.Offset)
++                       : Operand.Data.SIB.Offset ? Constant(static_cast<int32_t>(Operand.Data.SIB.Offset)) : nullptr;
++    if (Base && Displacement) Base = Add(OpSize::i64Bit, Base, Displacement);
++    else if (Displacement) Base = Displacement;
++    Ref Segment = GetSegment(Op->Flags, DefaultSegment);
++    Ref IndexHigh = Lanes * IndexBytes > 16 ? AVX128_LoadXMMRegister(IndexReg, true) : Invalid();
++    _VGatherLanes(AVX128_LoadXMMRegister(IndexReg, false), IndexHigh, Base ?: Invalid(), Segment ?: Invalid(), DestReg, MaskReg,
++                  ElementSize, AddrElementSize, Lanes, FEXCore::ilog2(Operand.Data.SIB.Scale), AddrSize != OpSize::i64Bit,
++                  IsTSOEnabled(RegClass::GPR), MaskAllOnesLow, MaskAllOnesHigh);
++    return;
+   }
+-
+-  if (Is128Bit) {
+-    if (AddrElementSize == OpSize::i64Bit && ElementLoadSize == OpSize::i32Bit) {
+-      // Special case for the 128-bit gather load using 64-bit address indexes with 32-bit results.
+-      // Only loads two 32-bit elements in to the lower 64-bits of the first destination.
+-      // Bits [255:65] all become zero.
+-      Result = _VMov(OpSize::i64Bit, Result);
+-    } else {
+-      Result = _VMov(OpSize::i128Bit, Result);
+-    }
+-  } else {
+-    if (AddrElementSize == OpSize::i64Bit && ElementLoadSize == OpSize::i32Bit) {
+-      // If we only fetched 128-bits worth of data then the upper-result is all zero.
+-      Result = _VMov(OpSize::i128Bit, Result);
++  for (unsigned Lane = 0; Lane < Lanes; ++Lane) {
++    const unsigned DataHalf = Lane * ElementBytes / 16;
++    const unsigned DataLane = Lane % (16 / ElementBytes);
++    Ref Mask = _VExtractToGPR(OpSize::i128Bit, ElementSize, LoadHalf(MaskReg, DataHalf), DataLane);
++    auto Active = CondJumpBit(Mask, ElementBytes * 8 - 1, true);
++    auto Body = CreateNewCodeBlockAfter(GetCurrentBlock());
++    auto Next = CreateNewCodeBlockAfter(Body);
++    SetTrueJumpTarget(Active, Body);
++    SetFalseJumpTarget(Active, Next);
++    SetCurrentCodeBlock(Body);
++    StartNewBlock();
++    _GuestOpcode(Op->PC - Entry);
++
++    Ref Offset = _VExtractToGPR(OpSize::i128Bit, AddrElementSize, LoadHalf(IndexReg, Lane * IndexBytes / 16), Lane % (16 / IndexBytes));
++    if (AddrElementSize == OpSize::i32Bit) Offset = _Sbfe(OpSize::i64Bit, 32, 0, Offset);
++    if (Operand.Data.SIB.Scale != 1) Offset = _Lshl(OpSize::i64Bit, Offset, Constant(FEXCore::ilog2(Operand.Data.SIB.Scale)));
++    if (BaseReg != X86State::REG_INVALID) Offset = Add(OpSize::i64Bit, Offset, LoadGPRRegister(BaseReg));
++    if (Operand.IsSIBRelocation()) {
++      Offset = Add(OpSize::i64Bit, Offset, _EntrypointOffset(OpSize::i64Bit, Operand.Data.SIB.Offset));
++    } else if (Operand.Data.SIB.Offset) {
++      Offset = Add(OpSize::i64Bit, Offset, static_cast<int32_t>(Operand.Data.SIB.Offset));
+     }
++    if (AddrSize != OpSize::i64Bit) Offset = _Bfe(OpSize::i64Bit, IR::OpSizeAsBits(AddrSize), 0, Offset);
++    Ref Address = AppendSegmentOffset(Offset, Op->Flags, DefaultSegment);
++    Ref Value = _LoadMemGPRAutoTSO(ElementSize, Address);
++    StoreHalf(DestReg, DataHalf, _VInsGPR(OpSize::i128Bit, ElementSize, DataLane, LoadHalf(DestReg, DataHalf), Value));
++    StoreHalf(MaskReg, DataHalf, _VInsGPR(OpSize::i128Bit, ElementSize, DataLane, LoadHalf(MaskReg, DataHalf), Constant(0)));
++    Jump(Next);
++    SetCurrentCodeBlock(Next);
++    StartNewBlock();
+   }
+-
+-  StoreResultFPR(Op, Result);
+-
+-  ///< Assume non-faulting behaviour and clear the mask register.
+-  auto Zero = LoadZeroVector(Size);
+-  StoreResultFPR_WithOpSize(Op, Op->Src[1], Zero, Size);
+ }
+ 
+ void OpDispatchBuilder::Extrq_imm(OpcodeArgs) {
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher/X87.cpp b/FEXCore/Source/Interface/Core/OpcodeDispatcher/X87.cpp
+index d361f873bf250dc930d805a74f5878bde77513ba..688f6c24dac51417dc6745e5bae1e5027b278dc2 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher/X87.cpp
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher/X87.cpp
+@@ -113,11 +113,12 @@ void OpDispatchBuilder::FILD(OpcodeArgs) {
+   auto absolute = _Neg(OpSize::i64Bit, Data, CondClass::MI);
+ 
+   // left justify the absolute integer
+-  auto shift = Sub(OpSize::i64Bit, Constant(63), _FindMSB(IR::OpSize::i64Bit, absolute));
++  auto shift = _CountLeadingZeroes(OpSize::i64Bit, absolute);
+   auto shifted = _Lshl(OpSize::i64Bit, absolute, shift);
+ 
+   auto adjusted_exponent = Sub(OpSize::i64Bit, Constant(0x3fff + 63), shift);
+-  auto zeroed_exponent = _Select(OpSize::i64Bit, OpSize::i64Bit, CondClass::EQ, absolute, zero, zero, adjusted_exponent);
++  // Normalization preserves NZCV from the signed input comparison above.
++  auto zeroed_exponent = _NZCVSelect(OpSize::i64Bit, CondClass::EQ, zero, adjusted_exponent);
+   auto upper = _Or(OpSize::i64Bit, sign, zeroed_exponent);
+ 
+   Ref ConvertedData = _VLoadTwoGPRs(shifted, upper);
+diff --git a/FEXCore/Source/Interface/Core/X86Tables/SecondaryGroupTables.cpp b/FEXCore/Source/Interface/Core/X86Tables/SecondaryGroupTables.cpp
+index fdfaf50de704fabf6e270deb84d459ac9f115cb6..242223ed1f173ec9cd868ecba9266e2f83672124 100644
+--- a/FEXCore/Source/Interface/Core/X86Tables/SecondaryGroupTables.cpp
++++ b/FEXCore/Source/Interface/Core/X86Tables/SecondaryGroupTables.cpp
+@@ -61,7 +61,7 @@ constexpr std::array<X86InstInfo, MAX_INST_SECOND_GROUP_TABLE_SIZE> SecondInstGr
+     // Pulls from other MODRM table
+ 
+     // GROUP 6
+-    {OPD(TYPE_GROUP_6, PF_NONE, 0), 1, X86InstInfo{"SLDT",  TYPE_UNDEC, FLAGS_MODRM | FLAGS_SF_MOD_DST, 0}},
++    {OPD(TYPE_GROUP_6, PF_NONE, 0), 1, X86InstInfo{"SLDT",  TYPE_INST, FLAGS_MODRM | FLAGS_SF_MOD_DST, 0}},
+     {OPD(TYPE_GROUP_6, PF_NONE, 1), 1, X86InstInfo{"STR",   TYPE_PRIV, FLAGS_MODRM | FLAGS_SF_MOD_DST,  0}},
+     {OPD(TYPE_GROUP_6, PF_NONE, 2), 1, X86InstInfo{"LLDT",  TYPE_PRIV, FLAGS_NONE,       0}},
+     {OPD(TYPE_GROUP_6, PF_NONE, 3), 1, X86InstInfo{"LTR",   TYPE_INST, FLAGS_NONE,       0}},
+@@ -70,7 +70,7 @@ constexpr std::array<X86InstInfo, MAX_INST_SECOND_GROUP_TABLE_SIZE> SecondInstGr
+     {OPD(TYPE_GROUP_6, PF_NONE, 6), 1, X86InstInfo{"",      TYPE_INVALID, FLAGS_NONE,    0}},
+     {OPD(TYPE_GROUP_6, PF_NONE, 7), 1, X86InstInfo{"",      TYPE_INVALID, FLAGS_NONE,    0}},
+ 
+-    {OPD(TYPE_GROUP_6, PF_F3, 0), 1, X86InstInfo{"SLDT",    TYPE_UNDEC, FLAGS_MODRM | FLAGS_SF_MOD_DST, 0}},
++    {OPD(TYPE_GROUP_6, PF_F3, 0), 1, X86InstInfo{"SLDT",    TYPE_INST, FLAGS_MODRM | FLAGS_SF_MOD_DST, 0}},
+     {OPD(TYPE_GROUP_6, PF_F3, 1), 1, X86InstInfo{"STR",     TYPE_PRIV, FLAGS_MODRM | FLAGS_SF_MOD_DST,  0}},
+     {OPD(TYPE_GROUP_6, PF_F3, 2), 1, X86InstInfo{"LLDT",    TYPE_PRIV, FLAGS_NONE,       0}},
+     {OPD(TYPE_GROUP_6, PF_F3, 3), 1, X86InstInfo{"LTR",     TYPE_INST, FLAGS_NONE,       0}},
+@@ -79,7 +79,7 @@ constexpr std::array<X86InstInfo, MAX_INST_SECOND_GROUP_TABLE_SIZE> SecondInstGr
+     {OPD(TYPE_GROUP_6, PF_F3, 6), 1, X86InstInfo{"",        TYPE_INVALID, FLAGS_NONE,    0}},
+     {OPD(TYPE_GROUP_6, PF_F3, 7), 1, X86InstInfo{"",        TYPE_INVALID, FLAGS_NONE,    0}},
+ 
+-    {OPD(TYPE_GROUP_6, PF_66, 0), 1, X86InstInfo{"SLDT",    TYPE_UNDEC, FLAGS_MODRM | FLAGS_SF_MOD_DST, 0}},
++    {OPD(TYPE_GROUP_6, PF_66, 0), 1, X86InstInfo{"SLDT",    TYPE_INST, FLAGS_MODRM | FLAGS_SF_MOD_DST, 0}},
+     {OPD(TYPE_GROUP_6, PF_66, 1), 1, X86InstInfo{"STR",     TYPE_PRIV, FLAGS_MODRM | FLAGS_SF_MOD_DST,  0}},
+     {OPD(TYPE_GROUP_6, PF_66, 2), 1, X86InstInfo{"LLDT",    TYPE_PRIV, FLAGS_NONE,       0}},
+     {OPD(TYPE_GROUP_6, PF_66, 3), 1, X86InstInfo{"LTR",     TYPE_INST, FLAGS_NONE,       0}},
+@@ -88,7 +88,7 @@ constexpr std::array<X86InstInfo, MAX_INST_SECOND_GROUP_TABLE_SIZE> SecondInstGr
+     {OPD(TYPE_GROUP_6, PF_66, 6), 1, X86InstInfo{"",        TYPE_INVALID, FLAGS_NONE,    0}},
+     {OPD(TYPE_GROUP_6, PF_66, 7), 1, X86InstInfo{"",        TYPE_INVALID, FLAGS_NONE,    0}},
+ 
+-    {OPD(TYPE_GROUP_6, PF_F2, 0), 1, X86InstInfo{"SLDT",    TYPE_UNDEC, FLAGS_MODRM | FLAGS_SF_MOD_DST, 0}},
++    {OPD(TYPE_GROUP_6, PF_F2, 0), 1, X86InstInfo{"SLDT",    TYPE_INST, FLAGS_MODRM | FLAGS_SF_MOD_DST, 0}},
+     {OPD(TYPE_GROUP_6, PF_F2, 1), 1, X86InstInfo{"STR",     TYPE_PRIV, FLAGS_MODRM | FLAGS_SF_MOD_DST,  0}},
+     {OPD(TYPE_GROUP_6, PF_F2, 2), 1, X86InstInfo{"LLDT",    TYPE_PRIV, FLAGS_NONE,       0}},
+     {OPD(TYPE_GROUP_6, PF_F2, 3), 1, X86InstInfo{"LTR",     TYPE_INST, FLAGS_NONE,       0}},
+@@ -103,7 +103,7 @@ constexpr std::array<X86InstInfo, MAX_INST_SECOND_GROUP_TABLE_SIZE> SecondInstGr
+     {OPD(TYPE_GROUP_7, PF_NONE, 2), 1, X86InstInfo{"",     TYPE_SECOND_GROUP_MODRM, FLAGS_NONE, 0}},
+     {OPD(TYPE_GROUP_7, PF_NONE, 3), 1, X86InstInfo{"",     TYPE_SECOND_GROUP_MODRM, FLAGS_NONE, 0}},
+     {OPD(TYPE_GROUP_7, PF_NONE, 4), 1, X86InstInfo{"SMSW", TYPE_INST, FLAGS_MODRM | FLAGS_SF_MOD_DST,          0}},
+-    {OPD(TYPE_GROUP_7, PF_NONE, 5), 1, X86InstInfo{"",     TYPE_INVALID, FLAGS_NONE,            0}},
++    {OPD(TYPE_GROUP_7, PF_NONE, 5), 1, X86InstInfo{"",     TYPE_SECOND_GROUP_MODRM, FLAGS_MODRM, 0}},
+     {OPD(TYPE_GROUP_7, PF_NONE, 6), 1, X86InstInfo{"LMSW", TYPE_INST, FLAGS_MODRM,          0}},
+     {OPD(TYPE_GROUP_7, PF_NONE, 7), 1, X86InstInfo{"INVLPG", TYPE_SECOND_GROUP_MODRM, FLAGS_MODRM | FLAGS_SF_MOD_DST, 0}},
+ 
+diff --git a/FEXCore/Source/Interface/Core/X86Tables/SecondaryModRMTables.cpp b/FEXCore/Source/Interface/Core/X86Tables/SecondaryModRMTables.cpp
+index 48417f9ffbce31511c98ffdeaba981579d99c93f..322d9feb44a0d841cc5c92873d87043a1c2ce95d 100644
+--- a/FEXCore/Source/Interface/Core/X86Tables/SecondaryModRMTables.cpp
++++ b/FEXCore/Source/Interface/Core/X86Tables/SecondaryModRMTables.cpp
+@@ -12,6 +12,19 @@ $end_info$
+ 
+ namespace FEXCore::X86Tables {
+ using namespace InstFlags;
++enum ModRM_LUT {
++  ENTRY_3_0,
++  ENTRY_MAX,
++};
++
++constexpr std::array<X86InstInfo[2], ENTRY_MAX> ModRM_ArchSelect_LUT = {{
++  // ENTRY_3_0
++  {
++    {"SWAPGS",   TYPE_INST,    FLAGS_NONE, 0, { .OpDispatch = &IR::OpDispatchBuilder::UnimplementedOp }},
++    {"SWAPGS",   TYPE_INST,    FLAGS_NONE, 0, { .OpDispatch = &IR::OpDispatchBuilder::PermissionRestrictedOp }},
++  },
++}};
++
+ constexpr std::array<X86InstInfo, MAX_SECOND_MODRM_TABLE_SIZE> SecondModRMTableOps = []() consteval {
+   std::array<X86InstInfo, MAX_SECOND_MODRM_TABLE_SIZE> Table{};
+   constexpr U8U8InfoStruct SecondaryModRMExtensionOpTable[] = {
+@@ -46,7 +59,7 @@ constexpr std::array<X86InstInfo, MAX_SECOND_MODRM_TABLE_SIZE> SecondModRMTableO
+     {((2 << 3) | 7), 1, X86InstInfo{"INVLPGA",  TYPE_INST,    FLAGS_NONE, 0}},
+ 
+     // REG /7
+-    {((3 << 3) | 0), 1, X86InstInfo{"SWAPGS",   TYPE_INST,    FLAGS_NONE, 0}},
++    {((3 << 3) | 0), 1, X86InstInfo{"", TYPE_ARCH_DISPATCHER, FLAGS_NONE, 0, { .Indirect = ModRM_ArchSelect_LUT[ENTRY_3_0] }}},
+     {((3 << 3) | 1), 1, X86InstInfo{"RDTSCP",   TYPE_INST,    FLAGS_NONE, 0}},
+     {((3 << 3) | 2), 1, X86InstInfo{"MONITORX", TYPE_PRIV,    FLAGS_NONE, 0}},
+     {((3 << 3) | 3), 1, X86InstInfo{"MWAITX",   TYPE_PRIV,    FLAGS_NONE, 0}},
+@@ -54,6 +67,16 @@ constexpr std::array<X86InstInfo, MAX_SECOND_MODRM_TABLE_SIZE> SecondModRMTableO
+     {((3 << 3) | 5), 1, X86InstInfo{"",         TYPE_INVALID, FLAGS_NONE, 0}},
+     {((3 << 3) | 6), 1, X86InstInfo{"",         TYPE_INVALID, FLAGS_NONE, 0}},
+     {((3 << 3) | 7), 1, X86InstInfo{"",         TYPE_INVALID, FLAGS_NONE, 0}},
++
++    // REG /5
++    {((4 << 3) | 0), 1, X86InstInfo{"SERIALIZE", TYPE_INST,   FLAGS_NONE, 0}},
++    {((4 << 3) | 1), 1, X86InstInfo{"",         TYPE_INVALID, FLAGS_NONE, 0}},
++    {((4 << 3) | 2), 1, X86InstInfo{"",         TYPE_INVALID, FLAGS_NONE, 0}},
++    {((4 << 3) | 3), 1, X86InstInfo{"",         TYPE_INVALID, FLAGS_NONE, 0}},
++    {((4 << 3) | 4), 1, X86InstInfo{"",         TYPE_INVALID, FLAGS_NONE, 0}},
++    {((4 << 3) | 5), 1, X86InstInfo{"",         TYPE_INVALID, FLAGS_NONE, 0}},
++    {((4 << 3) | 6), 1, X86InstInfo{"",         TYPE_INVALID, FLAGS_NONE, 0}},
++    {((4 << 3) | 7), 1, X86InstInfo{"",         TYPE_INVALID, FLAGS_NONE, 0}},
+   };
+ 
+   GenerateTable(Table.data(), SecondaryModRMExtensionOpTable, std::size(SecondaryModRMExtensionOpTable));
+diff --git a/FEXCore/Source/Interface/Core/X86Tables/SecondaryTables.cpp b/FEXCore/Source/Interface/Core/X86Tables/SecondaryTables.cpp
+index a08c243c23fdfd09a6ea15f7fda4e8f24d266a83..cd793be9e360350584e8cc13f89c1d23a7d90052 100644
+--- a/FEXCore/Source/Interface/Core/X86Tables/SecondaryTables.cpp
++++ b/FEXCore/Source/Interface/Core/X86Tables/SecondaryTables.cpp
+@@ -226,12 +226,12 @@ constexpr std::array<X86InstInfo, MAX_SECOND_TABLE_SIZE> SecondBaseOps = []() co
+     {0xB5, 1, X86InstInfo{"LGS",     TYPE_INVALID, FLAGS_NO_OVERLAY,                                                                                0}},
+     {0xB6, 1, X86InstInfo{"MOVZX",   TYPE_INST, GenFlagsSrcSize(SIZE_8BIT) | FLAGS_MODRM | FLAGS_NO_OVERLAY,                                        0}},
+     {0xB7, 1, X86InstInfo{"MOVZX",   TYPE_INST, GenFlagsSrcSize(SIZE_16BIT) | FLAGS_MODRM | FLAGS_NO_OVERLAY,                                       0}},
+-    {0xB8, 1, X86InstInfo{"",        TYPE_INVALID, FLAGS_NONE,                                                                                      0}},
++    {0xB8, 1, X86InstInfo{"",        TYPE_INVALID, FLAGS_NO_PREFIX_ORDER,                                                                           0}},
+     {0xB9, 1, X86InstInfo{"",        TYPE_GROUP_10, FLAGS_NO_OVERLAY,                                                                               0}},
+     {0xBA, 1, X86InstInfo{"",        TYPE_GROUP_8, FLAGS_NO_OVERLAY,                                                                                0}},
+     {0xBB, 1, X86InstInfo{"BTC",     TYPE_INST, FLAGS_DEBUG_MEM_ACCESS | FLAGS_MODRM | FLAGS_SF_MOD_DST | FLAGS_NO_OVERLAY | FLAGS_SUPPORTS_LOCK,   0}},
+-    {0xBC, 1, X86InstInfo{"BSF",     TYPE_INST, FLAGS_MODRM | FLAGS_NO_OVERLAY66,                                                                   0}},
+-    {0xBD, 1, X86InstInfo{"BSR",     TYPE_INST, FLAGS_MODRM | FLAGS_NO_OVERLAY66,                                                                   0}},
++    {0xBC, 1, X86InstInfo{"BSF",     TYPE_INST, FLAGS_MODRM | FLAGS_NO_PREFIX_ORDER | FLAGS_NO_OVERLAY66,                                           0}},
++    {0xBD, 1, X86InstInfo{"BSR",     TYPE_INST, FLAGS_MODRM | FLAGS_NO_PREFIX_ORDER | FLAGS_NO_OVERLAY66,                                           0}},
+     {0xBE, 1, X86InstInfo{"MOVSX",   TYPE_INST, GenFlagsSrcSize(SIZE_8BIT) | FLAGS_MODRM | FLAGS_NO_OVERLAY,                                        0}},
+     {0xBF, 1, X86InstInfo{"MOVSX",   TYPE_INST, GenFlagsSrcSize(SIZE_16BIT) | FLAGS_MODRM | FLAGS_NO_OVERLAY,                                       0}},
+ 
+diff --git a/FEXCore/Source/Interface/Core/X86Tables/VEXTables.cpp b/FEXCore/Source/Interface/Core/X86Tables/VEXTables.cpp
+index 4aa60b4406b6dd13e955880c62ff3b45c9033568..b4b74ff8e9bb4ca52331422eb06b3652d70f14c3 100644
+--- a/FEXCore/Source/Interface/Core/X86Tables/VEXTables.cpp
++++ b/FEXCore/Source/Interface/Core/X86Tables/VEXTables.cpp
+@@ -225,7 +225,7 @@ namespace AVX128 {
+     {OPD(1, 0b01, 0xEE), 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::AVX128_VectorALU, IR::OP_VSMAX, OpSize::i16Bit>},
+     {OPD(1, 0b01, 0xEF), 1, &OpDispatchBuilder::AVX128_VectorXOR},
+ 
+-    {OPD(1, 0b11, 0xF0), 1, &OpDispatchBuilder::AVX128_MOVVectorUnaligned},
++    {OPD(1, 0b11, 0xF0), 1, &OpDispatchBuilder::AVX128_VMOVAPS},
+     {OPD(1, 0b01, 0xF1), 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::AVX128_VectorShiftWideImpl, OpSize::i16Bit, IROps::OP_VUSHLSWIDE>}, // VPSLL
+     {OPD(1, 0b01, 0xF2), 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::AVX128_VectorShiftWideImpl, OpSize::i32Bit, IROps::OP_VUSHLSWIDE>}, // VPSLL
+     {OPD(1, 0b01, 0xF3), 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::AVX128_VectorShiftWideImpl, OpSize::i64Bit, IROps::OP_VUSHLSWIDE>}, // VPSLL
+@@ -327,10 +327,10 @@ namespace AVX128 {
+     {OPD(2, 0b01, 0x8C), 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::AVX128_VPMASKMOV, false>},
+     {OPD(2, 0b01, 0x8E), 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::AVX128_VPMASKMOV, true>},
+ 
+-    {OPD(2, 0b01, 0x90), 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::AVX128_VPGATHER, OpSize::i32Bit>},
+-    {OPD(2, 0b01, 0x91), 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::AVX128_VPGATHER, OpSize::i64Bit>},
+-    {OPD(2, 0b01, 0x92), 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::AVX128_VPGATHER, OpSize::i32Bit>},
+-    {OPD(2, 0b01, 0x93), 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::AVX128_VPGATHER, OpSize::i64Bit>},
++    {OPD(2, 0b01, 0x90), 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::VPGATHER, OpSize::i32Bit>},
++    {OPD(2, 0b01, 0x91), 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::VPGATHER, OpSize::i64Bit>},
++    {OPD(2, 0b01, 0x92), 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::VPGATHER, OpSize::i32Bit>},
++    {OPD(2, 0b01, 0x93), 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::VPGATHER, OpSize::i64Bit>},
+ 
+     {OPD(2, 0b01, 0x96), 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::AVX128_VFMAddSubImpl, true, 1, 3, 2>},  // VFMADDSUB
+     {OPD(2, 0b01, 0x97), 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::AVX128_VFMAddSubImpl, false, 1, 3, 2>}, // VFMSUBADD
+diff --git a/FEXCore/Source/Interface/Core/X86Tables/X86Tables.h b/FEXCore/Source/Interface/Core/X86Tables/X86Tables.h
+index 3010516f6196223b21876e672afe96822ea8ba86..67b8920cbf37aab1ad64b6724540f364cd768714 100644
+--- a/FEXCore/Source/Interface/Core/X86Tables/X86Tables.h
++++ b/FEXCore/Source/Interface/Core/X86Tables/X86Tables.h
+@@ -519,7 +519,7 @@ constexpr size_t MAX_INST_GROUP_TABLE_SIZE = 512;
+ // 12 (groups) | 3(max indexes) | 8 ops = 0b1111'11'111 = 9 bits
+ constexpr size_t MAX_INST_SECOND_GROUP_TABLE_SIZE = 512;
+ constexpr size_t MAX_X87_TABLE_SIZE = 1 << 11;
+-constexpr size_t MAX_SECOND_MODRM_TABLE_SIZE = 32;
++constexpr size_t MAX_SECOND_MODRM_TABLE_SIZE = 40;
+ // (3 bit prefixes) | 8 bit opcode
+ constexpr size_t MAX_0F_38_TABLE_SIZE = (1 << 11);
+ // 1 REX | 1 prefixes | 8 bit opcode
+diff --git a/FEXCore/Source/Interface/IR/IR.json b/FEXCore/Source/Interface/IR/IR.json
+index c050995873c611fdc51344216600254442d03cb7..2cf73b7241c86bd29019b8454cba233b9e032b8f 100644
+--- a/FEXCore/Source/Interface/IR/IR.json
++++ b/FEXCore/Source/Interface/IR/IR.json
+@@ -638,7 +638,19 @@
+           "RegisterSize != FEXCore::IR::OpSize::i256Bit && \"What does 256-bit mean in this context?\""
+         ]
+       },
++      "VGatherLanes FPR:$IndexLow, FPR:$IndexHigh, GPR:$Base, GPR:$Segment, u8:$DestReg, u8:$MaskReg, OpSize:$DataSize, OpSize:$IndexSize, u8:$Lanes, u8:$ScaleShift, i1:$Address32, i1:$TSO, i1:$MaskAllOnesLow, i1:$MaskAllOnesHigh": {
++        "HasSideEffects": true,
++        "Desc": ["Split-AVX x64 VEX gather over normalized guest Dest/Mask registers after a full register cache flush.",
++                 "Each active lane loads, then writes guest Dest and clears its guest Mask lane in place: the static",
++                 "register for the low half, CPUState::avx_high for the high half. A faulting lane therefore leaves",
++                 "exact x86 partial state without splitting blocks. IndexHigh may be Invalid when no lane uses it.",
++                 "Address = (Base + (sext(Index) << ScaleShift)), truncated to 32 bits if Address32, plus Segment if valid.",
++                 "MaskAllOnesLow/High mean every mask lane in that half is known active, so its lanes skip the mask test;",
++                 "each lane still clears its mask lane after the load.",
++                 "Does not write NZCV."]
++      },
+       "FPR = VLoadVectorElement OpSize:#RegisterSize, OpSize:#ElementSize, FPR:$DstSrc, u8:$Index, GPR:$Addr": {
++        "HasSideEffects": true,
+         "Desc": ["Does a memory load to a single element of a vector.",
+                  "Leaves the rest of the vector's data intact.",
+                  "Matches arm64 ld1 semantics"],
+@@ -1610,7 +1622,8 @@
+         "Desc": ["Integer long signed division returning lower bits",
+                  "The Lower and Upper registers will be concated together to generate a dividend twice the size",
+                  "Then the divisor divides the temporary dividend and returns the results in the original sized register",
+-                 "If Upper is invalid, this is a non-long division."
++                 "If Upper is invalid, this is a non-long division.",
++                 "If Remainder is invalid, only Quotient is produced."
+                 ],
+         "DestSize": "Size",
+         "HasSideEffects": true
+@@ -1619,7 +1632,8 @@
+         "Desc": ["Integer long unsigned division returning lower bits",
+                  "The Lower and Upper registers will be concated together to generate a dividend twice the size",
+                  "Then the divisor divides the temporary dividend and returns the results in the original sized register",
+-                 "If Upper is invalid, this is a non-long division."
++                 "If Upper is invalid, this is a non-long division.",
++                 "If Remainder is invalid, only Quotient is produced."
+                 ],
+         "DestSize": "Size",
+         "HasSideEffects": true
+diff --git a/FEXCore/Source/Utils/ArchHelpers/Arm64.cpp b/FEXCore/Source/Utils/ArchHelpers/Arm64.cpp
+index 939a587123431c2d1fab21f91d01880df9c4554e..55aa57610968fa6b8ae3f35a514cbdae30f8b05d 100644
+--- a/FEXCore/Source/Utils/ArchHelpers/Arm64.cpp
++++ b/FEXCore/Source/Utils/ArchHelpers/Arm64.cpp
+@@ -28,14 +28,15 @@ constexpr uint32_t RCPC2_MASK = 0x3F'E0'0C'00;
+ constexpr uint32_t LDAPUR_INST = 0x19'40'00'00;
+ constexpr uint32_t STLUR_INST = 0x19'00'00'00;
+ 
+-constexpr uint32_t LDAXP_MASK = 0xBF'FF'80'00;
+-constexpr uint32_t LDAXP_INST = 0x88'7F'80'00;
++constexpr uint32_t LDXP_MASK = 0xBF'FF'80'00;
++constexpr uint32_t LDXP_INST = 0x88'7F'00'00;
+ 
+ constexpr uint32_t STLXP_MASK = 0xBF'E0'80'00;
+ constexpr uint32_t STLXP_INST = 0x88'20'80'00;
+ 
+ constexpr uint32_t LDAXR_MASK = 0x3F'FF'FC'00;
+ constexpr uint32_t LDAXR_INST = 0x08'5F'FC'00;
++constexpr uint32_t LDXR_INST = 0x08'5F'7C'00;
+ constexpr uint32_t LDAR_INST = 0x08'DF'FC'00;
+ constexpr uint32_t LDAPR_INST = 0x38'BF'C0'00;
+ constexpr uint32_t STLR_INST = 0x08'9F'FC'00;
+@@ -63,8 +64,6 @@ constexpr uint32_t ADD_INST = 0x0B'00'00'00;
+ constexpr uint32_t SUB_INST = 0x4B'00'00'00;
+ constexpr uint32_t ADD_SHIFT_INST = 0x0B'20'00'00;
+ constexpr uint32_t SUB_SHIFT_INST = 0x4B'20'00'00;
+-constexpr uint32_t CMP_INST = 0x6B'00'00'00;
+-constexpr uint32_t CMP_SHIFT_INST = 0x6B'20'00'00;
+ constexpr uint32_t AND_INST = 0x0A'00'00'00;
+ constexpr uint32_t BIC_INST = 0x0A'20'00'00;
+ constexpr uint32_t OR_INST = 0x2A'00'00'00;
+@@ -72,12 +71,6 @@ constexpr uint32_t ORN_INST = 0x2A'20'00'00;
+ constexpr uint32_t EOR_INST = 0x4A'00'00'00;
+ constexpr uint32_t EON_INST = 0x4A'20'00'00;
+ 
+-constexpr uint32_t CCMP_MASK = 0x7F'E0'0C'10;
+-constexpr uint32_t CCMP_INST = 0x7A'40'00'00;
+-
+-constexpr uint32_t CLREX_MASK = 0xFF'FF'F0'FF;
+-constexpr uint32_t CLREX_INST = 0xD5'03'30'5F;
+-
+ enum ExclusiveAtomicPairType {
+   TYPE_SWAP,
+   TYPE_ADD,
+@@ -310,32 +303,6 @@ static uint64_t DoLoad64(uint64_t Addr) {
+   }
+ }
+ 
+-static __uint128_t DoLoad128(uint64_t Addr) {
+-  // Any misalignment here means we cross a 16byte boundary
+-  // So we need two 128bit loads
+-  uint64_t Alignment = Addr & 0b1111;
+-  Addr &= ~0b1111ULL;
+-  uint64_t AddrUpper = Addr + 16;
+-
+-  union AlignedData {
+-    struct {
+-      __uint128_t Lower;
+-      __uint128_t Upper;
+-    } Large;
+-    struct {
+-      uint8_t Data[32];
+-    } Bytes;
+-  };
+-
+-  AlignedData* Data = reinterpret_cast<AlignedData*>(alloca(sizeof(AlignedData)));
+-  Data->Large.Upper = LoadAcquire128(AddrUpper);
+-  Data->Large.Lower = LoadAcquire128(Addr);
+-
+-  __uint128_t Result {};
+-  memcpy(&Result, &Data->Bytes.Data[Alignment], sizeof(Result));
+-  return Result;
+-}
+-
+ static bool RunCASPAL(uint64_t* GPRs, uint32_t Size, uint32_t DesiredReg1, uint32_t DesiredReg2, uint32_t ExpectedReg1,
+                       uint32_t ExpectedReg2, uint32_t AddressReg, uint32_t* StrictSplitLockMutex) {
+ 
+@@ -534,89 +501,42 @@ static bool HandleCASPAL(uint32_t Instr, uint64_t* GPRs, uint32_t* StrictSplitLo
+   return RunCASPAL(GPRs, Size, DesiredReg1, DesiredReg2, ExpectedReg1, ExpectedReg2, AddressReg, StrictSplitLockMutex);
+ }
+ 
+-static uint64_t HandleCASPAL_ARMv8(uint32_t Instr, uintptr_t ProgramCounter, uint64_t* GPRs, uint32_t* StrictSplitLockMutex) {
+-  // caspair
+-  // [1] ldaxp(TMP2.W(), TMP3.W(), MemOperand(MemSrc)); <-- DataReg & AddrReg
+-  // [2] cmp(TMP2.W(), Expected.first.W()); <-- ExpectedReg1
+-  // [3] ccmp(TMP3.W(), Expected.second.W(), NoFlag, Condition::eq); <-- ExpectedREg2
+-  // [4] b(&LoopNotExpected, Condition::ne);
+-  // [5] stlxp(TMP2.W(), Desired.first.W(), Desired.second.W(), MemOperand(MemSrc)); <-- DesiredReg
+-  // [6] cbnz(TMP2.W(), &LoopTop);
+-  // [7] mov(Dst.first.W(), Expected.first.W());
+-  // [8] mov(Dst.second.W(), Expected.second.W());
+-  // [9] b(&LoopExpected);
+-  // [10] mov(Dst.first.W(), TMP2.W());
+-  // [11] mov(Dst.second.W(), TMP3.W());
+-  // [12] clrex();
+-
+-  uint32_t* PC = (uint32_t*)ProgramCounter;
+-
+-  uint32_t Size = (Instr >> 30) & 1;
+-  uint32_t AddrReg = (Instr >> 5) & 0x1F;
+-  uint32_t DataReg = Instr & 0x1F;
+-  uint32_t DataReg2 = (Instr >> 10) & 0x1F;
+-
+-  uint32_t ExpectedReg1 {};
+-  uint32_t ExpectedReg2 {};
+-
+-  uint32_t DesiredReg1 {};
+-  uint32_t DesiredReg2 {};
+-
+-  if (Size == 1) {
+-    // 64-bit pair happens on paranoid vector loads
+-    // [1] ldaxp(TMP1, TMP2, MemSrc);
+-    // [2] clrex();
+-    //
+-    // 64-bit pair happens on paranoid vector stores
+-    // [1] ldaxp(xzr, TMP3, MemSrc); // <- Can hit SIGBUS
+-    // [2] stlxp(TMP3, TMP1, TMP2, MemSrc); // <- Can also hit SIGBUS
+-    // [3] cbnz(TMP3, &B); // < Overwritten with DMB
+-
+-    if (DataReg == 31) {
+-    } else {
+-      uint32_t NextInstr = PC[1];
+-      if ((NextInstr & ArchHelpers::Arm64::CLREX_MASK) == ArchHelpers::Arm64::CLREX_INST) {
+-        uint64_t Addr = GPRs[AddrReg];
+-
+-        auto Res = DoLoad128(Addr);
+-        // We set the result register if it isn't a zero register
+-        if (DataReg != 31) {
+-          GPRs[DataReg] = Res;
+-        }
+-        if (DataReg2 != 31) {
+-          GPRs[DataReg2] = Res >> 64;
+-        }
+-
+-        // Skip ldaxp and clrex
+-        return 2 * sizeof(uint32_t);
+-      }
+-    }
++static uint64_t HandleCASPair_LLSC(uint32_t Instr, uintptr_t ProgramCounter, uint64_t* GPRs, uint32_t* StrictSplitLockMutex) {
++  // Must match DEF_OP(CASPair):
++  // [0] ldxp(TMP2, TMP3, MemSrc); <-- faults; DataReg, DataReg2 & AddrReg
++  // [1] eor(TMP4, TMP2, Expected0); <-- ExpectedReg1
++  // [2] eor(TMP1, TMP3, Expected1); <-- ExpectedReg2
++  // [3] orr(TMP4, TMP4, TMP1);
++  // [4] cbnz(TMP4, &LoopNotExpected);
++  // [5] stlxp(TMP4, Desired0, Desired1, MemSrc); <-- DesiredReg1, DesiredReg2
++  // [6] cbnz(TMP4, &LoopTop);
++  // [7] b(&LoopDone);
++  // [8] stlxp(TMP4, TMP2, TMP3, MemSrc);
++  // [9] cbnz(TMP4, &LoopTop);
++  // [10] dmb ish <-- resume here with the observed value in DataReg, DataReg2
++  const uint32_t* PC = reinterpret_cast<const uint32_t*>(ProgramCounter);
++
++  // A 64-bit pair (CMPXCHG16B) faults only when misaligned, which RunCASPAL cannot emulate.
++  const uint32_t Size = (Instr >> 30) & 1;
++  if (Size != 0 || (PC[1] & ALU_OP_MASK) != EOR_INST || (PC[2] & ALU_OP_MASK) != EOR_INST ||
++      (PC[5] & STLXP_MASK) != STLXP_INST || PC[10] != DMB) {
+     return 0;
+   }
+ 
+-  // Only 32-bit pairs
+-  for (int i = 1; i < 10; i++) {
+-    uint32_t NextInstr = PC[i];
+-    if ((NextInstr & ArchHelpers::Arm64::ALU_OP_MASK) == ArchHelpers::Arm64::CMP_INST ||
+-        (NextInstr & ArchHelpers::Arm64::ALU_OP_MASK) == ArchHelpers::Arm64::CMP_SHIFT_INST) {
+-      ExpectedReg1 = GetRmReg(NextInstr);
+-    } else if ((NextInstr & ArchHelpers::Arm64::CCMP_MASK) == ArchHelpers::Arm64::CCMP_INST) {
+-      ExpectedReg2 = GetRmReg(NextInstr);
+-    } else if ((NextInstr & ArchHelpers::Arm64::STLXP_MASK) == ArchHelpers::Arm64::STLXP_INST) {
+-      DesiredReg1 = (NextInstr & 0x1F);
+-      DesiredReg2 = (NextInstr >> 10) & 0x1F;
+-    }
+-  }
++  const uint32_t AddrReg = GetRnReg(Instr);
++  const uint32_t DataReg = GetRdReg(Instr);
++  const uint32_t DataReg2 = (Instr >> 10) & REGISTER_MASK;
++  const uint32_t DesiredReg1 = GetRdReg(PC[5]);
++  const uint32_t DesiredReg2 = (PC[5] >> 10) & REGISTER_MASK;
+ 
+-  // mov expected into the temp registers used by JIT
+-  GPRs[DataReg] = GPRs[ExpectedReg1];
+-  GPRs[DataReg2] = GPRs[ExpectedReg2];
++  // RunCASPAL leaves the observed value in its expected registers, which is what ldxp would have loaded.
++  GPRs[DataReg] = GPRs[GetRmReg(PC[1])];
++  GPRs[DataReg2] = GPRs[GetRmReg(PC[2])];
+ 
+   if (RunCASPAL(GPRs, Size, DesiredReg1, DesiredReg2, DataReg, DataReg2, AddrReg, StrictSplitLockMutex)) {
+-    return 9 * sizeof(uint32_t); // skip to mov + clrex
+-  } else {
+-    return 0;
++    return 10 * sizeof(uint32_t);
+   }
++  return 0;
+ }
+ 
+ template<typename T>
+@@ -1630,47 +1550,36 @@ static bool HandleAtomicStore(uint32_t Instr, uint64_t* GPRs, int64_t Offset, ui
+   return false;
+ }
+ 
+-static uint64_t HandleCAS_NoAtomics(uintptr_t ProgramCounter, uint64_t* GPRs, uint32_t* StrictSplitLockMutex) {
+-  // ARMv8.0 CAS
+-  // [1] ldaxrb(TMP2.W(), MemOperand(MemSrc))
+-  // [2] cmp (TMP2.W(), Expected.W())
+-  // [3] b
+-  // [4] stlxrb(TMP3.W(), Desired.W(), MemOperand(MemSrc)
+-  // [5] cbnz
+-  // [6] mov
+-  // [7] b
+-  // [8] mov (.., TMP2.W());
+-  // [9] clrex
+-
+-  uint32_t* PC = (uint32_t*)ProgramCounter;
+-  uint32_t Instr = PC[0];
+-  uint32_t Size = 1 << (Instr >> 30);
+-  uint32_t AddressReg = GetRnReg(Instr);
+-  uint32_t ResultReg = GetRdReg(Instr); // TMP2
+-  uint32_t DesiredReg = 0;
+-  uint32_t ExpectedReg = 0;
+-  for (size_t i = 1; i < 6; ++i) {
+-    uint32_t NextInstr = PC[i];
+-    if ((NextInstr & ArchHelpers::Arm64::STLXR_MASK) == ArchHelpers::Arm64::STLXR_INST) {
+-#if defined(ASSERTIONS_ENABLED) && ASSERTIONS_ENABLED
+-      // Just double check that the memory destination matches
+-      const uint32_t StoreAddressReg = GetRnReg(NextInstr);
+-      LOGMAN_THROW_A_FMT(StoreAddressReg == AddressReg, "StoreExclusive memory register didn't match the store exclusive register");
+-#endif
+-      DesiredReg = GetRdReg(NextInstr);
+-    } else if ((NextInstr & ArchHelpers::Arm64::ALU_OP_MASK) == ArchHelpers::Arm64::CMP_INST ||
+-               (NextInstr & ArchHelpers::Arm64::ALU_OP_MASK) == ArchHelpers::Arm64::CMP_SHIFT_INST) {
+-      ExpectedReg = GetRmReg(NextInstr);
+-    }
++static uint64_t HandleCAS_LLSC(uintptr_t ProgramCounter, uint64_t* GPRs, uint32_t* StrictSplitLockMutex) {
++  // Must match DEF_OP(CAS):
++  // [0] ldxr(TMP2, MemSrc); <-- faults; ResultReg & AddressReg
++  // [1] sub(TMP3, TMP2, Expected{, uxtb|uxth}); <-- ExpectedReg
++  // [2] cbnz(TMP3, &LoopNotExpected);
++  // [3] stlxr(TMP3, Desired, MemSrc); <-- DesiredReg
++  // [4] cbnz(TMP3, &LoopTop);
++  // [5] b(&LoopDone);
++  // [6] stlxr(TMP3, TMP2, MemSrc);
++  // [7] cbnz(TMP3, &LoopTop);
++  // [8] dmb ish <-- resume here with the observed value in ResultReg
++  const uint32_t* PC = reinterpret_cast<const uint32_t*>(ProgramCounter);
++  const uint32_t Instr = PC[0];
++  if (((PC[1] & ALU_OP_MASK) != SUB_INST && (PC[1] & ALU_OP_MASK) != SUB_SHIFT_INST) || (PC[3] & STLXR_MASK) != STLXR_INST ||
++      PC[8] != DMB) {
++    return 0;
+   }
+-  // set up CASAL by doing mov(TMP2, Expected)
+-  GPRs[ResultReg] = GPRs[ExpectedReg];
+ 
++  const uint32_t Size = 1 << (Instr >> 30);
++  const uint32_t AddressReg = GetRnReg(Instr);
++  const uint32_t ResultReg = GetRdReg(Instr);
++  const uint32_t ExpectedReg = GetRmReg(PC[1]);
++  const uint32_t DesiredReg = GetRdReg(PC[3]);
++
++  // RunCASAL leaves the observed value in its expected register, which is what ldxr would have loaded.
++  GPRs[ResultReg] = GPRs[ExpectedReg];
+   if (RunCASAL(GPRs, Size, DesiredReg, ResultReg, AddressReg, StrictSplitLockMutex)) {
+-    return 7 * sizeof(uint32_t); // jump to mov to allocated register
+-  } else {
+-    return 0;
++    return 8 * sizeof(uint32_t);
+   }
++  return 0;
+ }
+ 
+ static uint64_t HandleAtomicLoadstoreExclusive(uintptr_t ProgramCounter, uint64_t* GPRs, uint32_t* StrictSplitLockMutex) {
+@@ -1748,9 +1657,6 @@ static uint64_t HandleAtomicLoadstoreExclusive(uintptr_t ProgramCounter, uint64_
+         AtomicOp = ExclusiveAtomicPairType::TYPE_SUB;
+       }
+       DataSourceReg = GetRmReg(NextInstr);
+-    } else if ((NextInstr & ArchHelpers::Arm64::ALU_OP_MASK) == ArchHelpers::Arm64::CMP_INST ||
+-               (NextInstr & ArchHelpers::Arm64::ALU_OP_MASK) == ArchHelpers::Arm64::CMP_SHIFT_INST) {
+-      return HandleCAS_NoAtomics(ProgramCounter, GPRs, StrictSplitLockMutex); // ARMv8.0 CAS
+     } else if ((NextInstr & ArchHelpers::Arm64::ALU_OP_MASK) == ArchHelpers::Arm64::AND_INST) {
+       AtomicOp = ExclusiveAtomicPairType::TYPE_AND;
+       DataSourceReg = GetRmReg(NextInstr);
+@@ -2089,23 +1995,26 @@ std::optional<int32_t> HandleUnalignedAccess(FEXCore::Core::InternalThreadState*
+       return BytesToSkip;
+     }
+     // Explicit fallthrough to the backpatch handler below!
+-  } else if ((Instr & ArchHelpers::Arm64::LDAXP_MASK) == ArchHelpers::Arm64::LDAXP_INST) { // LDAXP
+-    // Should be compare and swap pair only. LDAXP not used elsewhere
+-    uint64_t BytesToSkip = ArchHelpers::Arm64::HandleCASPAL_ARMv8(Instr, ProgramCounter, GPRs, StrictSplitLockMutex);
+-    if (BytesToSkip) {
+-      // Skip this instruction now
++  } else if ((Instr & ArchHelpers::Arm64::LDAXR_MASK) == ArchHelpers::Arm64::LDXR_INST) { // LDXR*, only emitted by CAS
++    if (uint64_t BytesToSkip = ArchHelpers::Arm64::HandleCAS_LLSC(ProgramCounter, GPRs, StrictSplitLockMutex)) {
+       return BytesToSkip;
+-    } else {
+-      LogMan::Msg::EFmt("Unhandled JIT SIGBUS CASPAL: PC: 0x{:x} Instruction: 0x{:08x}\n", ProgramCounter, PC[0]);
+-      return std::nullopt;
+     }
++    LogMan::Msg::EFmt("Unhandled JIT SIGBUS CAS: PC: 0x{:x} Instruction: 0x{:08x}\n", ProgramCounter, PC[0]);
++    return std::nullopt;
++  } else if ((Instr & ArchHelpers::Arm64::LDXP_MASK) == ArchHelpers::Arm64::LDXP_INST) { // LDXP, only emitted by CASPair
++    if (uint64_t BytesToSkip = ArchHelpers::Arm64::HandleCASPair_LLSC(Instr, ProgramCounter, GPRs, StrictSplitLockMutex)) {
++      return BytesToSkip;
++    }
++    LogMan::Msg::EFmt("Unhandled JIT SIGBUS CASPair: PC: 0x{:x} Instruction: 0x{:08x}\n", ProgramCounter, PC[0]);
++    return std::nullopt;
+   }
+ 
+   // Lock code mutex during any SIGBUS handling that potentially changes code.
+   // Due to code buffer sharing between threads, code must be carefully backpatched from last to first.
+   // Multiple threads can be attempting to handle the SIGBUS or even be executing the code being backpatched.
+-  // The spin lock lives in the block tail, in the CodeBuffer with the code; declared first so it's released last.
+-  FEXCore::Allocator::ScopedJITWrite JITWrite;
++  // Only backpatching writes JIT code; the emulated atomics above run on every unaligned access and must not toggle W^X.
++  // The spin lock lives in the JIT code tail, so the write scope must be open before taking it and outlive its release.
++  const FEXCore::Allocator::JitWriteScope JitWrite;
+   FEXCore::Utils::SpinWaitLock::UniqueSpinMutex lk(&InlineTail->SpinLockFutex);
+ 
+   if ((Instr & LDAXR_MASK) == LDAR_INST ||  // LDAR*
+diff --git a/FEXCore/include/FEXCore/Core/CoreState.h b/FEXCore/include/FEXCore/Core/CoreState.h
+index 80514bfdcddfe70b09d08b2961d68540f7e27ed6..aaf139efb93445e54cfbc9ab83fb9b335eaff8c7 100644
+--- a/FEXCore/include/FEXCore/Core/CoreState.h
++++ b/FEXCore/include/FEXCore/Core/CoreState.h
+@@ -247,7 +247,6 @@ struct alignas(64) CPUState {
+   // Follows encoding of the TI bit in segment selector encoding.
+   constexpr static uint32_t SEGMENT_ARRAY_INDEX_GDT = 0;
+   constexpr static uint32_t SEGMENT_ARRAY_INDEX_LDT = 1;
+-  Core::CPUState::gdt_segment private_gdt[32] {};
+ };
+ static_assert(std::is_trivially_copyable_v<CPUState>, "Needs to be trivial");
+ static_assert(std::is_standard_layout_v<CPUState>, "This needs to be standard layout");
+diff --git a/unittests/32Bit_ASM/PrimaryGroup/1_82_00.asm b/unittests/32Bit_ASM/PrimaryGroup/1_82_00.asm
+new file mode 100644
+index 0000000000000000000000000000000000000000..7b153a9fa039a1d8badce2477274e7e69c05a503
+--- /dev/null
++++ b/unittests/32Bit_ASM/PrimaryGroup/1_82_00.asm
+@@ -0,0 +1,26 @@
++%ifdef CONFIG
++{
++  "RegData": {
++    "RAX": "0xdeadbe01",
++    "RBX": "0xdeadbe01"
++  },
++  "Mode": "32BIT"
++}
++%endif
++
++; 0x82 is the 32-bit only alias of the 0x80 group 1 encoding.
++; NASM won't emit it, so we have to encode it by hand.
++mov eax, 0xdeadbeef
++
++; add al, 0x12
++db 0x82, 0xc0, 0x12
++
++mov edi, 0xe0000000
++mov dword [edi], 0xdeadbeef
++
++; lock add byte [edi], 0x12
++db 0xf0, 0x82, 0x07, 0x12
++
++mov ebx, [edi]
++
++hlt
+diff --git a/unittests/32Bit_ASM/PrimaryGroup/1_82_01.asm b/unittests/32Bit_ASM/PrimaryGroup/1_82_01.asm
+new file mode 100644
+index 0000000000000000000000000000000000000000..a4633fda6ddfbcdade7402fe5705346f35c339ea
+--- /dev/null
++++ b/unittests/32Bit_ASM/PrimaryGroup/1_82_01.asm
+@@ -0,0 +1,26 @@
++%ifdef CONFIG
++{
++  "RegData": {
++    "RAX": "0xdeadbeff",
++    "RBX": "0xdeadbeff"
++  },
++  "Mode": "32BIT"
++}
++%endif
++
++; 0x82 is the 32-bit only alias of the 0x80 group 1 encoding.
++; NASM won't emit it, so we have to encode it by hand.
++mov eax, 0xdeadbeef
++
++; or al, 0x12
++db 0x82, 0xc8, 0x12
++
++mov edi, 0xe0000000
++mov dword [edi], 0xdeadbeef
++
++; lock or byte [edi], 0x12
++db 0xf0, 0x82, 0x0f, 0x12
++
++mov ebx, [edi]
++
++hlt
+diff --git a/unittests/32Bit_ASM/PrimaryGroup/1_82_02.asm b/unittests/32Bit_ASM/PrimaryGroup/1_82_02.asm
+new file mode 100644
+index 0000000000000000000000000000000000000000..4a966e8f417d984789f3194fe1ac97e43c2521be
+--- /dev/null
++++ b/unittests/32Bit_ASM/PrimaryGroup/1_82_02.asm
+@@ -0,0 +1,18 @@
++%ifdef CONFIG
++{
++  "RegData": {
++    "RAX": "0xdeadbe02"
++  },
++  "Mode": "32BIT"
++}
++%endif
++
++; 0x82 is the 32-bit only alias of the 0x80 group 1 encoding.
++; NASM won't emit it, so we have to encode it by hand.
++mov eax, 0xdeadbeef
++stc
++
++; adc al, 0x12
++db 0x82, 0xd0, 0x12
++
++hlt
+diff --git a/unittests/32Bit_ASM/PrimaryGroup/1_82_03.asm b/unittests/32Bit_ASM/PrimaryGroup/1_82_03.asm
+new file mode 100644
+index 0000000000000000000000000000000000000000..823704e809cacdaae4f8ffde491ecfad2f355f57
+--- /dev/null
++++ b/unittests/32Bit_ASM/PrimaryGroup/1_82_03.asm
+@@ -0,0 +1,18 @@
++%ifdef CONFIG
++{
++  "RegData": {
++    "RAX": "0xdeadbedc"
++  },
++  "Mode": "32BIT"
++}
++%endif
++
++; 0x82 is the 32-bit only alias of the 0x80 group 1 encoding.
++; NASM won't emit it, so we have to encode it by hand.
++mov eax, 0xdeadbeef
++stc
++
++; sbb al, 0x12
++db 0x82, 0xd8, 0x12
++
++hlt
+diff --git a/unittests/32Bit_ASM/PrimaryGroup/1_82_04.asm b/unittests/32Bit_ASM/PrimaryGroup/1_82_04.asm
+new file mode 100644
+index 0000000000000000000000000000000000000000..d2954d24f64c6ba2886b4619f03212d51b2ca04c
+--- /dev/null
++++ b/unittests/32Bit_ASM/PrimaryGroup/1_82_04.asm
+@@ -0,0 +1,26 @@
++%ifdef CONFIG
++{
++  "RegData": {
++    "RAX": "0xdeadbe02",
++    "RBX": "0xdeadbe02"
++  },
++  "Mode": "32BIT"
++}
++%endif
++
++; 0x82 is the 32-bit only alias of the 0x80 group 1 encoding.
++; NASM won't emit it, so we have to encode it by hand.
++mov eax, 0xdeadbeef
++
++; and al, 0x12
++db 0x82, 0xe0, 0x12
++
++mov edi, 0xe0000000
++mov dword [edi], 0xdeadbeef
++
++; lock and byte [edi], 0x12
++db 0xf0, 0x82, 0x27, 0x12
++
++mov ebx, [edi]
++
++hlt
+diff --git a/unittests/32Bit_ASM/PrimaryGroup/1_82_05.asm b/unittests/32Bit_ASM/PrimaryGroup/1_82_05.asm
+new file mode 100644
+index 0000000000000000000000000000000000000000..92d05ba47ed008dcbf6690e65a2682e9c0cbca80
+--- /dev/null
++++ b/unittests/32Bit_ASM/PrimaryGroup/1_82_05.asm
+@@ -0,0 +1,26 @@
++%ifdef CONFIG
++{
++  "RegData": {
++    "RAX": "0xdeadbedd",
++    "RBX": "0xdeadbedd"
++  },
++  "Mode": "32BIT"
++}
++%endif
++
++; 0x82 is the 32-bit only alias of the 0x80 group 1 encoding.
++; NASM won't emit it, so we have to encode it by hand.
++mov eax, 0xdeadbeef
++
++; sub al, 0x12
++db 0x82, 0xe8, 0x12
++
++mov edi, 0xe0000000
++mov dword [edi], 0xdeadbeef
++
++; lock sub byte [edi], 0x12
++db 0xf0, 0x82, 0x2f, 0x12
++
++mov ebx, [edi]
++
++hlt
+diff --git a/unittests/32Bit_ASM/PrimaryGroup/1_82_06.asm b/unittests/32Bit_ASM/PrimaryGroup/1_82_06.asm
+new file mode 100644
+index 0000000000000000000000000000000000000000..23814504baa8fdef9a38d88bd2e9b5e7e4400da3
+--- /dev/null
++++ b/unittests/32Bit_ASM/PrimaryGroup/1_82_06.asm
+@@ -0,0 +1,26 @@
++%ifdef CONFIG
++{
++  "RegData": {
++    "RAX": "0xdeadbefd",
++    "RBX": "0xdeadbefd"
++  },
++  "Mode": "32BIT"
++}
++%endif
++
++; 0x82 is the 32-bit only alias of the 0x80 group 1 encoding.
++; NASM won't emit it, so we have to encode it by hand.
++mov eax, 0xdeadbeef
++
++; xor al, 0x12
++db 0x82, 0xf0, 0x12
++
++mov edi, 0xe0000000
++mov dword [edi], 0xdeadbeef
++
++; lock xor byte [edi], 0x12
++db 0xf0, 0x82, 0x37, 0x12
++
++mov ebx, [edi]
++
++hlt
+diff --git a/unittests/32Bit_ASM/PrimaryGroup/1_82_07.asm b/unittests/32Bit_ASM/PrimaryGroup/1_82_07.asm
+new file mode 100644
+index 0000000000000000000000000000000000000000..bb235c716004ff990356ad2580774d0775281307
+--- /dev/null
++++ b/unittests/32Bit_ASM/PrimaryGroup/1_82_07.asm
+@@ -0,0 +1,21 @@
++%ifdef CONFIG
++{
++  "RegData": {
++    "RAX": "0xdeadbeef",
++    "RBX": "0x1"
++  },
++  "Mode": "32BIT"
++}
++%endif
++
++; 0x82 is the 32-bit only alias of the 0x80 group 1 encoding.
++; NASM won't emit it, so we have to encode it by hand.
++mov eax, 0xdeadbeef
++xor ebx, ebx
++
++; cmp al, 0x12
++db 0x82, 0xf8, 0x12
++
++seta bl
++
++hlt
+diff --git a/unittests/ASM/X87/FXRSTOR_TOP.asm b/unittests/ASM/X87/FXRSTOR_TOP.asm
+new file mode 100644
+index 0000000000000000000000000000000000000000..efa3fa427efbeaec9fb19a4fb8bd956730ebc160
+--- /dev/null
++++ b/unittests/ASM/X87/FXRSTOR_TOP.asm
+@@ -0,0 +1,40 @@
++%ifdef CONFIG
++{
++  "RegData": {
++    "RAX": "5",
++    "RBX": "3",
++    "RCX": "2",
++    "RDX": "1",
++    "RSI": "0xE0"
++  }
++}
++%endif
++
++; FXSAVE stores logical ST(i), while the context stores physical registers.
++; Three pushes give TOP=5. Exact integers also exercise F80-to-F64 restore.
++fninit
++fld1
++fild dword [rel two]
++fild dword [rel three]
++fxsave [rel saved]
++fninit
++fxrstor [rel saved]
++fnstsw ax
++shr eax, 11
++and eax, 7
++fxsave [rel restored]
++movzx esi, byte [rel restored + 4]
++fistp dword [rel result]
++mov ebx, dword [rel result]
++fistp dword [rel result]
++mov ecx, dword [rel result]
++fistp dword [rel result]
++mov edx, dword [rel result]
++hlt
++
++align 16
++saved: times 512 db 0
++restored: times 512 db 0
++result: dd 0
++two: dd 2
++three: dd 3
+diff --git a/unittests/FEXLinuxTests/tests/signal/SystemInstructions.32.cpp b/unittests/FEXLinuxTests/tests/signal/SystemInstructions.32.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..7962114ad01a2c92e018120c684cad0e50e5882f
+--- /dev/null
++++ b/unittests/FEXLinuxTests/tests/signal/SystemInstructions.32.cpp
+@@ -0,0 +1,93 @@
++#include "invalid_util.h"
++
++#include <catch2/catch_test_macros.hpp>
++
++#include <signal.h>
++#include <stdint.h>
++
++#ifndef REG_RIP
++#define REG_RIP REG_EIP
++#endif
++
++enum trapno {
++  X86_TRAPNO_UD = 6,
++  X86_TRAPNO_GP = 13,
++};
++
++#define CONCAT(x, y) x##y
++#define TestSymbols(num)                       \
++  extern "C" uint64_t CONCAT(TestBegin_, num); \
++  extern "C" uint64_t CONCAT(TestEnd_, num);
++
++#define Test(num, asm, trapno, errno, si_code, signal)                                                      \
++  capturing_handler_skip = (unsigned long)&CONCAT(TestEnd_, num) - (unsigned long)&CONCAT(TestBegin_, num); \
++  const unsigned long EXPECTED_RIP = (unsigned long)&CONCAT(TestBegin_, num);                               \
++  const int EXPECTED_TRAPNO = trapno;                                                                       \
++  const int EXPECTED_ERR = errno;                                                                           \
++  const int EXPECTED_SI_CODE = si_code;                                                                     \
++  const int EXPECTED_SIGNAL = signal;                                                                       \
++  __asm volatile("TestBegin_" #num ":" asm ";"                                                              \
++                                           "TestEnd_" #num ":" ::                                           \
++                                             : "memory");
++
++
++#define TEST(num, name, asm, trapno, errno, _si_code, _signal)      \
++  TestSymbols(num);                                                 \
++  TEST_CASE("Signals: " #name) {                                    \
++    struct sigaction act {};                                        \
++    act.sa_sigaction = CapturingHandler;                            \
++    act.sa_flags = SA_SIGINFO;                                      \
++    sigaction(SIGSEGV, &act, nullptr);                              \
++    sigaction(SIGTRAP, &act, nullptr);                              \
++    sigaction(SIGILL, &act, nullptr);                               \
++                                                                    \
++    Test(num, asm, trapno, errno, _si_code, _signal);               \
++                                                                    \
++    REQUIRE(from_handler.has_value());                              \
++    CHECK(from_handler->mctx.gregs[REG_RIP] == EXPECTED_RIP);       \
++    CHECK(from_handler->mctx.gregs[REG_TRAPNO] == EXPECTED_TRAPNO); \
++    CHECK(from_handler->mctx.gregs[REG_ERR] == EXPECTED_ERR);       \
++    CHECK(from_handler->si_code == EXPECTED_SI_CODE);               \
++    CHECK(from_handler->signal == EXPECTED_SIGNAL);                 \
++    from_handler.reset();                                           \
++  }
++
++// Instructions that explicitly are supported but must only work in CPL-0
++TEST(0, "rdmsr", "rdmsr", X86_TRAPNO_GP, 0, 0x80, SIGSEGV);
++TEST(1, "outs", "outs dx, byte ptr [esi]", X86_TRAPNO_GP, 0, 0x80, SIGSEGV);
++TEST(2, "ins", "ins byte ptr [edi], dx", X86_TRAPNO_GP, 0, 0x80, SIGSEGV);
++TEST(3, "cli", "cli", X86_TRAPNO_GP, 0, 0x80, SIGSEGV);
++TEST(4, "clts", "clts", X86_TRAPNO_GP, 0, 0x80, SIGSEGV);
++TEST(5, "invlpg", "invlpg [eax]", X86_TRAPNO_GP, 0, 0x80, SIGSEGV);
++TEST(6, "lmsw", "lmsw [eax]", X86_TRAPNO_GP, 0, 0x80, SIGSEGV);
++TEST(7, "ltr", "ltr [eax]", X86_TRAPNO_GP, 0, 0x80, SIGSEGV);
++TEST(8, "mov cr0", "mov cr0, eax", X86_TRAPNO_GP, 0, 0x80, SIGSEGV);
++TEST(10, "mov eax, cr0", "mov eax, cr0", X86_TRAPNO_GP, 0, 0x80, SIGSEGV);
++TEST(12, "mov eax, dr0", "mov eax, dr0", X86_TRAPNO_GP, 0, 0x80, SIGSEGV);
++TEST(13, "mov dr0, eax", "mov dr0, eax", X86_TRAPNO_GP, 0, 0x80, SIGSEGV);
++TEST(14, "rdpmc", "rdpmc", X86_TRAPNO_GP, 0, 0x80, SIGSEGV);
++TEST(15, "sti", "sti", X86_TRAPNO_GP, 0, 0x80, SIGSEGV);
++TEST(16, "swapgs", "swapgs", X86_TRAPNO_UD, 0, 2, SIGILL);
++#ifdef __clang__
++TEST(17, "sysret", "sysret", X86_TRAPNO_GP, 0, 0x80, SIGSEGV);
++#else
++TEST(17, "sysret", "sysretd", X86_TRAPNO_GP, 0, 0x80, SIGSEGV);
++#endif
++TEST(18, "wrmsr", "wrmsr", X86_TRAPNO_GP, 0, 0x80, SIGSEGV);
++TEST(19, "invd", "invd", X86_TRAPNO_GP, 0, 0x80, SIGSEGV);
++TEST(20, "wbinvd", "wbinvd", X86_TRAPNO_GP, 0, 0x80, SIGSEGV);
++
++// Instructions not implemented
++TEST(21, "monitor", "monitor", X86_TRAPNO_UD, 0, 2, SIGILL);
++TEST(22, "mwait", "mwait", X86_TRAPNO_UD, 0, 2, SIGILL);
++TEST(23, "sysenter", "sysenter", X86_TRAPNO_UD, 0, 2, SIGILL);
++#ifdef __clang__
++TEST(24, "sysexit", "sysexit", X86_TRAPNO_UD, 0, 2, SIGILL);
++#else
++TEST(24, "sysexit", "sysexitd", X86_TRAPNO_UD, 0, 2, SIGILL);
++#endif
++
++TEST(25, "in eax, dx", "in eax, dx", X86_TRAPNO_GP, 0, 0x80, SIGSEGV);
++// Differs between dr8 and dr0-7 variants.
++// dr0-7: SIGSEGV
++// dr8-15: SIGILL
+diff --git a/unittests/FEXLinuxTests/tests/signal/SystemInstructions.64.cpp b/unittests/FEXLinuxTests/tests/signal/SystemInstructions.64.cpp
+index dee0830cf484839390600aca5e631fe9ec51bef3..6a5fbc9c12ceb83dc0c5796433e59f5b8d19f368 100644
+--- a/unittests/FEXLinuxTests/tests/signal/SystemInstructions.64.cpp
++++ b/unittests/FEXLinuxTests/tests/signal/SystemInstructions.64.cpp
+@@ -53,6 +53,7 @@ enum trapno {
+     CHECK(from_handler->mctx.gregs[REG_ERR] == EXPECTED_ERR);       \
+     CHECK(from_handler->si_code == EXPECTED_SI_CODE);               \
+     CHECK(from_handler->signal == EXPECTED_SIGNAL);                 \
++    from_handler.reset();                                           \
+   }
+ 
+ // Instructions that explicitly are supported but must only work in CPL-0
+diff --git a/unittests/InstructionCountCI/AVX128/VEX_map1.json b/unittests/InstructionCountCI/AVX128/VEX_map1.json
+index ace54c96efed31046fe5261f07bda909500366da..8b8e553f1e52edea820b14ddce5b421b54e62af1 100644
+--- a/unittests/InstructionCountCI/AVX128/VEX_map1.json
++++ b/unittests/InstructionCountCI/AVX128/VEX_map1.json
+@@ -36,15 +36,11 @@
+       ]
+     },
+     "vmovups ymm0, ymm0": {
+-      "ExpectedInstructionCount": 2,
++      "ExpectedInstructionCount": 0,
+       "Comment": [
+-        "Spurious moves",
+         "Map 1 0b00 0x10 256-bit"
+       ],
+-      "ExpectedArm64ASM": [
+-        "ldr q2, [x28, #192]",
+-        "str q2, [x28, #192]"
+-      ]
++      "ExpectedArm64ASM": []
+     },
+     "vmovups ymm0, [rax]": {
+       "ExpectedInstructionCount": 2,
+@@ -76,15 +72,11 @@
+       ]
+     },
+     "vmovupd ymm0, ymm0": {
+-      "ExpectedInstructionCount": 2,
++      "ExpectedInstructionCount": 0,
+       "Comment": [
+-        "Spurious moves",
+         "Map 1 0b01 0x10 256-bit"
+       ],
+-      "ExpectedArm64ASM": [
+-        "ldr q2, [x28, #192]",
+-        "str q2, [x28, #192]"
+-      ]
++      "ExpectedArm64ASM": []
+     },
+     "vmovupd ymm0, [rax]": {
+       "ExpectedInstructionCount": 2,
+@@ -4159,7 +4151,7 @@
+       ]
+     },
+     "vpmovmskb rax, ymm0": {
+-      "ExpectedInstructionCount": 16,
++      "ExpectedInstructionCount": 10,
+       "Comment": [
+         "Map 1 0b01 0xd7 256-bit"
+       ],
+@@ -4168,18 +4160,12 @@
+         "ldr q3, [x28, #3456]",
+         "cmlt v4.16b, v16.16b, #0",
+         "and v4.16b, v4.16b, v3.16b",
+-        "addp v4.16b, v4.16b, v4.16b",
+-        "addp v4.16b, v4.16b, v4.16b",
+-        "addp v4.8b, v4.8b, v4.8b",
+-        "umov w20, v4.h[0]",
+         "cmlt v2.16b, v2.16b, #0",
+         "and v2.16b, v2.16b, v3.16b",
+-        "addp v2.16b, v2.16b, v2.16b",
++        "addp v2.16b, v4.16b, v2.16b",
+         "addp v2.16b, v2.16b, v2.16b",
+         "addp v2.8b, v2.8b, v2.8b",
+-        "umov w21, v2.h[0]",
+-        "orr x20, x20, x21, lsl #16",
+-        "mov w4, w20"
++        "mov w4, v2.s[0]"
+       ]
+     },
+     "vpsubusb xmm0, xmm1, xmm2": {
