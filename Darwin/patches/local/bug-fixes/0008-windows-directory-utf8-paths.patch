@@ -1,0 +1,127 @@
+Subject: [PATCH] windows directory utf8 paths
+
+Keep Windows directory traversal paths consistently UTF-8.
+
+Source: local macOS Wine queue; see ../../README.md for ancestry and dependencies.
+License: ../LICENSE (MIT)
+
+diff --git a/FEXCore/Source/Interface/Core/DiskCache.cpp b/FEXCore/Source/Interface/Core/DiskCache.cpp
+index aef1e3dba86760c02bfd341d3f9b45acf6e04110..dac2281bf1c84d2dbce78885830f598e896025cf 100644
+--- a/FEXCore/Source/Interface/Core/DiskCache.cpp
++++ b/FEXCore/Source/Interface/Core/DiskCache.cpp
+@@ -22,6 +22,9 @@
+ #include <cstring>
+ #include <atomic>
+ 
++#include <winternl.h>
++extern "C" NTSTATUS RtlUnicodeToUTF8N(PCHAR, ULONG, PULONG, PCWCH, ULONG);
++
+ namespace FEXCore {
+ 
+ namespace DiskCache {
+@@ -387,6 +390,21 @@ namespace DiskCache {
+     if (!DiskCachePruneStaleEntries) {
+       return;
+     }
++    const fextl::string NativeCacheBase(CacheBase);
++
++    // Config/getenv and file-open APIs use ANSI; FileUtils traversal uses UTF-8.
++    UNICODE_STRING BaseW;
++    if (!RtlCreateUnicodeStringFromAsciiz(&BaseW, NativeCacheBase.c_str())) return;
++    ULONG Bytes {};
++    if (RtlUnicodeToUTF8N(nullptr, 0, &Bytes, BaseW.Buffer, BaseW.Length) != 0) {
++      RtlFreeUnicodeString(&BaseW);
++      return;
++    }
++    fextl::string UTF8Base(Bytes, '\0');
++    const auto Status = RtlUnicodeToUTF8N(UTF8Base.data(), Bytes, &Bytes, BaseW.Buffer, BaseW.Length);
++    RtlFreeUnicodeString(&BaseW);
++    if (Status != 0) return;
++    CacheBase = UTF8Base;
+ 
+     struct SimpleCapture {
+       std::string_view CacheBase, MachineBucketHash;
+diff --git a/FEXCore/Source/Utils/FileUtils.cpp b/FEXCore/Source/Utils/FileUtils.cpp
+index d3e62cacde06e483ece57bbb07642bed7d23eabd..433663768c668186714727f37ed485c56d4c73e0 100644
+--- a/FEXCore/Source/Utils/FileUtils.cpp
++++ b/FEXCore/Source/Utils/FileUtils.cpp
+@@ -10,6 +10,7 @@
+ #include <fcntl.h>
+ #include <unistd.h>
+ #else
++#include <climits>
+ #include <windows.h>
+ #include <winnt.h>
+ #include <winternl.h>
+@@ -21,6 +22,7 @@ extern "C" NTSTATUS WINAPI NtQueryDirectoryFile(HANDLE, HANDLE, PIO_APC_ROUTINE,
+ 
+ extern "C" NTSTATUS RtlUnicodeToUTF8N(OUT PCHAR UTF8StringDestination, IN ULONG UTF8StringMaxByteCount,
+                                       OUT PULONG UTF8StringActualByteCount, IN PCWCH UnicodeStringSource, IN ULONG UnicodeStringByteCount);
++extern "C" NTSTATUS RtlUTF8ToUnicodeN(PWSTR, ULONG, PULONG, PCCH, ULONG);
+ #endif
+ 
+ namespace FEXCore::FileUtils {
+@@ -202,14 +204,27 @@ end:
+ }
+ 
+ #else
++static std::optional<fextl::basic_string<wchar_t>> PathToWidePath(std::string_view Path) {
++  // WalkDirectory returns UTF-8 names, independent of the process ANSI code page.
++  ULONG Bytes {};
++  if (Path.empty() || Path.find('\0') != std::string_view::npos || Path.size() > ULONG_MAX ||
++      RtlUTF8ToUnicodeN(nullptr, 0, &Bytes, Path.data(), Path.size()) != STATUS_SUCCESS) {
++    return std::nullopt;
++  }
++  fextl::basic_string<wchar_t> PathW(Bytes / sizeof(wchar_t), L'\0');
++  if (RtlUTF8ToUnicodeN(PathW.data(), Bytes, &Bytes, Path.data(), Path.size()) != STATUS_SUCCESS) {
++    return std::nullopt;
++  }
++  return PathW;
++}
++
+ static inline std::optional<UNICODE_STRING> PathToNTPath(std::string_view Path) {
+-  UNICODE_STRING PathW;
+-  if (!RtlCreateUnicodeStringFromAsciiz(&PathW, fextl::string(Path).c_str())) {
++  auto PathW = PathToWidePath(Path);
++  if (!PathW) {
+     return std::nullopt;
+   }
+   UNICODE_STRING NTPath;
+-  bool Success = RtlDosPathNameToNtPathName_U(PathW.Buffer, &NTPath, nullptr, nullptr);
+-  RtlFreeUnicodeString(&PathW);
++  bool Success = RtlDosPathNameToNtPathName_U(PathW->c_str(), &NTPath, nullptr, nullptr);
+   if (!Success) {
+     return std::nullopt;
+   }
+@@ -298,10 +313,17 @@ FEX_DEFAULT_VISIBILITY void WalkDirectory(std::string_view Directory,
+       if (EntryName != L"." && EntryName != L"..") {
+         ULONG utf8_bytes_needed = 0;
+         ULONG actual_utf8_bytes = 0;
+-        RtlUnicodeToUTF8N(nullptr, 0, &utf8_bytes_needed, Info->FileName, Info->FileNameLength);
++        Status = RtlUnicodeToUTF8N(nullptr, 0, &utf8_bytes_needed, Info->FileName, Info->FileNameLength);
++        if (Status != STATUS_SUCCESS) {
++          goto end;
++        }
+         char* dynamic_buf = reinterpret_cast<char*>(FEXCore::Allocator::malloc(utf8_bytes_needed + 1));
+         if (dynamic_buf) {
+-          RtlUnicodeToUTF8N(dynamic_buf, utf8_bytes_needed + 1, &actual_utf8_bytes, Info->FileName, Info->FileNameLength);
++          Status = RtlUnicodeToUTF8N(dynamic_buf, utf8_bytes_needed + 1, &actual_utf8_bytes, Info->FileName, Info->FileNameLength);
++          if (Status != STATUS_SUCCESS) {
++            FEXCore::Allocator::free(dynamic_buf);
++            goto end;
++          }
+           std::string_view name_view(dynamic_buf, actual_utf8_bytes);
+           bool is_dir = (Info->FileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+           Callback(name_view, is_dir, user_data);
+diff --git a/FEXCore/include/FEXCore/Utils/FileUtils.h b/FEXCore/include/FEXCore/Utils/FileUtils.h
+index 07365aa927fb9542f0a236554d212668be9a52dc..2bb3c5334af8353be19c0e387c13459e6bc68079 100644
+--- a/FEXCore/include/FEXCore/Utils/FileUtils.h
++++ b/FEXCore/include/FEXCore/Utils/FileUtils.h
+@@ -13,6 +13,7 @@ namespace FEXCore::FileUtils {
+  */
+ FEX_DEFAULT_VISIBILITY bool RecursiveRemoveDirectory(const fextl::string& Directory);
+ 
++// Traversal paths and returned entry names use UTF-8, including on Windows.
+ FEX_DEFAULT_VISIBILITY void WalkDirectory(std::string_view Directory,
+                                           fextl::move_only_function<void(std::string_view name, bool is_dir, const void* user_data)> Callback,
+                                           const void* user_data);

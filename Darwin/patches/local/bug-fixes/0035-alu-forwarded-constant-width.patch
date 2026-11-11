@@ -1,0 +1,22 @@
+Subject: [PATCH] alu forwarded constant width
+
+Mask forwarded constants to the architectural narrow ALU operand width.
+
+Source: local macOS Wine queue; see ../../README.md for ancestry and dependencies.
+License: ../LICENSE (MIT)
+
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp b/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
+index 8526a20fb038fb227f21f7598cc12638d982f66a..cb2c2179e4023125ca5b7dbc09a5c4da48822849 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
+@@ -4830,7 +4830,9 @@ void OpDispatchBuilder::ALUOp(OpcodeArgs, FEXCore::IR::IROps ALUIROp, FEXCore::I
+       (ALUIROp == IR::IROps::OP_XOR || ALUIROp == IR::IROps::OP_OR || ALUIROp == IR::IROps::OP_ANDWITHFLAGS)) {
+ 
+     RoundedSize = ResultSize = GetGPROpSize();
+-    LOGMAN_THROW_A_FMT(Const < (1ull << IR::OpSizeAsBits(Size)), "does not clobber");
++    // Forwarded register constants can retain the upper garbage allowed by the load.
++    Const &= (1ull << IR::OpSizeAsBits(Size)) - 1;
++    Src = Constant(Const);
+ 
+     // For AND, we can play the same trick but we instead need the upper bits of
+     // the constant to be all-1s instead of all-0s to preserve. We also can't

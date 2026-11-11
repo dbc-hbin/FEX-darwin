@@ -1,0 +1,49 @@
+Subject: [PATCH] lse cmpxchg full ordering
+
+Provide full x86 ordering around LSE compare-exchange, including failed comparisons.
+
+Source: local macOS Wine queue; see ../../README.md for ancestry and dependencies.
+License: ../LICENSE (MIT)
+
+diff --git a/FEXCore/Source/Interface/Core/JIT/AtomicOps.cpp b/FEXCore/Source/Interface/Core/JIT/AtomicOps.cpp
+index 014a8c690593e3db86d4abb59c4294a9c63e589b..017b108ad4b0a093d68c38f721cd352e5526eb6a 100644
+--- a/FEXCore/Source/Interface/Core/JIT/AtomicOps.cpp
++++ b/FEXCore/Source/Interface/Core/JIT/AtomicOps.cpp
+@@ -23,7 +23,10 @@ DEF_OP(CASPair) {
+   auto MemSrc = GetReg(Op->Addr);
+ 
+   const auto EmitSize = IROp->ElementSize == IR::OpSize::i64Bit ? ARMEmitter::Size::i64Bit : ARMEmitter::Size::i32Bit;
++
+   if (CTX->HostFeatures.SupportsAtomics) {
++    // Failed comparisons may be read-only; order prior stores before the compare read itself.
++    dmb(ARMEmitter::BarrierScope::ISH);
+     // RA has heuristics to try to pair sources, but we need to handle the cases
+     // where they fail. We do so by moving to temporaries. Note we use 64-bit
+     // moves here even for 32-bit cmpxchg, for the Firestorm register renamer.
+@@ -46,6 +49,8 @@ DEF_OP(CASPair) {
+     mov(ARMEmitter::Size::i64Bit, CaspalDst0, Expected0);
+     mov(ARMEmitter::Size::i64Bit, CaspalDst1, Expected1);
+     caspal(EmitSize, CaspalDst0, CaspalDst1, Desired0, Desired1, MemSrc);
++    // A failed LSE comparison may perform no release write. Locked x86 operations still order stores before later loads.
++    dmb(ARMEmitter::BarrierScope::ISH);
+ 
+     if (CaspalDst0 != Dst0) {
+       mov(ARMEmitter::Size::i64Bit, Dst0, CaspalDst0);
+@@ -103,6 +108,8 @@ DEF_OP(CAS) {
+   auto Dst = GetReg(Node);
+ 
+   if (CTX->HostFeatures.SupportsAtomics) {
++    // Failed comparisons may be read-only; order prior stores before the compare read itself.
++    dmb(ARMEmitter::BarrierScope::ISH);
+     if (Expected == Dst && Dst != MemSrc && Dst != Desired) {
+       casal(SubEmitSize, Dst, Desired, MemSrc);
+     } else {
+@@ -110,6 +117,8 @@ DEF_OP(CAS) {
+       casal(SubEmitSize, TMP2, Desired, MemSrc);
+       mov(EmitSize, Dst, TMP2.R());
+     }
++    // Failed comparisons require the same full ordering as successful locked operations.
++    dmb(ARMEmitter::BarrierScope::ISH);
+   } else {
+     ARMEmitter::BackwardLabel LoopTop;
+     ARMEmitter::ForwardLabel LoopNotExpected;

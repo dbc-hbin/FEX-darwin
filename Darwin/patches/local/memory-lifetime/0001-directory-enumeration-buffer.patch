@@ -1,0 +1,20 @@
+Subject: [PATCH] directory enumeration buffer
+
+Replace the live enumeration buffer without retaining a freed pointer.
+
+Source: local macOS Wine queue; see ../../README.md for ancestry and dependencies.
+License: ../LICENSE (MIT)
+
+diff --git a/FEXCore/Source/Utils/FileUtils.cpp b/FEXCore/Source/Utils/FileUtils.cpp
+index 433663768c668186714727f37ed485c56d4c73e0..3002e7162ddd7943ab82c4dcf9ad8c7ce65f56b3 100644
+--- a/FEXCore/Source/Utils/FileUtils.cpp
++++ b/FEXCore/Source/Utils/FileUtils.cpp
+@@ -290,7 +290,7 @@ FEX_DEFAULT_VISIBILITY void WalkDirectory(std::string_view Directory,
+         // Buffer too small? Scale and try again.
+         dirent_size *= 2;
+         FEXCore::Allocator::free(dirent_buffer);
+-        uint8_t* dirent_buffer = reinterpret_cast<uint8_t*>(FEXCore::Allocator::malloc(dirent_size));
++        dirent_buffer = reinterpret_cast<uint8_t*>(FEXCore::Allocator::malloc(dirent_size));
+ 
+         if (!dirent_buffer) {
+           // Ran out of memory?

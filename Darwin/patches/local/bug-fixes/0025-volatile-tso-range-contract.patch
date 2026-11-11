@@ -1,0 +1,166 @@
+Subject: [PATCH] volatile tso range contract
+
+Validate and apply instruction-level volatile ordering metadata without weakening forced ordering.
+
+Source: local macOS Wine queue; see ../../README.md for ancestry and dependencies.
+License: ../LICENSE (MIT)
+
+diff --git a/FEXCore/Source/Interface/Core/Core.cpp b/FEXCore/Source/Interface/Core/Core.cpp
+index eec2d3d5f043b84134fb64fcfe66e439234e186a..df9d26520651618dfbc879161db40712c5a7cbd0 100644
+--- a/FEXCore/Source/Interface/Core/Core.cpp
++++ b/FEXCore/Source/Interface/Core/Core.cpp
+@@ -578,14 +578,8 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
+       }
+ #endif
+ 
+-      bool BlockInForceTSOValidRange = false;
+-      auto InstForceTSOIt = ForceTSOInstructions.end();
+-      if (ForceTSOValidRanges.Contains({Block.Entry, Block.Entry + Block.Size})) {
+-        if (auto It = ForceTSOInstructions.lower_bound(Block.Entry); It != ForceTSOInstructions.end() && *It < Block.Entry + Block.Size) {
+-          InstForceTSOIt = It;
+-          BlockInForceTSOValidRange = true;
+-        }
+-      }
++      auto TSORange = ForceTSOValidRanges.Query(Block.Entry);
++      auto InstForceTSOIt = ForceTSOInstructions.lower_bound(Block.Entry);
+ 
+       // Set the block entry point
+       Thread->OpDispatcher->SetNewBlockIfChanged(Block.Entry);
+@@ -677,14 +671,17 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
+           Thread->OpDispatcher->ResetHandledLock();
+           Thread->OpDispatcher->ResetDecodeFailure();
+           IR::ForceTSOMode ForceTSO = IR::ForceTSOMode::NoOverride;
+-          if (BlockInForceTSOValidRange) {
+-            if (InstForceTSOIt != ForceTSOInstructions.end() && *InstForceTSOIt == InstAddress) {
+-              ForceTSO = IR::ForceTSOMode::ForceEnabled;
+-            } else {
+-              ForceTSO = IR::ForceTSOMode::ForceDisabled;
+-            }
+-          } else if (DecodedInfo->Flags & X86Tables::DecodeFlags::FLAG_FORCE_TSO) {
++          if (TSORange.Size && InstAddress >= TSORange.Interval.End) {
++            TSORange = ForceTSOValidRanges.Query(InstAddress);
++          }
++          // A range certifies its unmarked instructions, including runs with no marked PC.
++          // Never weaken an instruction spanning the boundary, or an explicit Unity override.
++          if ((DecodedInfo->Flags & X86Tables::DecodeFlags::FLAG_FORCE_TSO) ||
++              (InstForceTSOIt != ForceTSOInstructions.end() && *InstForceTSOIt == InstAddress)) {
+             ForceTSO = IR::ForceTSOMode::ForceEnabled;
++          } else if (TSORange.Size && InstAddress >= TSORange.Interval.Offset &&
++                     DecodedInfo->InstSize <= TSORange.Interval.End - InstAddress) {
++            ForceTSO = IR::ForceTSOMode::ForceDisabled;
+           }
+ 
+           Thread->OpDispatcher->SetForceTSO(ForceTSO);
+@@ -701,8 +698,9 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
+             ++TotalInstructions;
+ 
+             // Walk InstForceTSOIt forward past the handled instruction
+-            InstForceTSOIt =
+-              std::find_if(InstForceTSOIt, ForceTSOInstructions.end(), [&](auto Val) { return Val >= Block.Entry + BlockInstructionsLength; });
++            while (InstForceTSOIt != ForceTSOInstructions.end() && *InstForceTSOIt < Block.Entry + BlockInstructionsLength) {
++              ++InstForceTSOIt;
++            }
+           }
+         } else {
+           // Invalid instruction
+@@ -1156,7 +1154,7 @@ void ContextImpl::RemoveForceTSOInformation(uint64_t Address, uint64_t Size) {
+   LogMan::Throw::AFmt(CodeInvalidationMutex.try_lock() == false, "CodeInvalidationMutex needs to be unique_locked here");
+ 
+   ForceTSOValidRanges.Remove({Address, Address + Size});
+-  ForceTSOInstructions.erase(ForceTSOInstructions.lower_bound(Address), ForceTSOInstructions.upper_bound(Address + Size));
++  ForceTSOInstructions.erase(ForceTSOInstructions.lower_bound(Address), ForceTSOInstructions.lower_bound(Address + Size));
+ }
+ 
+ void ContextImpl::MarkMonoBackpatcherBlock(uint64_t BlockEntry) {
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher.h b/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
+index 792c2fdcb819eebfe53c950390fab7f5d25a8774..8023ee50370eb3115a31233d46e6b38766145388 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
+@@ -1600,8 +1600,8 @@ private:
+   }
+ 
+   [[nodiscard]]
+-  static bool IsNonTSOReg(MemoryAccessType Access, uint8_t Reg) {
+-    return Access == MemoryAccessType::DEFAULT && Reg == X86State::REG_RSP;
++  bool IsNonTSOReg(MemoryAccessType Access, uint8_t Reg) const {
++    return Access == MemoryAccessType::DEFAULT && Reg == X86State::REG_RSP && ForceTSO != ForceTSOMode::ForceEnabled;
+   }
+ 
+   AddressMode DecodeAddress(const X86Tables::DecodedOp& Op, const X86Tables::DecodedOperand& Operand, MemoryAccessType AccessType, bool IsLoad);
+diff --git a/Source/Common/VolatileMetadata.h b/Source/Common/VolatileMetadata.h
+index a6141fe1b6233652798f1691258d86ebe6e30ce4..25a32874da3efc1f54f751f988372544e8094b55 100644
+--- a/Source/Common/VolatileMetadata.h
++++ b/Source/Common/VolatileMetadata.h
+@@ -36,7 +36,8 @@ inline void ApplyFEXExtendedVolatileMetadata(FEX::VolatileMetadata::ExtendedVola
+ 
+   // Walk the volatile list
+   for (const auto it_ranges : ExtendedMetaData.VolatileValidRanges) {
+-    if (it_ranges.Offset >= FileOffset && it_ranges.End < FileOffsetEnd) {
++    if (it_ranges.Offset >= FileOffset && it_ranges.Offset < it_ranges.End && it_ranges.End <= FileOffsetEnd &&
++        it_ranges.End - FileOffset <= EndAddress - Address) {
+       VolatileValidRanges.Insert({Address + it_ranges.Offset - FileOffset, Address + it_ranges.End - FileOffset});
+     }
+   }
+diff --git a/Source/Windows/Common/ImageTracker.cpp b/Source/Windows/Common/ImageTracker.cpp
+index dd22fe3ab4b8258033aae8ba15ab14ff04082260..761b7873eb85507d61ec2bfc738e828008232d3b 100644
+--- a/Source/Windows/Common/ImageTracker.cpp
++++ b/Source/Windows/Common/ImageTracker.cpp
+@@ -46,17 +46,24 @@ static void LoadImageVolatileMetadata(fextl::set<uint64_t>& VolatileInstructions
+ 
+   const auto* LoadConfig =
+     reinterpret_cast<ArchImageLoadConfigDirectory*>(RtlImageDirectoryEntryToData(Module, true, IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG, &Size));
+-  if (!LoadConfig || LoadConfig->Size <= offsetof(ArchImageLoadConfigDirectory, VolatileMetadataPointer)) {
++  constexpr size_t Required = offsetof(ArchImageLoadConfigDirectory, VolatileMetadataPointer) + sizeof(LoadConfig->VolatileMetadataPointer);
++  if (!LoadConfig || Size < Required || LoadConfig->Size < Required) {
+     return;
+   }
+ 
+-  if (LoadConfig->VolatileMetadataPointer < Address || LoadConfig->VolatileMetadataPointer + sizeof(IMAGE_VOLATILE_METADATA) >= EndAddress) {
++  const auto ImageSize = EndAddress - Address;
++  auto InImage = [ImageSize](uint64_t RVA, uint64_t Bytes) { return RVA <= ImageSize && Bytes <= ImageSize - RVA; };
++  const uint64_t MetadataRVA = LoadConfig->VolatileMetadataPointer - Address;
++  if (!InImage(MetadataRVA, sizeof(IMAGE_VOLATILE_METADATA))) {
+     return;
+   }
+ 
+-  const auto* VolatileMetadata = reinterpret_cast<IMAGE_VOLATILE_METADATA*>(LoadConfig->VolatileMetadataPointer);
+-  if (!VolatileMetadata || Address + VolatileMetadata->VolatileAccessTable + VolatileMetadata->VolatileAccessTableSize >= EndAddress ||
+-      Address + VolatileMetadata->VolatileInfoRangeTable + VolatileMetadata->VolatileInfoRangeTableSize >= EndAddress) {
++  const auto* VolatileMetadata = reinterpret_cast<const IMAGE_VOLATILE_METADATA*>(Address + MetadataRVA);
++  if (VolatileMetadata->Size < sizeof(*VolatileMetadata) ||
++      !InImage(VolatileMetadata->VolatileAccessTable, VolatileMetadata->VolatileAccessTableSize) ||
++      !InImage(VolatileMetadata->VolatileInfoRangeTable, VolatileMetadata->VolatileInfoRangeTableSize) ||
++      VolatileMetadata->VolatileAccessTableSize % sizeof(IMAGE_VOLATILE_RVA_METADATA) ||
++      VolatileMetadata->VolatileInfoRangeTableSize % sizeof(IMAGE_VOLATILE_RANGE_METADATA)) {
+     return;
+   }
+ 
+@@ -64,6 +71,9 @@ static void LoadImageVolatileMetadata(fextl::set<uint64_t>& VolatileInstructions
+   const auto* VolatileAccessTableEnd =
+     VolatileAccessTableBegin + (VolatileMetadata->VolatileAccessTableSize / sizeof(IMAGE_VOLATILE_RVA_METADATA));
+   for (auto It = VolatileAccessTableBegin; It != VolatileAccessTableEnd; It++) {
++    if (It->Rva >= ImageSize) {
++      return; // Never certify an unmarked range using a malformed instruction table.
++    }
+     VolatileInstructions.emplace(Address + It->Rva);
+   }
+ 
+@@ -71,7 +81,9 @@ static void LoadImageVolatileMetadata(fextl::set<uint64_t>& VolatileInstructions
+   const auto* VolatileInfoRangeTableEnd =
+     VolatileInfoRangeTableBegin + (VolatileMetadata->VolatileInfoRangeTableSize / sizeof(IMAGE_VOLATILE_RANGE_METADATA));
+   for (auto It = VolatileInfoRangeTableBegin; It != VolatileInfoRangeTableEnd; It++) {
+-    VolatileValidRanges.Insert({Address + It->Rva, Address + It->Rva + It->Size});
++    if (InImage(It->Rva, It->Size)) {
++      VolatileValidRanges.Insert({Address + It->Rva, Address + It->Rva + It->Size});
++    }
+   }
+ }
+ 
+@@ -182,7 +194,6 @@ FEXCore::ExecutableFileSectionInfo ImageTracker::HandleImageMap(std::string_view
+     }
+   }
+ 
+-
+   if (FEXCore::Config::Get_VOLATILEMETADATA()) {
+     uint64_t EndAddress = Address + Nt->OptionalHeader.SizeOfImage;
+     fextl::set<uint64_t> VolatileInstructions {};

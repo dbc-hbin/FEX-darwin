@@ -1,0 +1,46 @@
+Subject: [PATCH] disk cache footprint identity
+
+Match cache index entries by both guest hash and footprint.
+
+Source: local macOS Wine queue; see ../../README.md for ancestry and dependencies.
+License: ../LICENSE (MIT)
+
+diff --git a/FEXCore/Source/Interface/Core/DiskCache.cpp b/FEXCore/Source/Interface/Core/DiskCache.cpp
+index 1b74348b8cf75bfeadb0f297b0830478a7144c26..36145b61a3f45d3f49046862dd74675bad6ff805 100644
+--- a/FEXCore/Source/Interface/Core/DiskCache.cpp
++++ b/FEXCore/Source/Interface/Core/DiskCache.cpp
+@@ -981,7 +981,7 @@ namespace DiskCache {
+   IndexEntry* DiskCache::LookupLocked(const uint64_t LookupKey, const XXH128_hash_t& GuestHash, const uint64_t GuestFootprint) {
+     auto It = Index.find(LookupKey);
+     if (It != Index.end()) {
+-      if (XXH128_isEqual(It->second.MainEntry.GuestHash, GuestHash)) {
++      if (It->second.MainEntryFootprint == GuestFootprint && XXH128_isEqual(It->second.MainEntry.GuestHash, GuestHash)) {
+         return &It->second.MainEntry;
+       }
+       if (It->second.MoreEntries.get()) {
+@@ -1273,23 +1273,9 @@ namespace DiskCache {
+       auto It = Index.find(LookupKey);
+       if (It == Index.end()) {
+         Index.emplace(LookupKey, IndexCacheHead {std::move(NewEntry), GuestFootprint, nullptr});
++      } else if (LookupLocked(LookupKey, Header.GuestHash, GuestFootprint)) {
++        return true;
+       } else {
+-        bool Dupe = false;
+-        if (It->second.MoreEntries.get()) {
+-          for (auto& [Key, Elem] : *It->second.MoreEntries) {
+-            if (XXH128_isEqual(Elem.GuestHash, Header.GuestHash)) {
+-              Dupe = true;
+-              break;
+-            }
+-          }
+-        }
+-        if (!Dupe && XXH128_isEqual(It->second.MainEntry.GuestHash, Header.GuestHash)) {
+-          Dupe = true;
+-        }
+-        // could happen if it's seen again while in flight in the store queue
+-        if (Dupe) {
+-          return true;
+-        }
+         if (!It->second.MoreEntries.get()) {
+           It->second.MoreEntries = fextl::make_unique<fextl::multimap<uint64_t, struct IndexEntry>>();
+         } else if (It->second.MoreEntries->size() >= LOOKUP_KEY_MAX_BUCKET_DEPTH) {

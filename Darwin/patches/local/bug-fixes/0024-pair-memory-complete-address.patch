@@ -1,0 +1,89 @@
+Subject: [PATCH] pair memory complete address
+
+Preserve complete addresses and actual element widths for paired memory accesses.
+
+Source: local macOS Wine queue; see ../../README.md for ancestry and dependencies.
+License: ../LICENSE (MIT)
+
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher.h b/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
+index 4477c7266c85e92cd7377b374b0fcbb7f8a44bfa..792c2fdcb819eebfe53c950390fab7f5d25a8774 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
+@@ -2634,18 +2634,19 @@ private:
+     return _LoadMemAutoTSO(RegClass::FPR, Size, A, Align);
+   }
+ 
+-  AddressMode SelectPairAddressMode(AddressMode A, IR::OpSize Size) {
++  AddressMode SelectPairAddressMode(AddressMode A, IR::OpSize Size, bool AtomicTSO) {
+     LOGMAN_THROW_A_FMT(Size != IR::OpSize::iUnsized, "Invalid size!");
+     const auto SizeInt = IR::OpSizeToSize(Size);
+     AddressMode Out {};
+ 
+-    signed OffsetEl = A.Offset / SizeInt;
+-    if ((A.Offset % SizeInt) == 0 && OffsetEl >= -64 && OffsetEl < 64) {
++    const auto OffsetEl = A.Offset / SizeInt;
++    // Preserve the signed imm7 selection for pairs. Ordered accesses use a complete base.
++    if (!AtomicTSO && !A.Segment && A.AddrSize == OpSize::i64Bit && (A.Offset % SizeInt) == 0 && OffsetEl >= -64 && OffsetEl < 64) {
+       Out.Offset = A.Offset;
+       A.Offset = 0;
+     }
+ 
+-    Out.Base = LoadEffectiveAddress(this, A, GetGPROpSize(), true, false);
++    Out.Base = LoadEffectiveAddress(this, A, A.AddrSize == OpSize::i64Bit ? OpSize::i64Bit : GetGPROpSize(), true, false);
+     return Out;
+   }
+ 
+@@ -2663,18 +2664,19 @@ private:
+     const bool AtomicTSO = IsTSOEnabled(Class) && !A.NonTSO;
+ 
+     // Use ldp if possible, otherwise fallback on two loads.
++    const auto B = SelectPairAddressMode(A, Size, AtomicTSO);
+     if (!AtomicTSO && !A.Segment && Size >= OpSize::i32Bit && Size <= OpSize::i128Bit) {
+-      const auto B = SelectPairAddressMode(A, Size);
+       return LoadMemPair(Class, Size, B.Base, B.Offset);
+     }
+ 
+-    AddressMode HighA = A;
+-    HighA.Offset += 16;
+-
+-    return {
+-      .Low = _LoadMemAutoTSO(Class, Size, A, Align),
+-      .High = _LoadMemAutoTSO(Class, Size, HighA, Align),
+-    };
++    const auto LowOffset = Constant(B.Offset);
++    const auto HighOffset = Constant(B.Offset + IR::OpSizeToSize(Size));
++    if (AtomicTSO) {
++      return {_LoadMemTSO(Class, Size, B.Base, LowOffset, Align, MemOffsetType::SXTX, 1),
++              _LoadMemTSO(Class, Size, B.Base, HighOffset, Align, MemOffsetType::SXTX, 1)};
++    }
++    return {_LoadMem(Class, Size, B.Base, LowOffset, Align, MemOffsetType::SXTX, 1),
++            _LoadMem(Class, Size, B.Base, HighOffset, Align, MemOffsetType::SXTX, 1)};
+   }
+   RefPair _LoadMemPairFPRAutoTSO(OpSize Size, const AddressMode& A, OpSize Align = OpSize::i8Bit) {
+     return _LoadMemPairAutoTSO(RegClass::FPR, Size, A, Align);
+@@ -2702,15 +2704,19 @@ private:
+     const bool AtomicTSO = IsTSOEnabled(Class) && !A.NonTSO;
+ 
+     // Use stp if possible, otherwise fallback on two stores.
++    const auto B = SelectPairAddressMode(A, Size, AtomicTSO);
+     if (!AtomicTSO && !A.Segment && Size >= OpSize::i32Bit && Size <= OpSize::i128Bit) {
+-      const auto B = SelectPairAddressMode(A, Size);
+       _StoreMemPair(Class, Size, Value1, Value2, B.Base, B.Offset);
+     } else {
+-      auto B = A;
+-
+-      _StoreMemAutoTSO(Class, Size, B, Value1, OpSize::i8Bit);
+-      B.Offset += SizeInt;
+-      _StoreMemAutoTSO(Class, Size, B, Value2, OpSize::i8Bit);
++      const auto LowOffset = Constant(B.Offset);
++      const auto HighOffset = Constant(B.Offset + SizeInt);
++      if (AtomicTSO) {
++        _StoreMemTSO(Class, Size, Value1, B.Base, LowOffset, Align, MemOffsetType::SXTX, 1);
++        _StoreMemTSO(Class, Size, Value2, B.Base, HighOffset, Align, MemOffsetType::SXTX, 1);
++      } else {
++        _StoreMem(Class, Size, Value1, B.Base, LowOffset, Align, MemOffsetType::SXTX, 1);
++        _StoreMem(Class, Size, Value2, B.Base, HighOffset, Align, MemOffsetType::SXTX, 1);
++      }
+     }
+   }
+   void _StoreMemPairFPRAutoTSO(OpSize Size, const AddressMode& A, Ref Value1, Ref Value2, OpSize Align = OpSize::i8Bit) {

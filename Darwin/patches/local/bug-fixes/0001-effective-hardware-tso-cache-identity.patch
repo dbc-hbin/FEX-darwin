@@ -1,0 +1,149 @@
+Subject: [PATCH] effective hardware tso cache identity
+
+Initialize cache identity after selecting effective hardware TSO.
+
+Source: local macOS Wine queue; see ../../README.md for ancestry and dependencies.
+License: ../LICENSE (MIT)
+
+diff --git a/FEXCore/Source/Interface/Context/Context.h b/FEXCore/Source/Interface/Context/Context.h
+index 9b91055bd084b0b15137eca8a2414faf1894afa7..0b1c36e2c953af71d22a2c48fe910cdcb18cad60 100644
+--- a/FEXCore/Source/Interface/Context/Context.h
++++ b/FEXCore/Source/Interface/Context/Context.h
+@@ -456,6 +456,10 @@ public:
+     UpdateAtomicTSOEmulationConfig();
+   }
+ 
++  bool HasHardwareTSOSupport() const {
++    return SupportsHardwareTSO || HostFeatures.ProcessFeatures.SupportsHardwareTSO;
++  }
++
+   void EnableExitOnHLT() override {
+     ExitOnHLT = true;
+   }
+@@ -472,7 +476,7 @@ public:
+ 
+ protected:
+   void UpdateAtomicTSOEmulationConfig() {
+-    if (SupportsHardwareTSO) {
++    if (HasHardwareTSOSupport()) {
+       // If the hardware supports TSO then we don't need to emulate it through atomics.
+       AtomicTSOEmulationEnabled = false;
+       VectorAtomicTSOEmulationEnabled = false;
+diff --git a/FEXCore/include/FEXCore/Core/HostFeatures.h b/FEXCore/include/FEXCore/Core/HostFeatures.h
+index 0073b58492c87a4ae7f63d6b6c21f98153735d48..f488427ef58da8676141b530af067a95a084b501 100644
+--- a/FEXCore/include/FEXCore/Core/HostFeatures.h
++++ b/FEXCore/include/FEXCore/Core/HostFeatures.h
+@@ -63,7 +63,8 @@ struct HostFeatures {
+     uint8_t SupportsSVE128 : 1 {};
+     uint8_t SupportsSVE256 : 1 {};
+ 
+-    uint8_t pad : 1 {};
++    // Effective hardware TSO selected before context construction.
++    uint8_t SupportsHardwareTSO : 1 {};
+   };
+   static_assert(sizeof(ProcessFeaturesHash) == 1);
+ 
+diff --git a/Source/Windows/ARM64EC/Module.cpp b/Source/Windows/ARM64EC/Module.cpp
+index a74252ff2c944113661ec82e37ae338724d03c3b..524137f9b43e9350a38cb0c813fb4ee7c4040764 100644
+--- a/Source/Windows/ARM64EC/Module.cpp
++++ b/Source/Windows/ARM64EC/Module.cpp
+@@ -796,7 +796,7 @@ NTSTATUS ProcessInit() {
+   CTX->SetSignalDelegator(SignalDelegator.get());
+   CTX->SetSyscallHandler(SyscallHandler.get());
+   CTX->InitCore();
+-  Exception::HandlerConfig.emplace(*CTX);
++  Exception::HandlerConfig.emplace();
+   InvalidationTracker.emplace(*CTX, Threads);
+   ImageTracker.emplace(*CTX, false);
+ 
+diff --git a/Source/Windows/Common/CPUFeatures.cpp b/Source/Windows/Common/CPUFeatures.cpp
+index 02ae1eedacf4320e698e1018fb5d0111cd823313..5f55e4a64600c5e4786e51999875f1e5381974d8 100644
+--- a/Source/Windows/Common/CPUFeatures.cpp
++++ b/Source/Windows/Common/CPUFeatures.cpp
+@@ -2,6 +2,7 @@
+ 
+ #include "Common/CPUInfo.h"
+ 
++#include <FEXCore/Config/Config.h>
+ #include <FEXCore/Core/Context.h>
+ #include <FEXCore/Core/HostFeatures.h>
+ #include <FEXCore/fextl/fmt.h>
+@@ -94,6 +95,8 @@ FEXCore::HostFeatures CPUFeatures::FetchHostFeatures(bool IsWine, FEXCore::HostF
+   // arm64ec supports synchronous faults without a double-fault dance.
+   HostFeatures.ProcessFeatures.SupportsFaultFreeSynchronousFaults = HostType == FEXCore::HostFeatures::HostTypeEnum::Arm64ec;
+ 
++  FEX_CONFIG_OPT(TSOEnabled, TSOENABLED);
++  HostFeatures.ProcessFeatures.SupportsHardwareTSO = TSOEnabled() && UnixLib::TryEnableHardwareTSO();
+   return HostFeatures;
+ }
+ 
+diff --git a/Source/Windows/Common/FEXUnixLib.h b/Source/Windows/Common/FEXUnixLib.h
+index a5b93aae2fca080e9c336fba7ebfb42f73eedb42..53f65c87685a7291bcfeb9944c31a9f88c97e134 100644
+--- a/Source/Windows/Common/FEXUnixLib.h
++++ b/Source/Windows/Common/FEXUnixLib.h
+@@ -22,9 +22,11 @@ bool Init(HMODULE NtDll);
+ bool Available();
+ 
+ /**
+- * @brief Tries to enable hardware TSO if supported.
++ * @brief Enable hardware TSO through the native Unix helper.
+  *
+- * @return true if hardware TSO is supported and enabled.
++ * Call before creating the context so its code-cache identity includes this state.
++ * Wine enables its other guest-executing threads through its existing TSO hook.
++ * @return true if the helper enabled hardware TSO on the calling thread.
+  */
+ bool TryEnableHardwareTSO();
+ 
+diff --git a/Source/Windows/Common/TSOHandlerConfig.h b/Source/Windows/Common/TSOHandlerConfig.h
+index f63478d792dc7f1774f7cf15ee05c95d13e459c8..3825070260c4bbf8d638bc38200af426133a66f2 100644
+--- a/Source/Windows/Common/TSOHandlerConfig.h
++++ b/Source/Windows/Common/TSOHandlerConfig.h
+@@ -1,7 +1,6 @@
+ // SPDX-License-Identifier: MIT
+ #pragma once
+ 
+-#include <FEXCore/Core/Context.h>
+ #include <FEXCore/Config/Config.h>
+ #include <FEXCore/Utils/ArchHelpers/Arm64.h>
+ 
+@@ -10,17 +9,13 @@
+ namespace FEX::Windows {
+ class TSOHandlerConfig final {
+ public:
+-  TSOHandlerConfig(FEXCore::Context::Context& CTX) {
++  TSOHandlerConfig() {
+     if (HalfBarrierTSOEnabled()) {
+       UnalignedHandlerType = FEXCore::ArchHelpers::Arm64::UnalignedHandlerType::HalfBarrier;
+     } else {
+       UnalignedHandlerType = FEXCore::ArchHelpers::Arm64::UnalignedHandlerType::NonAtomic;
+     }
+ 
+-    if (TSOEnabled() && FEX::Windows::UnixLib::TryEnableHardwareTSO()) {
+-      CTX.SetHardwareTSOSupport(true);
+-    }
+-
+     uint64_t Flags = (StrictInProcessSplitLocks() ? FEX_UNALIGN_ATOMIC_STRICT_SPLIT_LOCKS : 0) |
+                      (KernelUnalignedAtomicBackpatching() ? FEX_UNALIGN_ATOMIC_BACKPATCH : 0) | FEX_UNALIGN_ATOMIC_EMULATE;
+ 
+@@ -34,7 +29,6 @@ public:
+   }
+ 
+ private:
+-  FEX_CONFIG_OPT(TSOEnabled, TSOENABLED);
+   FEX_CONFIG_OPT(HalfBarrierTSOEnabled, HALFBARRIERTSOENABLED);
+   FEX_CONFIG_OPT(StrictInProcessSplitLocks, STRICTINPROCESSSPLITLOCKS);
+   FEX_CONFIG_OPT(KernelUnalignedAtomicBackpatching, KERNELUNALIGNEDATOMICBACKPATCHING);
+diff --git a/Source/Windows/WOW64/Module.cpp b/Source/Windows/WOW64/Module.cpp
+index 5ad510728ef58d80684373f42e78574632a7aa4d..e7296b5ca55f7a70db0529ab0897e953c530624c 100644
+--- a/Source/Windows/WOW64/Module.cpp
++++ b/Source/Windows/WOW64/Module.cpp
+@@ -596,7 +596,7 @@ void BTCpuProcessInit() {
+   CTX->SetSignalDelegator(SignalDelegator.get());
+   CTX->SetSyscallHandler(SyscallHandler.get());
+   CTX->InitCore();
+-  Context::HandlerConfig.emplace(*CTX);
++  Context::HandlerConfig.emplace();
+   InvalidationTracker.emplace(*CTX, Threads);
+   ImageTracker.emplace(*CTX, false);
+ 

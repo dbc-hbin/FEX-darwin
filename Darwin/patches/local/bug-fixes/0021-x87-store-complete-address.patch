@@ -1,0 +1,218 @@
+Subject: [PATCH] x87 store complete address
+
+Carry complete architectural addresses through x87 store producers and consumers.
+
+Source: local macOS Wine queue; see ../../README.md for ancestry and dependencies.
+License: ../LICENSE (MIT)
+
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher/X87.cpp b/FEXCore/Source/Interface/Core/OpcodeDispatcher/X87.cpp
+index 7cb516d00dc3cfe9b0d73d9e34c34ecfa108c10e..059b25412fd6bd352e3ddc565d1f8eb9b570f75f 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher/X87.cpp
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher/X87.cpp
+@@ -135,8 +135,8 @@ void OpDispatchBuilder::FST(OpcodeArgs, IR::OpSize Width) {
+   const auto SourceSize = ReducedPrecisionMode ? OpSize::i64Bit : OpSize::f80Bit;
+   AddressMode A = DecodeAddress(Op, Op->Dest, MemoryAccessType::DEFAULT, false);
+ 
+-  A = SelectAddressMode(this, A, GetGPROpSize(), CTX->HostFeatures.SupportsTSOImm9, false, false, Width);
+-  _StoreStackMem(SourceSize, Width, A.Base, A.Index, OpSize::iInvalid, A.IndexType, A.IndexScale);
++  Ref Mem = LoadEffectiveAddress(this, A, GetGPROpSize(), true);
++  _StoreStackMem(SourceSize, Width, Mem);
+ 
+   if (Op->TableInfo->Flags & X86Tables::InstFlags::FLAGS_POP) {
+     _PopStackDestroy();
+diff --git a/FEXCore/Source/Interface/IR/IR.json b/FEXCore/Source/Interface/IR/IR.json
+index 6c1a345fe68c9fd99b192dab5761f39905d37109..01548fc90902d974665f451783160ea30737e053 100644
+--- a/FEXCore/Source/Interface/IR/IR.json
++++ b/FEXCore/Source/Interface/IR/IR.json
+@@ -3006,7 +3006,7 @@
+         "HasSideEffects": true,
+         "X87": true
+       },
+-      "StoreStackMem OpSize:$SourceSize, OpSize:$StoreSize, GPR:$Addr, GPR:$Offset, OpSize:$Align, MemOffsetType:$OffsetType, u8:$OffsetScale": {
++      "StoreStackMem OpSize:$SourceSize, OpSize:$StoreSize, GPR:$Addr": {
+         "Desc": [
+           "Takes the top value off the x87 stack and stores it to memory.",
+           "SourceSize is 128bit for F80 values, 64-bit for low precision.",
+diff --git a/FEXCore/Source/Interface/IR/PassManager.cpp b/FEXCore/Source/Interface/IR/PassManager.cpp
+index 5d3bcec8bc6427eaddf47a28dc9ee1bbff771789..169100a9668783c0e8de1b8a5f77069adabfdac7 100644
+--- a/FEXCore/Source/Interface/IR/PassManager.cpp
++++ b/FEXCore/Source/Interface/IR/PassManager.cpp
+@@ -73,7 +73,7 @@ void PassManager::AddDefaultPasses(Context::ContextImpl* ctx) {
+   // We only specifically disable optimization passes if desired, as IR output should
+   // still be well-formed regardless of the modifications made to it.
+   if (!DisablePasses()) {
+-    InsertPass(CreateX87StackOptimizationPass(ctx->HostFeatures, ctx->Config.Is64BitMode ? IR::OpSize::i64Bit : IR::OpSize::i32Bit));
++    InsertPass(CreateX87StackOptimizationPass(ctx->HostFeatures));
+     InsertPass(CreateDeadFlagCalculationEliminination());
+   }
+ 
+diff --git a/FEXCore/Source/Interface/IR/Passes.h b/FEXCore/Source/Interface/IR/Passes.h
+index 213967a092da0f34c3afadcd8746f3305927e1f5..74353615a81c19e65bd41ea59198f982521009eb 100644
+--- a/FEXCore/Source/Interface/IR/Passes.h
++++ b/FEXCore/Source/Interface/IR/Passes.h
+@@ -13,7 +13,7 @@ class Pass;
+ 
+ fextl::unique_ptr<Pass> CreateDeadFlagCalculationEliminination();
+ fextl::unique_ptr<Pass> CreateRegisterAllocationPass(const CPUIDEmu* CPUID);
+-fextl::unique_ptr<Pass> CreateX87StackOptimizationPass(const HostFeatures&, OpSize GPROpSize);
++fextl::unique_ptr<Pass> CreateX87StackOptimizationPass(const HostFeatures&);
+ 
+ namespace Validation {
+   fextl::unique_ptr<Pass> CreateIRValidation();
+diff --git a/FEXCore/Source/Interface/IR/Passes/x87StackOptimizationPass.cpp b/FEXCore/Source/Interface/IR/Passes/x87StackOptimizationPass.cpp
+index f205097a1e0edddf9b889fc185ed2ec25571c6eb..e6da0681308a1509124b86adddb9ad0d64b4c6f1 100644
+--- a/FEXCore/Source/Interface/IR/Passes/x87StackOptimizationPass.cpp
++++ b/FEXCore/Source/Interface/IR/Passes/x87StackOptimizationPass.cpp
+@@ -8,7 +8,6 @@
+ #include "FEXCore/IR/IR.h"
+ #include "FEXCore/Utils/Profiler.h"
+ #include "FEXCore/Core/HostFeatures.h"
+-#include "Interface/Core/Addressing.h"
+ 
+ #include <array>
+ #include <cstddef>
+@@ -151,9 +150,8 @@ private:
+ 
+ class X87StackOptimization final : public Pass {
+ public:
+-  X87StackOptimization(const FEXCore::HostFeatures& Features, OpSize GPROpSize)
+-    : Features(Features)
+-    , GPROpSize(GPROpSize) {
++  X87StackOptimization(const FEXCore::HostFeatures& Features)
++    : Features(Features) {
+     FEX_CONFIG_OPT(ReducedPrecision, X87REDUCEDPRECISION);
+     ReducedPrecisionMode = ReducedPrecision;
+   }
+@@ -161,41 +159,26 @@ public:
+ 
+ private:
+   const FEXCore::HostFeatures& Features;
+-  const OpSize GPROpSize;
+   bool ReducedPrecisionMode;
+   FEX_CONFIG_OPT(DisableVixlIndirectCalls, DISABLE_VIXL_INDIRECT_RUNTIME_CALLS);
+ 
+   // Helpers
+   Ref RotateRight8(uint32_t V, Ref Amount);
+ 
+-  void F80SplitStore_Helper(const IROp_StoreStackMem* Op, Ref StackNode, Ref AddrNode, Ref Offset, OpSize Align, MemOffsetType OffsetType,
+-                            uint8_t OffsetScale) {
+-    IREmit->_StoreMemFPR(OpSize::i64Bit, StackNode, AddrNode, Offset, Align, OffsetType, OffsetScale);
++  void F80SplitStore_Helper(Ref StackNode, Ref AddrNode) {
++    IREmit->_StoreMemFPR(OpSize::i64Bit, StackNode, AddrNode, IREmit->Invalid(), OpSize::iInvalid, MemOffsetType::SXTX, 1);
+     auto Upper = IREmit->_VExtractToGPR(OpSize::i128Bit, OpSize::i64Bit, StackNode, 1);
+ 
+     // Store the Upper part of the register (the remaining 2 bytes) into memory.
+-    AddressMode A {.Base = AddrNode,
+-                   .Index = Op->Offset.IsInvalid() ? nullptr : Offset,
+-                   .Offset = 8,
+-                   .IndexType = MemOffsetType::SXTX,
+-                   .IndexScale = OffsetScale,
+-                   .AddrSize = OpSize::i64Bit};
+-    A = SelectAddressMode(IREmit, A, GPROpSize, Features.SupportsTSOImm9, false, false, OpSize::i16Bit);
+-    IREmit->_StoreMemGPR(OpSize::i16Bit, Upper, A.Base, A.Index, OpSize::i64Bit, MemOffsetType::SXTX, A.IndexScale);
++    IREmit->_StoreMemGPR(OpSize::i16Bit, Upper, AddrNode, IREmit->Constant(8), OpSize::i64Bit, MemOffsetType::SXTX, 1);
+   }
+ 
+-  void Store80BitToMem(const IROp_StoreStackMem* Op, Ref StackNode, Ref AddrNode, Ref Offset, OpSize Align, MemOffsetType OffsetType,
+-                       uint8_t OffsetScale) {
++  void Store80BitToMem(Ref StackNode, Ref AddrNode) {
++    // StoreStackMem carries the complete architectural operand base.
+     if (Features.SupportsSVE()) {
+-      AddressMode A {.Base = AddrNode,
+-                     .Index = Op->Offset.IsInvalid() ? nullptr : Offset,
+-                     .IndexType = MemOffsetType::SXTX,
+-                     .IndexScale = OffsetScale,
+-                     .AddrSize = OpSize::i64Bit};
+-      AddrNode = LoadEffectiveAddress(IREmit, A, GPROpSize, false);
+       IREmit->_StoreMemX87SVEOptPredicate(OpSize::i128Bit, OpSize::i16Bit, StackNode, AddrNode);
+     } else {
+-      F80SplitStore_Helper(Op, StackNode, AddrNode, Offset, Align, OffsetType, OffsetScale);
++      F80SplitStore_Helper(StackNode, AddrNode);
+     }
+   }
+ 
+@@ -203,22 +186,18 @@ private:
+     LOGMAN_THROW_A_FMT(!ReducedPrecisionMode, "Full precision mode expected.");
+ 
+     Ref AddrNode = IR.GetNode(Op->Addr);
+-    Ref Offset = IR.GetNode(Op->Offset);
+-    OpSize Align = Op->Align;
+-    MemOffsetType OffsetType = Op->OffsetType;
+-    uint8_t OffsetScale = Op->OffsetScale;
+ 
+     // Normal Precision Mode
+     switch (Op->StoreSize) {
+     case OpSize::i32Bit:
+     case OpSize::i64Bit: {
+       StackNode = IREmit->_F80CVT(Op->StoreSize, StackNode);
+-      IREmit->_StoreMemFPR(Op->StoreSize, StackNode, AddrNode, Offset, Align, OffsetType, OffsetScale);
++      IREmit->_StoreMemFPR(Op->StoreSize, StackNode, AddrNode, IREmit->Invalid(), OpSize::iInvalid, MemOffsetType::SXTX, 1);
+       break;
+     }
+ 
+     case OpSize::f80Bit: {
+-      Store80BitToMem(Op, StackNode, AddrNode, Offset, Align, OffsetType, OffsetScale);
++      Store80BitToMem(StackNode, AddrNode);
+       break;
+     }
+     default: ERROR_AND_DIE_FMT("Unsupported x87 size");
+@@ -231,10 +210,6 @@ private:
+     LOGMAN_THROW_A_FMT(ReducedPrecisionMode, "Reduced precision mode expected.");
+ 
+     Ref AddrNode = IR.GetNode(Op->Addr);
+-    Ref Offset = IR.GetNode(Op->Offset);
+-    OpSize Align = Op->Align;
+-    MemOffsetType OffsetType = Op->OffsetType;
+-    uint8_t OffsetScale = Op->OffsetScale;
+ 
+     switch (Op->StoreSize) {
+     case OpSize::i32Bit: {
+@@ -242,13 +217,13 @@ private:
+       [[fallthrough]];
+     }
+     case OpSize::i64Bit: {
+-      IREmit->_StoreMemFPR(Op->StoreSize, StackNode, AddrNode, Offset, Align, OffsetType, OffsetScale);
++      IREmit->_StoreMemFPR(Op->StoreSize, StackNode, AddrNode, IREmit->Invalid(), OpSize::iInvalid, MemOffsetType::SXTX, 1);
+       break;
+     }
+ 
+     case OpSize::f80Bit: {
+       StackNode = IREmit->_F80CVTTo(StackNode, OpSize::i64Bit);
+-      Store80BitToMem(Op, StackNode, AddrNode, Offset, Align, OffsetType, OffsetScale);
++      Store80BitToMem(StackNode, AddrNode);
+       break;
+     }
+     default: ERROR_AND_DIE_FMT("Unsupported x87 size");
+@@ -1001,10 +976,6 @@ void X87StackOptimization::Run(IREmitter* Emit) {
+         const auto& Value = MigrateToSlowPath_IfInvalid();
+         Ref StackNode = SlowPath ? LoadStackValueAtOffset_Slow() : Value->StackDataNode;
+         Ref AddrNode = CurrentIR.GetNode(Op->Addr);
+-        Ref Offset = CurrentIR.GetNode(Op->Offset);
+-        OpSize Align = Op->Align;
+-        MemOffsetType OffsetType = Op->OffsetType;
+-        uint8_t OffsetScale = Op->OffsetScale;
+ 
+         // On the fast path we can optimize memory copies.
+         // If we are doing:
+@@ -1021,9 +992,9 @@ void X87StackOptimization::Run(IREmitter* Emit) {
+         if (!SlowPath && Value->Source && Value->Source->Size == StoreSize) {
+           Ref SourceValue = Value->Source->Node;
+           if (Op->StoreSize == OpSize::f80Bit) {
+-            Store80BitToMem(Op, SourceValue, AddrNode, Offset, Align, OffsetType, OffsetScale);
++            Store80BitToMem(SourceValue, AddrNode);
+           } else {
+-            IREmit->_StoreMemFPR(StoreSize, SourceValue, AddrNode, Offset, Align, OffsetType, OffsetScale);
++            IREmit->_StoreMemFPR(StoreSize, SourceValue, AddrNode, IREmit->Invalid(), OpSize::iInvalid, MemOffsetType::SXTX, 1);
+           }
+           break;
+         }
+@@ -1234,7 +1205,7 @@ void X87StackOptimization::Run(IREmitter* Emit) {
+   }
+ }
+ 
+-fextl::unique_ptr<Pass> CreateX87StackOptimizationPass(const HostFeatures& Features, OpSize GPROpSize) {
+-  return fextl::make_unique<X87StackOptimization>(Features, GPROpSize);
++fextl::unique_ptr<Pass> CreateX87StackOptimizationPass(const HostFeatures& Features) {
++  return fextl::make_unique<X87StackOptimization>(Features);
+ }
+ } // namespace FEXCore::IR

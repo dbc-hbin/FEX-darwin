@@ -3,17 +3,19 @@ Subject: [PATCH] ARM64EC: restore the extra flags carried by the paired Wine exp
 Apply after the wine-build-new FEX queue. Requires the matching Wine EFLAGS
 patch; both sides use LMISXH_AKMOCL_EFLAGS with the same opt-out semantics.
 
+diff --git a/Source/Windows/ARM64EC/Module.cpp b/Source/Windows/ARM64EC/Module.cpp
+index d112e7b6d2bf2042b06cf2edc9ff3c85efc3c83f..3c39e84da45d7be5c579cc3c3d04892ac48989b6 100644
 --- a/Source/Windows/ARM64EC/Module.cpp
 +++ b/Source/Windows/ARM64EC/Module.cpp
-@@ -52,6 +52,7 @@
+@@ -52,6 +52,7 @@ $end_info$
  #include "Windows/Common/SHMStats.h"
-
+ 
  #include <cstdint>
 +#include <cstdlib>
  #include <cstdio>
  #include <type_traits>
  #include <mutex>
-@@ -715,12 +716,21 @@
+@@ -797,13 +798,22 @@ public:
  extern "C" void SyncThreadContext(CONTEXT* Context) {
    ProcessCrossProcessWork();
    auto* Thread = GetCPUArea().ThreadState();
@@ -22,7 +24,7 @@ patch; both sides use LMISXH_AKMOCL_EFLAGS with the same opt-out semantics.
    static constexpr uint32_t ECValidEFlagsMask {(1U << FEXCore::X86State::RFLAG_OF_RAW_LOC) | (1U << FEXCore::X86State::RFLAG_CF_RAW_LOC) |
                                                 (1U << FEXCore::X86State::RFLAG_ZF_RAW_LOC) | (1U << FEXCore::X86State::RFLAG_SF_RAW_LOC) |
                                                 (1U << FEXCore::X86State::RFLAG_TF_RAW_LOC)};
-
+ 
 +  static const bool CarryExtraFlags = [] {
 +    const char* Value = std::getenv("LMISXH_AKMOCL_EFLAGS");
 +    return !Value || (Value[0] == '1' && !Value[1]);
@@ -37,3 +39,4 @@ patch; both sides use LMISXH_AKMOCL_EFLAGS with the same opt-out semantics.
 +  Context->EFlags = (Context->EFlags & ValidEFlagsMask) | (StateEFlags & ~ValidEFlagsMask);
    Exception::LoadStateFromECContext(Thread, *Context);
  }
+ 

@@ -60,15 +60,26 @@ def main() -> None:
         if hashlib.sha256(patch.read_bytes()).hexdigest() != checksums[entry]:
             sys.exit(f"Patch checksum mismatch: {entry}")
     source.parent.mkdir(parents=True, exist_ok=True)
+    _ = subprocess.run(["git", "init", str(source)], check=True)
+    _ = subprocess.run(
+        ["git", "-C", str(source), "remote", "add", "origin", provenance.upstream.repository],
+        check=True,
+    )
     _ = subprocess.run(
         [
             "git",
-            "clone",
-            "--depth=1",
-            f"--branch={provenance.upstream.tag}",
-            provenance.upstream.repository,
+            "-C",
             str(source),
+            "fetch",
+            "--no-tags",
+            "origin",
+            provenance.upstream.commit,
+            f"refs/tags/{provenance.upstream.tag}:refs/tags/{provenance.upstream.tag}",
         ],
+        check=True,
+    )
+    _ = subprocess.run(
+        ["git", "-C", str(source), "checkout", "--detach", provenance.upstream.commit],
         check=True,
     )
     revision = subprocess.run(
@@ -79,6 +90,19 @@ def main() -> None:
     ).stdout.strip()
     if revision != provenance.upstream.commit:
         sys.exit(f"Upstream revision mismatch: {revision}")
+    # Keep the release ancestry available to CMake's git describe version lookup.
+    _ = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(source),
+            "merge-base",
+            "--is-ancestor",
+            f"refs/tags/{provenance.upstream.tag}",
+            "HEAD",
+        ],
+        check=True,
+    )
     for entry in series:
         _ = subprocess.run(
             [

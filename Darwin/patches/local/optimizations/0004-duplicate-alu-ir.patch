@@ -1,0 +1,20 @@
+Subject: [PATCH] duplicate alu ir
+
+Avoid creating duplicate unused ADD and SUB IR.
+
+Source: local macOS Wine queue; see ../../README.md for ancestry and dependencies.
+License: ../LICENSE (MIT)
+
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp b/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
+index cb2c2179e4023125ca5b7dbc09a5c4da48822849..51e263b41629c2141ca35ae3d034170abc2fcb5f 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
+@@ -4869,7 +4869,7 @@ void OpDispatchBuilder::ALUOp(OpcodeArgs, FEXCore::IR::IROps ALUIROp, FEXCore::I
+     Result = _Not(OpSize, Dest);
+   } else if (IsConst && Const == Mask && !DestIsLockedMem(Op) && ALUIROp == IR::IROps::OP_AND) {
+     Result = Dest;
+-  } else {
++  } else if (ALUIROp != IR::IROps::OP_ADD && ALUIROp != IR::IROps::OP_SUB) {
+     DeriveOp(ALUOp, ALUIROp, _AndWithFlags(OpSize, Dest, Src));
+     Result = ALUOp;
+   }

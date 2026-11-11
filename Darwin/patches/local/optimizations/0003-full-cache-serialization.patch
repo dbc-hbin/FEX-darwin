@@ -1,0 +1,21 @@
+Subject: [PATCH] full cache serialization
+
+Avoid serializing cache entries that cannot be stored.
+
+Source: local macOS Wine queue; see ../../README.md for ancestry and dependencies.
+License: ../LICENSE (MIT)
+
+diff --git a/FEXCore/Source/Interface/Core/DiskCache.cpp b/FEXCore/Source/Interface/Core/DiskCache.cpp
+index 0706cc0bca78e3d89823f395098edb6326543a55..0823a5679a0c0abad49362bd4bd3d1eb1d781d06 100644
+--- a/FEXCore/Source/Interface/Core/DiskCache.cpp
++++ b/FEXCore/Source/Interface/Core/DiskCache.cpp
+@@ -1074,6 +1074,9 @@ namespace DiskCache {
+     if (!DecodedBlockInfo) {
+       return false;
+     }
++    if (RWCacheDB->Full() && !MemoryLRUMaxSize) {
++      return false;
++    }
+     // check for any reloc targets outside of our jurisdiction
+     // todo what are they exactly? caching those blocks is great when it works, so need to figure this out and make finer-grained if we can
+     if (RelocationFilter && Region) {

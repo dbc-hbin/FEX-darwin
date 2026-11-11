@@ -1,0 +1,350 @@
+Subject: [PATCH] darwin writable code smc policy
+
+Validate writable code at instruction boundaries under Darwin guest-page constraints.
+
+Source: local macOS Wine queue; see ../../README.md for ancestry and dependencies.
+License: ../LICENSE (MIT)
+
+diff --git a/FEXCore/Source/Interface/Core/Core.cpp b/FEXCore/Source/Interface/Core/Core.cpp
+index c7ec2d67..932a2546 100644
+--- a/FEXCore/Source/Interface/Core/Core.cpp
++++ b/FEXCore/Source/Interface/Core/Core.cpp
+@@ -529,8 +529,6 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
+ 
+   bool HasCustomIR {};
+ 
+-  bool WantsDiskCachePatching = DiskCache.IsReadingDiskCache() || DiskCache.IsWritingDiskCache();
+-
+   if (HasCustomIRHandlers.load(std::memory_order_relaxed)) {
+     std::shared_lock lk(CustomIRMutex);
+     auto Handler = CustomIRHandlers.find(GuestRIP);
+@@ -636,13 +634,8 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
+         }
+ 
+         if (Config.SMCChecks == FEXCore::Config::CONFIG_SMC_FULL || Block.ForceFullSMCDetection) {
+-          auto ExistingCodePtr = reinterpret_cast<uint8_t*>(Block.Entry + BlockInstructionsLength);
+           auto InstAddressReg = Thread->OpDispatcher->_EntrypointOffset(GPRSize, InstAddress - GuestRIP);
+-
+-          auto Value = FEXCore::Utils::crc32(ExistingCodePtr, DecodedInfo->InstSize);
+-          auto CRC = WantsDiskCachePatching ?
+-                       Thread->OpDispatcher->_PatchableGuestCRC(IR::OpSize::i64Bit, Value, (int64_t)ExistingCodePtr, DecodedInfo->InstSize) :
+-                       Thread->OpDispatcher->Constant(Value);
++          auto CRC = Thread->OpDispatcher->Constant(DecodedInfo->CapturedCRC);
+           auto CodeChanged = Thread->OpDispatcher->_ValidateCode(CRC, InstAddressReg, DecodedInfo->InstSize);
+ 
+           auto InvalidateCodeCond = Thread->OpDispatcher->CondJump(CodeChanged);
+diff --git a/FEXCore/Source/Interface/Core/DiskCache.cpp b/FEXCore/Source/Interface/Core/DiskCache.cpp
+index be1584ea..b57cb3e8 100644
+--- a/FEXCore/Source/Interface/Core/DiskCache.cpp
++++ b/FEXCore/Source/Interface/Core/DiskCache.cpp
+@@ -16,6 +16,7 @@
+ #include <FEXCore/Utils/LogManager.h>
+ #include <FEXCore/Utils/Profiler.h>
+ #include <FEXCore/Utils/TypeDefines.h>
++#include "Utils/crc32.h"
+ #include <FEXHeaderUtils/Filesystem.h>
+ 
+ #include <cstdint>
+@@ -1113,6 +1114,9 @@ namespace DiskCache {
+     // we'll copy everything into here and pass it to the Writer, then return to caller quickly
+     auto BlobRef = fextl::make_shared<fextl::vector<uint8_t>>(TotalSize);
+     uint8_t* BlobData = BlobRef->data();
++    // Hash, validate and publish the same owned bytes, even if the guest writes during serialization.
++    memcpy(BlobData + GuestCodeOffset, GuestCode.data(), GuestCode.size());
++    const std::span<const uint8_t> GuestCodeSnapshot {BlobData + GuestCodeOffset, GuestCode.size()};
+ 
+     BlobFixedHeader Header {
+       .GuestSize = (uint32_t)GuestCode.size(),
+@@ -1206,6 +1210,16 @@ namespace DiskCache {
+       if (SubBlock.BlockStatus != Frontend::Decoder::DecodedBlockStatus::SUCCESS) {
+         return false;
+       }
++      if (CTX->Config.SMCChecks == FEXCore::Config::CONFIG_SMC_FULL || SubBlock.ForceFullSMCDetection) {
++        for (size_t i = 0; i < SubBlock.NumInstructions; ++i) {
++          const auto& Inst = SubBlock.DecodedInstructions[i];
++          const auto Offset = Inst.PC - GuestRIP;
++          if (Offset > GuestCodeSnapshot.size() || Inst.InstSize > GuestCodeSnapshot.size() - Offset ||
++              FEXCore::Utils::crc32(GuestCodeSnapshot.data() + Offset, Inst.InstSize) != Inst.CapturedCRC) {
++            return false;
++          }
++        }
++      }
+       if (!CurStartExtent) {
+         CurStartExtent = SubBlock.Entry;
+         CurEndExtent = SubBlock.Entry + SubBlock.Size;
+@@ -1255,7 +1269,7 @@ namespace DiskCache {
+       XXH3_state_t HashState;
+       XXH3_128bits_reset(&HashState);
+       for (uint32_t i = 0; i < ExactGuestCodeExtents.size(); i += 2) {
+-        XXH3_128bits_update(&HashState, GuestCode.data() + ExactGuestCodeExtents[i], ExactGuestCodeExtents[i + 1]);
++        XXH3_128bits_update(&HashState, GuestCodeSnapshot.data() + ExactGuestCodeExtents[i], ExactGuestCodeExtents[i + 1]);
+       }
+       Header.GuestHash = XXH3_128bits_digest(&HashState);
+     }
+@@ -1284,7 +1298,6 @@ namespace DiskCache {
+       }
+     }
+ 
+-    memcpy(BlobData + GuestCodeOffset, GuestCode.data(), GuestCode.size());
+     MesaFOZ::foz_payload_key Key = {};
+     {
+       XXH3_state_t HashState;
+diff --git a/FEXCore/Source/Interface/Core/Frontend.cpp b/FEXCore/Source/Interface/Core/Frontend.cpp
+index 94e4ac52..d6d0e319 100644
+--- a/FEXCore/Source/Interface/Core/Frontend.cpp
++++ b/FEXCore/Source/Interface/Core/Frontend.cpp
+@@ -19,10 +19,12 @@ $end_info$
+ #include <FEXCore/Core/X86Enums.h>
+ #include <FEXCore/HLE/SyscallHandler.h>
+ #include <FEXCore/Utils/Allocator.h>
++#include <FEXCore/Utils/JitWriteScope.h>
+ #include <FEXCore/Utils/LogManager.h>
+ #include <FEXCore/Utils/Profiler.h>
+ #include <FEXCore/Utils/Telemetry.h>
+ #include <FEXCore/Utils/TypeDefines.h>
++#include "Utils/crc32.h"
+ #include <FEXCore/Debug/InternalThreadState.h>
+ #include <FEXCore/fextl/set.h>
+ 
+@@ -119,6 +121,7 @@ int32_t Decoder::CheckRangeExecutable(uint64_t Address, uint64_t Size) {
+       // Return the number of bytes that couldn't be decoded.
+       return -(Size - RemainingSize);
+     }
++    InstructionHasWritableBytes |= ExecutableRangeWritable;
+ 
+     uint64_t RangeRemainingSize = ExecutableRangeEnd - Address;
+     if (RemainingSize > RangeRemainingSize) {
+@@ -127,6 +130,7 @@ int32_t Decoder::CheckRangeExecutable(uint64_t Address, uint64_t Size) {
+     }
+   }
+ 
++  InstructionHasWritableBytes |= ExecutableRangeWritable;
+   // Say all bytes are readable.
+   return Size;
+ }
+@@ -161,8 +165,10 @@ std::pair<uint64_t, bool> Decoder::ReadData(uint8_t Size) {
+   LastFieldReadOffset = (uint8_t)InstructionSize;
+   LastFieldReadSize = Size;
+   auto ReadableSize = CheckRangeExecutable(Address, Size);
++  const auto ConsumedSize = std::abs(ReadableSize);
++  std::memcpy(Instruction.data() + InstructionSize, &InstStream.AdjustedInstStream[InstructionSize], ConsumedSize);
+   if (ReadableSize == Size) {
+-    std::memcpy(&Res, &InstStream.AdjustedInstStream[InstructionSize], Size);
++    std::memcpy(&Res, Instruction.data() + InstructionSize, Size);
+   } else {
+     HitNonExecutableRange = true;
+     // See PeekByte, this specific case may cause some executable memory to read as 0 but it doesn't matter as the entire instruction will be rolled back anyway.
+@@ -171,13 +177,7 @@ std::pair<uint64_t, bool> Decoder::ReadData(uint8_t Size) {
+ 
+   // Skip the number of decoded bytes regardless to get instruction size.
+   // Even partially decoded instruction.
+-#if defined(ASSERTIONS_ENABLED) && ASSERTIONS_ENABLED
+-  for (size_t i = 0; i < std::abs(ReadableSize); ++i) {
+-    ReadByte();
+-  }
+-#else
+-  SkipBytes(std::abs(ReadableSize));
+-#endif
++  SkipBytes(ConsumedSize);
+ 
+   if (Relocations) {
+     uint32_t SectionOffset = static_cast<uint32_t>(Address - SectionMinAddress);
+@@ -676,6 +676,12 @@ Decoder::DecodedBlockStatus Decoder::NormalOp(const FEXCore::X86Tables::X86InstI
+   } else {
+     // All real x86 instructions have byte sizes that are 8-bytes or less.
+     // Thunk instruction has an additional 32-byte SHA256 payload that needs to be accounted for.
++    if (Bytes) {
++      // The synthetic payload is data, not another executable instruction.
++      std::memcpy(Instruction.data() + InstructionSize, &InstStream.AdjustedInstStream[InstructionSize], Bytes);
++      // ThunkOp's symbol convention is PC + 2, including prefixed encodings.
++      std::memcpy(DecodeInst->ThunkHash.data, Instruction.data() + 2, sizeof(DecodeInst->ThunkHash));
++    }
+     InstructionSize += Bytes;
+     Bytes = 0;
+   }
+@@ -1111,6 +1117,7 @@ Decoder::DecodedBlockStatus Decoder::DecodeInstruction(uint64_t PC) {
+   HitBadRelocation = false;
+   HitBreakpoint = ~0U;
+   auto ErrorDuringDecoding = DecodeInstructionImpl(PC);
++  DecodeInst->CapturedCRC = FEXCore::Utils::crc32(Instruction.data(), DecodeInst->InstSize);
+ 
+   if (ErrorDuringDecoding != DecodedBlockStatus::SUCCESS || HitNonExecutableRange || HitBadRelocation) [[unlikely]] {
+     // Put an invalid instruction in the stream so the core can raise SIGILL if hit
+@@ -1129,7 +1136,8 @@ Decoder::DecodedBlockStatus Decoder::DecodeInstruction(uint64_t PC) {
+     }
+ 
+     // Keep InstSize around for PARTIAL_DECODE_INST so we can get the offset where it partial decoded.
+     DecodeInst->InstSize = 0;
++    DecodeInst->CapturedCRC = 0;
+ 
+     if (HitBadRelocation) {
+       return DecodedBlockStatus::BAD_RELOCATION;
+@@ -1356,6 +1363,7 @@ void Decoder::AddBranchTarget(uint64_t Target) {
+           .NumInstructions = BlockIt->NumInstructions - SplitIdx,
+           .DecodedInstructions = BlockIt->DecodedInstructions + SplitIdx,
+           .BlockStatus = BlockIt->BlockStatus,
++          .ForceFullSMCDetection = BlockIt->ForceFullSMCDetection,
+         };
+ 
+         if (BlockIt->DataMasks.size()) {
+@@ -1565,6 +1573,10 @@ void Decoder::PruneInlinedBranchDataMasks() {
+ }
+ 
+ void Decoder::DecodeLoop(const uint8_t* _InstStream, uint64_t GuestSizePause) {
++  // ponytail: validate writable Darwin code until Wine can trap a physical 16-KiB
++  // page without changing its four logical guest-page permissions.
++  const bool ValidateWritableCode =
++    FEXCore::Allocator::VirtualJitWriteProtect && CTX->Config.SMCChecks == FEXCore::Config::CONFIG_SMC_MTRACK;
+   // counter-intuitively, the masks are also needed for lookup on anon prefix decodes, not just stores
+   bool WantsDataMasks = CTX->DiskCache.IsReadingDiskCache() || CTX->DiskCache.IsWritingDiskCache();
+ 
+@@ -1618,6 +1630,7 @@ void Decoder::DecodeLoop(const uint8_t* _InstStream, uint64_t GuestSizePause) {
+ 
+     while (1) {
+       InstructionSize = 0;
++      InstructionHasWritableBytes = false;
+ 
+       // MAX_INST_SIZE assumes worst case
+       auto OpAddress = BlockIt->Entry + PCOffset;
+@@ -1644,6 +1657,9 @@ void Decoder::DecodeLoop(const uint8_t* _InstStream, uint64_t GuestSizePause) {
+ 
+       LastFieldReadSize = 0;
+       BlockIt->BlockStatus = DecodeInstruction(OpAddress);
++      BlockIt->ForceFullSMCDetection |=
++        ValidateWritableCode && (InstructionHasWritableBytes ||
++                                 (DecodeInst->TableInfo && DecodeInst->TableInfo->MoreBytes > sizeof(uint64_t)));
+       if (HitBadRelocation) {
+         BlockInfo.TotalInstructionCount = 0;
+         BlockInfo.Blocks = {*BlockIt};
+@@ -1771,6 +1787,28 @@ void Decoder::DecodeLoop(const uint8_t* _InstStream, uint64_t GuestSizePause) {
+ 
+   for (auto& Block : BlockInfo.Blocks) {
+     Block.IsEntryPoint = BlockInfo.EntryPoints.contains(Block.Entry);
++    if (CTX->Config.SMCChecks == FEXCore::Config::CONFIG_SMC_FULL || Block.ForceFullSMCDetection) {
++      // A validated instruction must retain the semantics whose bytes were captured.
++      // Relocating its operands from live guest memory could bless a racing write.
++      Block.DataMasks.clear();
++      for (size_t i = 0; i < Block.NumInstructions; ++i) {
++        auto& Inst = Block.DecodedInstructions[i];
++        for (auto* Operand : {&Inst.Dest, &Inst.Src[0], &Inst.Src[1], &Inst.Src[2]}) {
++          if (Operand->IsLiteralPatchable()) {
++            const auto Value = Operand->Data.LiteralPatchable.Value;
++            const auto Size = Operand->Data.LiteralPatchable.Size;
++            Operand->Type = DecodedOperand::OpType::Literal;
++            Operand->Data.Literal = {.Value = Value, .Size = Size};
++          } else if (Operand->IsGPRIndirect()) {
++            Operand->Data.GPRIndirect.PatchableDisp = false;
++          } else if (Operand->IsRIPRelative()) {
++            Operand->Data.RIPLiteral.PatchableDisp = false;
++          } else if (Operand->IsSIB()) {
++            Operand->Data.SIB.PatchableDisp = false;
++          }
++        }
++      }
++    }
+   }
+ 
+   // now that multiblock has settled down, remove any branch masks we put down that didn't end the block
+diff --git a/FEXCore/Source/Interface/Core/Frontend.h b/FEXCore/Source/Interface/Core/Frontend.h
+index ade14bc4..650e0e1a 100644
+--- a/FEXCore/Source/Interface/Core/Frontend.h
++++ b/FEXCore/Source/Interface/Core/Frontend.h
+@@ -158,6 +158,7 @@ private:
+   uint64_t ExecutableRangeBase {};
+   uint64_t ExecutableRangeEnd {};
+   bool ExecutableRangeWritable {};
++  bool InstructionHasWritableBytes {};
+   bool HitNonExecutableRange {};
+   bool HitBadRelocation {};
+   uint32_t HitBreakpoint {~0U};
+@@ -189,8 +190,8 @@ private:
+ 
+   static constexpr size_t MAX_INST_SIZE = 15;
+   uint8_t InstructionSize {};
+-  // Contains the full decoded instruction, unless it is a `Thunk` instruction.
+-  std::array<uint8_t, MAX_INST_SIZE> Instruction;
++  // Synthetic thunks append a symbol hash to the ordinary instruction bytes.
++  std::array<uint8_t, MAX_INST_SIZE + sizeof(IR::SHA256Sum)> Instruction;
+   uint8_t LastEscapePrefix {};
+   FEXCore::X86Tables::DecodedInst* DecodeInst;
+ 
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp b/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
+index df1315c5..aeb5634f 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
+@@ -63,14 +63,13 @@ void OpDispatchBuilder::SyscallOp(OpcodeArgs, bool IsSyscallInst) {
+ 
+ void OpDispatchBuilder::ThunkOp(OpcodeArgs) {
+   const auto GPRSize = GetGPROpSize();
+-  uint8_t* sha256 = (uint8_t*)(Op->PC + 2);
+ 
+   if (Is64BitMode) {
+     // x86-64 ABI puts the function argument in RDI
+-    Thunk(LoadGPRRegister(X86State::REG_RDI), *reinterpret_cast<SHA256Sum*>(sha256));
++    Thunk(LoadGPRRegister(X86State::REG_RDI), Op->ThunkHash);
+   } else {
+     // x86 fastcall ABI puts the function argument in ECX
+-    Thunk(LoadGPRRegister(X86State::REG_RCX), *reinterpret_cast<SHA256Sum*>(sha256));
++    Thunk(LoadGPRRegister(X86State::REG_RCX), Op->ThunkHash);
+   }
+ 
+   auto NewRIP = Pop(GPRSize);
+diff --git a/FEXCore/Source/Interface/Core/X86Tables/X86Tables.h b/FEXCore/Source/Interface/Core/X86Tables/X86Tables.h
+index 8a06c846..886ba633 100644
+--- a/FEXCore/Source/Interface/Core/X86Tables/X86Tables.h
++++ b/FEXCore/Source/Interface/Core/X86Tables/X86Tables.h
+@@ -7,6 +7,7 @@ $end_info$
+ 
+ #pragma once
+ 
++#include <FEXCore/IR/IR.h>
+ #include <FEXCore/Utils/EnumUtils.h>
+ #include <FEXCore/Utils/LogManager.h>
+ 
+@@ -234,6 +235,8 @@ struct DecodedInst {
+   const X86InstInfo* TableInfo;
+ 
+   uint32_t Flags;
++  uint32_t CapturedCRC;
++  FEXCore::IR::SHA256Sum ThunkHash;
+   uint16_t OP;
+   uint8_t OPRaw;
+ 
+diff --git a/Source/Windows/Common/InvalidationTracker.cpp b/Source/Windows/Common/InvalidationTracker.cpp
+index 272e96f8..2c717149 100644
+--- a/Source/Windows/Common/InvalidationTracker.cpp
++++ b/Source/Windows/Common/InvalidationTracker.cpp
+@@ -17,6 +17,9 @@ InvalidationTracker::InvalidationTracker(FEXCore::Context::Context& CTX, const s
+   , Threads {Threads} {
+   FEX_CONFIG_OPT(SMCChecks, SMCCHECKS);
+   SMCDetectionDisabled = (SMCChecks == FEXCore::Config::CONFIG_SMC_NONE);
++  // The frontend CRC-validates every instruction with bytes in an RWX interval in this mode (see Decoder::DecodeLoop),
++  // so write-trapping those intervals only adds fault round trips.
++  WritableCodeValidated = FEXCore::Allocator::VirtualJitWriteProtect && SMCChecks == FEXCore::Config::CONFIG_SMC_MTRACK;
+ 
+   MEMORY_BASIC_INFORMATION Info;
+   uint64_t Address = 0;
+@@ -347,6 +350,11 @@ bool InvalidationTracker::ProtectRWXIntervalsInternal(uint64_t Address, uint64_t
+     return false;
+   }
+ 
++  // Mono backpatcher detection relies on the first trapped write, so keep trapping until it has run.
++  if (!ForWriteLocked && WritableCodeValidated && !MonoBackpatcherDetectionPending) {
++    return false;
++  }
++
+   bool HitRWXInterval = false;
+   do {
+     const auto Query = RWXIntervals.Query(Address);
+diff --git a/Source/Windows/Common/InvalidationTracker.h b/Source/Windows/Common/InvalidationTracker.h
+index d2a80bca..99c2ef64 100644
+--- a/Source/Windows/Common/InvalidationTracker.h
++++ b/Source/Windows/Common/InvalidationTracker.h
+@@ -64,6 +64,7 @@ private:
+   FEXCore::Context::Context& CTX;
+   const std::unordered_map<DWORD, FEXCore::Core::InternalThreadState*>& Threads;
+   bool SMCDetectionDisabled {false};                    // Protected by IntervalsLock
++  bool WritableCodeValidated {false};
+   bool DEPDisabled {false};                             // Protected by IntervalsLock
+   FEXCore::IntervalList<uint64_t> DEPPromotedIntervals; // Protected by IntervalsLock
+ 

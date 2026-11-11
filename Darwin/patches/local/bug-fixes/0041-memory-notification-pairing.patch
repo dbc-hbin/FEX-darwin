@@ -1,0 +1,571 @@
+Subject: [PATCH] memory notification pairing
+
+Preserve successful paired updates and unpaired cross-process resync with selective locking.
+
+Source: local macOS Wine queue; see ../../README.md for ancestry and dependencies.
+License: ../LICENSE (MIT)
+
+diff --git a/Source/Windows/ARM64EC/Module.cpp b/Source/Windows/ARM64EC/Module.cpp
+index 17d9c443d3633f48411c346c319f1efbda63ba6e..d112e7b6d2bf2042b06cf2edc9ff3c85efc3c83f 100644
+--- a/Source/Windows/ARM64EC/Module.cpp
++++ b/Source/Windows/ARM64EC/Module.cpp
+@@ -140,6 +140,8 @@ struct ThreadCPUArea {
+ };
+ 
+ struct FrontendThreadData {
++  bool InCrossProcessWork {};
++  FEX::Windows::InvalidationTracker::PendingMemoryChange PendingMemoryChange {};
+   bool InLockedRWXRead {};
+ };
+ 
+@@ -172,6 +174,20 @@ FrontendThreadData* GetFrontendThreadData(FEXCore::Core::InternalThreadState* Th
+   return static_cast<FrontendThreadData*>(Thread->FrontendPtr);
+ }
+ 
++// Returns the Before/After state of the current thread's memory notification, or null for cross-process work.
++FEX::Windows::InvalidationTracker::PendingMemoryChange* GetPendingMemoryChange() {
++  auto* Data = GetFrontendThreadData(GetCPUArea().ThreadState());
++  return Data->InCrossProcessWork ? nullptr : &Data->PendingMemoryChange;
++}
++
++void ProcessCrossProcessWork() {
++  auto* Data = GetFrontendThreadData(GetCPUArea().ThreadState());
++  Data->InCrossProcessWork = true;
++  ProcessPendingCrossProcessEmulatorWork();
++  Data->InCrossProcessWork = false;
++}
++
++
+ bool IsEmulatorStackAddress(const ThreadCPUArea CPUArea, uint64_t Address) {
+   return Address <= CPUArea.EmulatorStackBase() && Address >= CPUArea.EmulatorStackLimit();
+ }
+@@ -727,7 +743,7 @@ public:
+   ECSyscallHandler() = default;
+ 
+   void HandleSyscall(FEXCore::Core::CpuStateFrame* Frame) override {
+-    ProcessPendingCrossProcessEmulatorWork();
++    ProcessCrossProcessWork();
+ 
+     // Manually raise an exeption with the current JIT state packed into a native context, ntdll handles this and
+     // reenters the JIT (see dlls/ntdll/signal_arm64ec.c in wine).
+@@ -773,16 +789,15 @@ public:
+   }
+ 
+   void PreCompile() override {
+-    ProcessPendingCrossProcessEmulatorWork();
++    ProcessCrossProcessWork();
+   }
+ };
+ } // namespace Exception
+ 
+ extern "C" void SyncThreadContext(CONTEXT* Context) {
+-  ProcessPendingCrossProcessEmulatorWork();
++  ProcessCrossProcessWork();
+   auto* Thread = GetCPUArea().ThreadState();
+-  // All other EFlags bits are lost when converting to/from an ARM64EC context, so merge them in from the current JIT state.
+-  // This is advisable over dropping their values as thread suspend/resume uses this function, and that can happen at any point in guest code.
++  // The pinned Wine transports NZCV and TF; preserve PF, AF, DF and system flags from FEX state.
+   static constexpr uint32_t ECValidEFlagsMask {(1U << FEXCore::X86State::RFLAG_OF_RAW_LOC) | (1U << FEXCore::X86State::RFLAG_CF_RAW_LOC) |
+                                                (1U << FEXCore::X86State::RFLAG_ZF_RAW_LOC) | (1U << FEXCore::X86State::RFLAG_SF_RAW_LOC) |
+                                                (1U << FEXCore::X86State::RFLAG_TF_RAW_LOC)};
+@@ -1136,14 +1151,18 @@ void NotifyMemoryAlloc(void* Address, SIZE_T Size, ULONG Type, ULONG Prot, BOOL
+     return;
+   }
+ 
++  // MEM_RESET(_UNDO) ignores the passed permissions
++  const bool Reset = Type & (MEM_RESET | MEM_RESET_UNDO);
++  const ULONG EffectiveProt = Reset ? PAGE_NOACCESS : Prot;
++  const auto Base = reinterpret_cast<uint64_t>(Address);
+   if (!After) {
+-    ThreadCreationMutex.lock();
++    InvalidationTracker->BeginMemoryChange(ThreadCreationMutex, GetPendingMemoryChange(), Base, Size, EffectiveProt);
+   } else {
+-    // MEM_RESET(_UNDO) ignores the passed permissions
+-    if (!Status && !(Type & (MEM_RESET | MEM_RESET_UNDO))) {
+-      InvalidationTracker->HandleMemoryProtectionNotification(reinterpret_cast<uint64_t>(Address), static_cast<uint64_t>(Size), Prot);
+-    }
+-    ThreadCreationMutex.unlock();
++    InvalidationTracker->EndMemoryChange(ThreadCreationMutex, GetPendingMemoryChange(), Base, Size, EffectiveProt, !Status, [&] {
++      if (!Reset) {
++        InvalidationTracker->HandleMemoryProtectionNotification(Base, Size, Prot);
++      }
++    });
+   }
+ }
+ 
+@@ -1152,13 +1171,12 @@ void NotifyMemoryFree(void* Address, SIZE_T Size, ULONG FreeType, BOOL After, NT
+     return;
+   }
+ 
++  const auto Base = reinterpret_cast<uint64_t>(Address);
+   if (!After) {
+-    ThreadCreationMutex.lock();
++    InvalidationTracker->BeginMemoryChange(ThreadCreationMutex, GetPendingMemoryChange(), Base, Size, PAGE_NOACCESS);
+   } else {
+-    if (!Status) {
+-      InvalidationTracker->InvalidateAlignedInterval(reinterpret_cast<uint64_t>(Address), static_cast<uint64_t>(Size), true);
+-    }
+-    ThreadCreationMutex.unlock();
++    InvalidationTracker->EndMemoryChange(ThreadCreationMutex, GetPendingMemoryChange(), Base, Size, PAGE_NOACCESS, !Status,
++                                         [&] { InvalidationTracker->InvalidateAlignedInterval(Base, Size, true); });
+   }
+ }
+ 
+@@ -1167,13 +1185,12 @@ void NotifyMemoryProtect(void* Address, SIZE_T Size, ULONG NewProt, BOOL After,
+     return;
+   }
+ 
++  const auto Base = reinterpret_cast<uint64_t>(Address);
+   if (!After) {
+-    ThreadCreationMutex.lock();
++    InvalidationTracker->BeginMemoryChange(ThreadCreationMutex, GetPendingMemoryChange(), Base, Size, NewProt);
+   } else {
+-    if (!Status) {
+-      InvalidationTracker->HandleMemoryProtectionNotification(reinterpret_cast<uint64_t>(Address), static_cast<uint64_t>(Size), NewProt);
+-    }
+-    ThreadCreationMutex.unlock();
++    InvalidationTracker->EndMemoryChange(ThreadCreationMutex, GetPendingMemoryChange(), Base, Size, NewProt, !Status,
++                                         [&] { InvalidationTracker->HandleMemoryProtectionNotification(Base, Size, NewProt); });
+   }
+ }
+ 
+@@ -1197,13 +1214,9 @@ void NotifyUnmapViewOfSection(void* Address, BOOL After, NTSTATUS Status) {
+   }
+ 
+   if (!After) {
+-    ThreadCreationMutex.lock();
+-    auto [Start, Size] = InvalidationTracker->InvalidateContainingSection(reinterpret_cast<uint64_t>(Address), true);
+-    if (Size) {
+-      HandleImageUnmap(Start, Size);
+-    }
++    InvalidationTracker->BeginUnmap(ThreadCreationMutex, GetPendingMemoryChange(), reinterpret_cast<uint64_t>(Address), HandleImageUnmap);
+   } else {
+-    ThreadCreationMutex.unlock();
++    InvalidationTracker->EndUnmap(ThreadCreationMutex, GetPendingMemoryChange(), !Status);
+   }
+ }
+ 
+diff --git a/Source/Windows/Common/InvalidationTracker.cpp b/Source/Windows/Common/InvalidationTracker.cpp
+index 2c717149b97634803dfce09d3bb272688771490b..c4218228bb123a44ae2eb1b9a445fb39d8d3829f 100644
+--- a/Source/Windows/Common/InvalidationTracker.cpp
++++ b/Source/Windows/Common/InvalidationTracker.cpp
+@@ -172,14 +172,15 @@ void InvalidationTracker::HandleImageMap(std::string_view Name, uint64_t Address
+   }
+ }
+ 
+-InvalidationTracker::InvalidateContainingSectionResult InvalidationTracker::InvalidateContainingSection(uint64_t Address, bool Free) {
++InvalidationTracker::ContainingSection InvalidationTracker::QueryContainingSection(uint64_t Address) {
+   MEMORY_BASIC_INFORMATION Info;
+   if (NtQueryVirtualMemory(NtCurrentProcess(), reinterpret_cast<void*>(Address), MemoryBasicInformation, &Info, sizeof(Info), nullptr)) {
+-    return {Address, 0};
++    return {Address, 0, false};
+   }
+ 
+   const auto SectionBase = reinterpret_cast<uint64_t>(Info.AllocationBase);
+   auto SectionSize = reinterpret_cast<uint64_t>(Info.BaseAddress) + Info.RegionSize - SectionBase;
++  const bool Image = Info.Type == MEM_IMAGE;
+ 
+   while (!NtQueryVirtualMemory(NtCurrentProcess(), reinterpret_cast<void*>(SectionBase + SectionSize), MemoryBasicInformation, &Info,
+                                sizeof(Info), nullptr) &&
+@@ -187,15 +188,17 @@ InvalidationTracker::InvalidateContainingSectionResult InvalidationTracker::Inva
+     SectionSize += Info.RegionSize;
+   }
+ 
+-  InvalidateIntervalInternal(SectionBase, SectionSize);
++  return {SectionBase, SectionSize, Image};
++}
+ 
+-  if (Free) {
+-    std::unique_lock Lock(IntervalsLock);
+-    XIntervals.Remove({SectionBase, SectionBase + SectionSize});
+-    RWXIntervals.Remove({SectionBase, SectionBase + SectionSize});
+-  }
++void InvalidationTracker::InvalidateSection(const ContainingSection& Section) {
++  const auto SectionBase = Section.SectionStart;
++  const auto SectionSize = Section.SectionSize;
++  InvalidateIntervalInternal(SectionBase, SectionSize);
+ 
+-  return {SectionBase, SectionSize};
++  std::unique_lock Lock(IntervalsLock);
++  XIntervals.Remove({SectionBase, SectionBase + SectionSize});
++  RWXIntervals.Remove({SectionBase, SectionBase + SectionSize});
+ }
+ 
+ void InvalidationTracker::InvalidateAlignedInterval(uint64_t Address, uint64_t Size, bool Free) {
+@@ -248,6 +251,73 @@ bool InvalidationTracker::HandleRWXAccessViolation(FEXCore::Core::InternalThread
+   return false;
+ }
+ 
++bool InvalidationTracker::MayAffectExecutable(uint64_t Address, uint64_t Size, ULONG Prot) {
++  std::shared_lock Lock(IntervalsLock);
++  if (ProtHasExec(Prot) || (DEPDisabled && ProtIsReadable(Prot))) {
++    return true;
++  }
++  if (!Address) {
++    return false;
++  }
++
++  const auto AlignedBase = Address & FEXCore::Utils::FEX_PAGE_MASK;
++  const auto AlignedSize = std::max<uint64_t>(FEXCore::Utils::FEX_PAGE_SIZE,
++                                              (Address - AlignedBase + Size + FEXCore::Utils::FEX_PAGE_SIZE - 1) & FEXCore::Utils::FEX_PAGE_MASK);
++  return XIntervals.Intersect({AlignedBase, AlignedBase + AlignedSize});
++}
++
++void InvalidationTracker::ResyncRange(uint64_t Address, uint64_t Size) {
++  const auto AlignedBase = Address & FEXCore::Utils::FEX_PAGE_MASK;
++  const auto AlignedEnd = AlignedBase + std::max<uint64_t>(FEXCore::Utils::FEX_PAGE_SIZE, (Address - AlignedBase + Size + FEXCore::Utils::FEX_PAGE_SIZE - 1) &
++                                                                                            FEXCore::Utils::FEX_PAGE_MASK);
++
++  {
++    std::unique_lock Lock(IntervalsLock);
++    uint64_t Current = AlignedBase;
++    while (Current < AlignedEnd) {
++      MEMORY_BASIC_INFORMATION Info;
++      uint64_t RegionEnd = AlignedEnd;
++      ULONG Prot = PAGE_NOACCESS;
++      if (!NtQueryVirtualMemory(NtCurrentProcess(), reinterpret_cast<void*>(Current), MemoryBasicInformation, &Info, sizeof(Info), nullptr)) {
++        RegionEnd = std::min(AlignedEnd, reinterpret_cast<uint64_t>(Info.BaseAddress) + Info.RegionSize);
++        if (Info.State == MEM_COMMIT) {
++          Prot = Info.Protect;
++        }
++      }
++      // A failed query or an empty region ends the walk, leaving the rest marked non-executable below.
++      if (RegionEnd <= Current) {
++        RegionEnd = AlignedEnd;
++        Prot = PAGE_NOACCESS;
++      }
++
++      const FEXCore::IntervalList<uint64_t>::Interval Region {Current, RegionEnd};
++      const bool HasExec = ProtHasExec(Prot);
++      const bool EffectiveExec = HasExec || (DEPDisabled && ProtIsReadable(Prot));
++
++      // Mirrors HandleMemoryProtectionNotification. Executable non-writable pages keep their RWX tracking, which
++      // covers write-trapped RWX pages that read back as read-only.
++      if (EffectiveExec) {
++        XIntervals.Insert(Region);
++        if (ProtIsWritable(Prot)) {
++          RWXIntervals.Insert(Region);
++        }
++        if (DEPDisabled && !HasExec) {
++          DEPPromotedIntervals.Insert(Region);
++        }
++      } else {
++        XIntervals.Remove(Region);
++        RWXIntervals.Remove(Region);
++        DEPPromotedIntervals.Remove(Region);
++      }
++
++      Current = RegionEnd;
++    }
++  }
++
++  // IntervalsLock cannot be held during invalidation
++  InvalidateIntervalInternal(AlignedBase, AlignedEnd - AlignedBase);
++}
++
+ bool InvalidationTracker::BeginUntrackedWriteLocked(uint64_t Address, uint64_t Size) {
+   return ProtectRWXIntervalsInternal(Address, Size, true);
+ }
+@@ -335,7 +405,6 @@ void InvalidationTracker::InvalidateIntervalInternal(uint64_t Address, uint64_t
+ }
+ 
+ void InvalidationTracker::InvalidateIntervalInternalLocked(uint64_t Address, uint64_t Size) {
+-  // NOTE: This assumes CodeInvalidationMutex is locked by the caller
+   CTX.InvalidateCodeBuffersCodeRange(Address, Size);
+   for (auto Thread : Threads) {
+     CTX.InvalidateThreadCachedCodeRange(Thread.second, Address, Size);
+diff --git a/Source/Windows/Common/InvalidationTracker.h b/Source/Windows/Common/InvalidationTracker.h
+index 99c2ef644c662e9d8bef30e87740abb246ef47b0..1099c3339d18e311501524f002d3c67a4112402b 100644
+--- a/Source/Windows/Common/InvalidationTracker.h
++++ b/Source/Windows/Common/InvalidationTracker.h
+@@ -3,9 +3,11 @@
+ 
+ #include <FEXCore/Utils/IntervalList.h>
+ #include <FEXCore/HLE/SyscallHandler.h>
++#include <atomic>
+ #include <mutex>
+ #include <shared_mutex>
+ #include <unordered_map>
++#include <utility>
+ #include <string_view>
+ 
+ namespace FEXCore::Core {
+@@ -26,11 +28,14 @@ public:
+   void HandleMemoryProtectionNotification(uint64_t Address, uint64_t Size, ULONG Prot);
+   void HandleProcessExecuteFlagsChange(ULONG Flags);
+   void HandleImageMap(std::string_view Name, uint64_t Address);
+-  struct InvalidateContainingSectionResult {
++  struct ContainingSection {
+     uint64_t SectionStart;
+     uint64_t SectionSize;
++    bool Image;
+   };
+-  InvalidateContainingSectionResult InvalidateContainingSection(uint64_t Address, bool Free);
++  // Returns the allocation containing Address, with a zero size if Address is not mapped.
++  ContainingSection QueryContainingSection(uint64_t Address);
++  void InvalidateSection(const ContainingSection& Section);
+   void InvalidateAlignedInterval(uint64_t Address, uint64_t Size, bool Free);
+   void ReprotectRWXIntervals(uint64_t Address, uint64_t Size);
+   bool HandleRWXAccessViolation(FEXCore::Core::InternalThreadState* Thread, uint64_t HostPC, uint64_t FaultAddress);
+@@ -41,7 +46,118 @@ public:
+ 
+   FEXCore::HLE::ExecutableRangeInfo QueryExecutableRange(uint64_t Address);
+ 
++  // Per-thread state carried from the Before to the After callback of one memory notification.
++  struct PendingMemoryChange {
++    bool Locked {};
++    ContainingSection Unmapped {}; // Section of an unlocked unmap
++  };
++
++  // Brackets an alloc/protect/free notification. `Mutex` is the frontend lock that serializes executable tracking.
++  // It is held across the change only when the change can alter executable tracking: the new protection is effectively
++  // executable, or the range intersects an executable interval. Other changes take no lock unless EndMemoryChange finds
++  // that a locked change may have raced with them, or that their range became executable, and then resync the range.
++  // A null `Pending` (cross-process work, or a thread without frontend state) defers all handling to EndMemoryChange.
++  // Prot is PAGE_NOACCESS for frees.
++  template<typename MutexType>
++  void BeginMemoryChange(MutexType& Mutex, PendingMemoryChange* Pending, uint64_t Address, uint64_t Size, ULONG Prot) {
++    if (Pending && MayAffectExecutable(Address, Size, Prot)) {
++      BeginLockedChange(Mutex, Pending);
++    }
++  }
++
++  // Address and Size are the final range reported by the After callback. Apply performs the tracking update of a
++  // successful locked change.
++  template<typename MutexType, typename ApplyType>
++  void EndMemoryChange(MutexType& Mutex, PendingMemoryChange* Pending, uint64_t Address, uint64_t Size, ULONG Prot, bool Succeeded,
++                       ApplyType&& Apply) {
++    if (Pending && Pending->Locked) {
++      if (Succeeded) {
++        Apply();
++      }
++      EndLockedChange(Mutex, Pending);
++    } else if (Succeeded) {
++      ResyncUnlockedChange(Mutex, Address, Size, Prot);
++    }
++  }
++
++  // Brackets an unmap notification like Begin/EndMemoryChange. Images and sections intersecting executable intervals
++  // are invalidated and passed to `ImageUnmap` in the Before callback, with `Mutex` held until the After callback.
++  template<typename MutexType, typename ImageUnmapType>
++  void BeginUnmap(MutexType& Mutex, PendingMemoryChange* Pending, uint64_t Address, ImageUnmapType&& ImageUnmap) {
++    const auto Section = QueryContainingSection(Address);
++    if (Pending && !Section.Image && !(Section.SectionSize && MayAffectExecutable(Section.SectionStart, Section.SectionSize, PAGE_NOACCESS))) {
++      Pending->Unmapped = Section;
++      return;
++    }
++
++    if (Pending) {
++      BeginLockedChange(Mutex, Pending);
++    } else {
++      Mutex.lock();
++    }
++    if (Section.SectionSize) {
++      InvalidateSection(Section);
++      ImageUnmap(Section.SectionStart, Section.SectionSize);
++    }
++    if (!Pending) {
++      Mutex.unlock();
++    }
++  }
++
++  template<typename MutexType>
++  void EndUnmap(MutexType& Mutex, PendingMemoryChange* Pending, bool Succeeded) {
++    if (!Pending) {
++      return;
++    }
++    if (Pending->Locked) {
++      EndLockedChange(Mutex, Pending);
++      return;
++    }
++    const auto Section = std::exchange(Pending->Unmapped, {});
++    if (Succeeded && Section.SectionSize) {
++      ResyncUnlockedChange(Mutex, Section.SectionStart, Section.SectionSize, PAGE_NOACCESS);
++    }
++  }
++
+ private:
++  // Whether applying Prot to the page-aligned range can change executable tracking. A null Address (chosen by the
++  // kernel) checks only Prot, and a zero Size checks the first page.
++  bool MayAffectExecutable(uint64_t Address, uint64_t Size, ULONG Prot);
++
++  template<typename MutexType>
++  void BeginLockedChange(MutexType& Mutex, PendingMemoryChange* Pending) {
++    Mutex.lock();
++    LockedChangesInFlight.fetch_add(1);
++    Pending->Locked = true;
++  }
++
++  template<typename MutexType>
++  void EndLockedChange(MutexType& Mutex, PendingMemoryChange* Pending) {
++    Pending->Locked = false;
++    LockedChangesInFlight.fetch_sub(1);
++    Mutex.unlock();
++  }
++
++  // Called after an unlocked change completed in the kernel. A locked change whose Before callback ran before that
++  // point either is still in flight, so its After callback may record a protection the unlocked change overwrote, or
++  // has already updated the interval lists. Reading the in-flight count before the lists observes one of the two, and a
++  // locked change that starts later also reaches the kernel later, so its own update is final.
++  template<typename MutexType>
++  void ResyncUnlockedChange(MutexType& Mutex, uint64_t Address, uint64_t Size, ULONG Prot) {
++    if (!LockedChangesInFlight.load() && !MayAffectExecutable(Address, Size, Prot)) {
++      return;
++    }
++    std::scoped_lock Lock(Mutex);
++    if (MayAffectExecutable(Address, Size, Prot)) {
++      ResyncRange(Address, Size);
++    }
++  }
++
++  // Re-derives executable tracking for the range from its current protection, then invalidates the range.
++  // Executable non-writable pages keep their RWX tracking, as in HandleMemoryProtectionNotification.
++  // NOTE: Must be called with the frontend lock passed to EndMemoryChange held.
++  void ResyncRange(uint64_t Address, uint64_t Size);
++
+   void DetectMonoBackpatcherBlock(FEXCore::Core::InternalThreadState* Thread, uint64_t HostPC);
+   void DisableSMCDetection();
+   void InvalidateIntervalInternal(uint64_t Address, uint64_t Size);
+@@ -68,6 +184,9 @@ private:
+   bool DEPDisabled {false};                             // Protected by IntervalsLock
+   FEXCore::IntervalList<uint64_t> DEPPromotedIntervals; // Protected by IntervalsLock
+ 
++  // Locked memory notifications between their Before and After callbacks
++  std::atomic<uint32_t> LockedChangesInFlight {0};
++
+   bool MonoBackpatcherDetectionPending {false};
+   uint64_t MonoBase {0};
+   uint64_t MonoEnd {0};
+diff --git a/Source/Windows/WOW64/Module.cpp b/Source/Windows/WOW64/Module.cpp
+index c2c690deb431489c391076863bc2339a1168a4a9..ae9b31717d6f6905542d3fceb97ba648bb9e978c 100644
+--- a/Source/Windows/WOW64/Module.cpp
++++ b/Source/Windows/WOW64/Module.cpp
+@@ -115,6 +115,8 @@ WOW64_CONTEXT* GetWow64Context() {
+ }
+ 
+ struct FrontendThreadData {
++  bool InCrossProcessWork {};
++  FEX::Windows::InvalidationTracker::PendingMemoryChange PendingMemoryChange {};
+   bool InLockedRWXRead {};
+   CHPE_V2_CPU_AREA_INFO CpuArea {};
+ 
+@@ -163,6 +165,22 @@ FrontendThreadData* GetFrontendThreadData(FEXCore::Core::InternalThreadState* Th
+   return static_cast<FrontendThreadData*>(Thread->FrontendPtr);
+ }
+ 
++// Returns the Before/After state of the current thread's memory notification, or null for cross-process work and
++// threads that have not been initialized yet.
++FEX::Windows::InvalidationTracker::PendingMemoryChange* GetPendingMemoryChange() {
++  auto* Thread = GetTLS().ThreadState();
++  auto* Data = Thread ? GetFrontendThreadData(Thread) : nullptr;
++  return !Data || Data->InCrossProcessWork ? nullptr : &Data->PendingMemoryChange;
++}
++
++void ProcessCrossProcessWork() {
++  auto* Data = GetFrontendThreadData(GetTLS().ThreadState());
++  Data->InCrossProcessWork = true;
++  Wow64ProcessPendingCrossProcessItems();
++  Data->InCrossProcessWork = false;
++}
++
++
+ uint64_t GetWowTEB(void* TEB) {
+   static constexpr size_t WowTEBOffsetMemberOffset {0x180c};
+   return static_cast<uint64_t>(
+@@ -514,7 +532,7 @@ public:
+ 
+       Context::FlushThreadStateContext();
+       Context::UnlockJITContext();
+-      Wow64ProcessPendingCrossProcessItems();
++      ProcessCrossProcessWork();
+       ReturnRAX = static_cast<uint64_t>(Wow64SystemServiceEx(static_cast<UINT>(EntryRAX), reinterpret_cast<UINT*>(static_cast<uint32_t>(ReturnRSP + 4))));
+       Context::LockJITContext();
+       Frame->State.gregs[FEXCore::X86State::REG_RAX] = ReturnRAX;
+@@ -555,7 +573,7 @@ public:
+   }
+ 
+   void PreCompile() override {
+-    Wow64ProcessPendingCrossProcessItems();
++    ProcessCrossProcessWork();
+   }
+ };
+ 
+@@ -897,36 +915,38 @@ void BTCpuNotifyMemoryDirty(void* Address, SIZE_T Size) {
+ }
+ 
+ void BTCpuNotifyMemoryAlloc(void* Address, SIZE_T Size, ULONG Type, ULONG Prot, BOOL After, ULONG Status) {
++  // MEM_RESET(_UNDO) ignores the passed permissions
++  const bool Reset = Type & (MEM_RESET | MEM_RESET_UNDO);
++  const ULONG EffectiveProt = Reset ? PAGE_NOACCESS : Prot;
++  const auto Base = reinterpret_cast<uint64_t>(Address);
+   if (!After) {
+-    ThreadCreationMutex.lock();
++    InvalidationTracker->BeginMemoryChange(ThreadCreationMutex, GetPendingMemoryChange(), Base, Size, EffectiveProt);
+   } else {
+-    // MEM_RESET(_UNDO) ignores the passed permissions
+-    if (!Status && !(Type & (MEM_RESET | MEM_RESET_UNDO))) {
+-      InvalidationTracker->HandleMemoryProtectionNotification(reinterpret_cast<uint64_t>(Address), static_cast<uint64_t>(Size), Prot);
+-    }
+-    ThreadCreationMutex.unlock();
++    InvalidationTracker->EndMemoryChange(ThreadCreationMutex, GetPendingMemoryChange(), Base, Size, EffectiveProt, !Status, [&] {
++      if (!Reset) {
++        InvalidationTracker->HandleMemoryProtectionNotification(Base, Size, Prot);
++      }
++    });
+   }
+ }
+ 
+ void BTCpuNotifyMemoryProtect(void* Address, SIZE_T Size, ULONG NewProt, BOOL After, ULONG Status) {
++  const auto Base = reinterpret_cast<uint64_t>(Address);
+   if (!After) {
+-    ThreadCreationMutex.lock();
++    InvalidationTracker->BeginMemoryChange(ThreadCreationMutex, GetPendingMemoryChange(), Base, Size, NewProt);
+   } else {
+-    if (!Status) {
+-      InvalidationTracker->HandleMemoryProtectionNotification(reinterpret_cast<uint64_t>(Address), static_cast<uint64_t>(Size), NewProt);
+-    }
+-    ThreadCreationMutex.unlock();
++    InvalidationTracker->EndMemoryChange(ThreadCreationMutex, GetPendingMemoryChange(), Base, Size, NewProt, !Status,
++                                         [&] { InvalidationTracker->HandleMemoryProtectionNotification(Base, Size, NewProt); });
+   }
+ }
+ 
+ void BTCpuNotifyMemoryFree(void* Address, SIZE_T Size, ULONG FreeType, BOOL After, ULONG Status) {
++  const auto Base = reinterpret_cast<uint64_t>(Address);
+   if (!After) {
+-    ThreadCreationMutex.lock();
++    InvalidationTracker->BeginMemoryChange(ThreadCreationMutex, GetPendingMemoryChange(), Base, Size, PAGE_NOACCESS);
+   } else {
+-    if (!Status) {
+-      InvalidationTracker->InvalidateAlignedInterval(reinterpret_cast<uint64_t>(Address), static_cast<uint64_t>(Size), true);
+-    }
+-    ThreadCreationMutex.unlock();
++    InvalidationTracker->EndMemoryChange(ThreadCreationMutex, GetPendingMemoryChange(), Base, Size, PAGE_NOACCESS, !Status,
++                                         [&] { InvalidationTracker->InvalidateAlignedInterval(Base, Size, true); });
+   }
+ }
+ 
+@@ -938,13 +958,9 @@ NTSTATUS BTCpuNotifyMapViewOfSection(void* Unk1, void* Address, void* Unk2, SIZE
+ 
+ void BTCpuNotifyUnmapViewOfSection(void* Address, BOOL After, ULONG Status) {
+   if (!After) {
+-    ThreadCreationMutex.lock();
+-    auto [Start, Size] = InvalidationTracker->InvalidateContainingSection(reinterpret_cast<uint64_t>(Address), true);
+-    if (Size) {
+-      HandleImageUnmap(Start, Size);
+-    }
++    InvalidationTracker->BeginUnmap(ThreadCreationMutex, GetPendingMemoryChange(), reinterpret_cast<uint64_t>(Address), HandleImageUnmap);
+   } else {
+-    ThreadCreationMutex.unlock();
++    InvalidationTracker->EndUnmap(ThreadCreationMutex, GetPendingMemoryChange(), !Status);
+   }
+ }
+ 
+@@ -965,7 +981,6 @@ void BTCpuNotifyProcessExecuteFlagsChange(ULONG Flags) {
+   std::scoped_lock Lock(ThreadCreationMutex);
+   InvalidationTracker->HandleProcessExecuteFlagsChange(Flags);
+ }
+-
+ BOOLEAN WINAPI BTCpuIsProcessorFeaturePresent(UINT Feature) {
+   return CPUFeatures->IsFeaturePresent(Feature) ? TRUE : FALSE;
+ }

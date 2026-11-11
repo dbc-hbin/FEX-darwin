@@ -1,0 +1,452 @@
+Subject: [PATCH] llsc cmpxchg fault contract
+
+Keep LL/SC compare-exchange emission and unaligned fault decoding consistent.
+
+Source: local macOS Wine queue; see ../../README.md for ancestry and dependencies.
+License: ../LICENSE (MIT)
+
+diff --git a/FEXCore/Source/Interface/Core/JIT/AtomicOps.cpp b/FEXCore/Source/Interface/Core/JIT/AtomicOps.cpp
+index 017b108ad4b0a093d68c38f721cd352e5526eb6a..94a11c09767a85d923d2400531d37454a90ac2ae 100644
+--- a/FEXCore/Source/Interface/Core/JIT/AtomicOps.cpp
++++ b/FEXCore/Source/Interface/Core/JIT/AtomicOps.cpp
+@@ -56,42 +56,32 @@ DEF_OP(CASPair) {
+       mov(ARMEmitter::Size::i64Bit, Dst0, CaspalDst0);
+       mov(ARMEmitter::Size::i64Bit, Dst1, CaspalDst1);
+     }
+-  } else {
+-    // Save NZCV so we don't have to mark this op as clobbering NZCV (the
+-    // SupportsAtomics does not clobber atomics and this !SupportsAtomics path
+-    // is so slow it's not worth the complexity of splitting the IR op.). We
+-    // clobber NZCV inside the hot loop and we can't replace cmp/ccmp/b.ne with
+-    // something NZCV-preserving without requiring an extra instruction.
+-    mrs(TMP1, ARMEmitter::SystemRegister::NZCV);
+-
+-    ARMEmitter::BackwardLabel LoopTop;
+-    ARMEmitter::ForwardLabel LoopNotExpected;
+-    ARMEmitter::ForwardLabel LoopExpected;
+-    (void)Bind(&LoopTop);
+-
+-    // This instruction sequence must be synced with HandleCASPAL_Armv8.
+-    ldaxp(EmitSize, TMP2, TMP3, MemSrc);
+-    cmp(EmitSize, TMP2, Expected0);
+-    ccmp(EmitSize, TMP3, Expected1, ARMEmitter::StatusFlags::None, ARMEmitter::Condition::CC_EQ);
+-    (void)b(ARMEmitter::Condition::CC_NE, &LoopNotExpected);
+-    stlxp(EmitSize, TMP2, Desired0, Desired1, MemSrc);
+-    (void)cbnz(EmitSize, TMP2, &LoopTop);
+-    mov(EmitSize, Dst0, Expected0);
+-    mov(EmitSize, Dst1, Expected1);
+-
+-    (void)b(&LoopExpected);
+-
+-    (void)Bind(&LoopNotExpected);
+-    mov(EmitSize, Dst0, TMP2.R());
+-    mov(EmitSize, Dst1, TMP3.R());
+-    // exclusive monitor needs to be cleared here
+-    // Might have hit the case where ldaxr was hit but stlxr wasn't
+-    clrex();
+-    (void)Bind(&LoopExpected);
+-
+-    // Restore
+-    msr(ARMEmitter::SystemRegister::NZCV, TMP1);
++    return;
+   }
++
++  // The loop always stores, writing the observed value back on mismatch, as x86 locked CMPXCHG
++  // does. The trailing dmb ish makes it a full barrier. Comparing with
++  // eor/orr/cbnz leaves NZCV untouched, so a fault on the store still exposes the exact guest flags.
++  // This instruction sequence must be synced with HandleCASPair_LLSC.
++  ARMEmitter::BackwardLabel LoopTop;
++  ARMEmitter::ForwardLabel LoopNotExpected;
++  ARMEmitter::ForwardLabel LoopDone;
++  (void)Bind(&LoopTop);
++  ldxp(EmitSize, TMP2, TMP3, MemSrc);
++  eor(EmitSize, TMP4, TMP2, Expected0);
++  eor(EmitSize, TMP1, TMP3, Expected1);
++  orr(EmitSize, TMP4, TMP4, TMP1);
++  (void)cbnz(EmitSize, TMP4, &LoopNotExpected);
++  stlxp(EmitSize, TMP4, Desired0, Desired1, MemSrc);
++  (void)cbnz(ARMEmitter::Size::i32Bit, TMP4, &LoopTop);
++  (void)b(&LoopDone);
++  (void)Bind(&LoopNotExpected);
++  stlxp(EmitSize, TMP4, TMP2, TMP3, MemSrc);
++  (void)cbnz(ARMEmitter::Size::i32Bit, TMP4, &LoopTop);
++  (void)Bind(&LoopDone);
++  dmb(ARMEmitter::BarrierScope::ISH);
++  mov(EmitSize, Dst0, TMP2.R());
++  mov(EmitSize, Dst1, TMP3.R());
+ }
+ 
+ DEF_OP(CAS) {
+@@ -119,32 +109,33 @@ DEF_OP(CAS) {
+     }
+     // Failed comparisons require the same full ordering as successful locked operations.
+     dmb(ARMEmitter::BarrierScope::ISH);
++    return;
++  }
++
++  // sub/cbnz leaves NZCV untouched.
++  // This instruction sequence must be synced with HandleCAS_LLSC.
++  ARMEmitter::BackwardLabel LoopTop;
++  ARMEmitter::ForwardLabel LoopNotExpected;
++  ARMEmitter::ForwardLabel LoopDone;
++  (void)Bind(&LoopTop);
++  ldxr(SubEmitSize, TMP2, MemSrc);
++  if (IROp->Size == IR::OpSize::i8Bit) {
++    sub(EmitSize, TMP3, TMP2, Expected, ARMEmitter::ExtendedType::UXTB, 0);
++  } else if (IROp->Size == IR::OpSize::i16Bit) {
++    sub(EmitSize, TMP3, TMP2, Expected, ARMEmitter::ExtendedType::UXTH, 0);
+   } else {
+-    ARMEmitter::BackwardLabel LoopTop;
+-    ARMEmitter::ForwardLabel LoopNotExpected;
+-    ARMEmitter::ForwardLabel LoopExpected;
+-    (void)Bind(&LoopTop);
+-    ldaxr(SubEmitSize, TMP2, MemSrc);
+-    if (IROp->Size == IR::OpSize::i8Bit) {
+-      cmp(EmitSize, TMP2, Expected, ARMEmitter::ExtendedType::UXTB, 0);
+-    } else if (IROp->Size == IR::OpSize::i16Bit) {
+-      cmp(EmitSize, TMP2, Expected, ARMEmitter::ExtendedType::UXTH, 0);
+-    } else {
+-      cmp(EmitSize, TMP2, Expected);
+-    }
+-    (void)b(ARMEmitter::Condition::CC_NE, &LoopNotExpected);
+-    stlxr(SubEmitSize, TMP3, Desired, MemSrc);
+-    (void)cbnz(EmitSize, TMP3, &LoopTop);
+-    mov(EmitSize, Dst, Expected);
+-    (void)b(&LoopExpected);
+-
+-    (void)Bind(&LoopNotExpected);
+-    mov(EmitSize, Dst, TMP2.R());
+-    // exclusive monitor needs to be cleared here
+-    // Might have hit the case where ldaxr was hit but stlxr wasn't
+-    clrex();
+-    (void)Bind(&LoopExpected);
++    sub(EmitSize, TMP3, TMP2, Expected);
+   }
++  (void)cbnz(EmitSize, TMP3, &LoopNotExpected);
++  stlxr(SubEmitSize, TMP3, Desired, MemSrc);
++  (void)cbnz(ARMEmitter::Size::i32Bit, TMP3, &LoopTop);
++  (void)b(&LoopDone);
++  (void)Bind(&LoopNotExpected);
++  stlxr(SubEmitSize, TMP3, TMP2, MemSrc);
++  (void)cbnz(ARMEmitter::Size::i32Bit, TMP3, &LoopTop);
++  (void)Bind(&LoopDone);
++  dmb(ARMEmitter::BarrierScope::ISH);
++  mov(EmitSize, Dst, TMP2.R());
+ }
+ 
+ DEF_OP(AtomicSwap) {
+diff --git a/FEXCore/Source/Utils/ArchHelpers/Arm64.cpp b/FEXCore/Source/Utils/ArchHelpers/Arm64.cpp
+index d53e2248936484527bc6ce8fd5344d1ff02d8b22..52a7a2db5522f611963224342fb603a2012a06f1 100644
+--- a/FEXCore/Source/Utils/ArchHelpers/Arm64.cpp
++++ b/FEXCore/Source/Utils/ArchHelpers/Arm64.cpp
+@@ -2,7 +2,6 @@
+ 
+ #include "Interface/Core/CPUBackend.h"
+ #include "Interface/Context/Context.h"
+-#include <FEXCore/Utils/AllocatorHooks.h>
+ #include <FEXCore/Utils/SpinWaitLock.h>
+ #include <FEXCore/Utils/JitWriteScope.h>
+ 
+@@ -29,14 +28,15 @@ constexpr uint32_t RCPC2_MASK = 0x3F'E0'0C'00;
+ constexpr uint32_t LDAPUR_INST = 0x19'40'00'00;
+ constexpr uint32_t STLUR_INST = 0x19'00'00'00;
+ 
+-constexpr uint32_t LDAXP_MASK = 0xBF'FF'80'00;
+-constexpr uint32_t LDAXP_INST = 0x88'7F'80'00;
++constexpr uint32_t LDXP_MASK = 0xBF'FF'80'00;
++constexpr uint32_t LDXP_INST = 0x88'7F'00'00;
+ 
+ constexpr uint32_t STLXP_MASK = 0xBF'E0'80'00;
+ constexpr uint32_t STLXP_INST = 0x88'20'80'00;
+ 
+ constexpr uint32_t LDAXR_MASK = 0x3F'FF'FC'00;
+ constexpr uint32_t LDAXR_INST = 0x08'5F'FC'00;
++constexpr uint32_t LDXR_INST = 0x08'5F'7C'00;
+ constexpr uint32_t LDAR_INST = 0x08'DF'FC'00;
+ constexpr uint32_t LDAPR_INST = 0x38'BF'C0'00;
+ constexpr uint32_t STLR_INST = 0x08'9F'FC'00;
+@@ -64,8 +64,6 @@ constexpr uint32_t ADD_INST = 0x0B'00'00'00;
+ constexpr uint32_t SUB_INST = 0x4B'00'00'00;
+ constexpr uint32_t ADD_SHIFT_INST = 0x0B'20'00'00;
+ constexpr uint32_t SUB_SHIFT_INST = 0x4B'20'00'00;
+-constexpr uint32_t CMP_INST = 0x6B'00'00'00;
+-constexpr uint32_t CMP_SHIFT_INST = 0x6B'20'00'00;
+ constexpr uint32_t AND_INST = 0x0A'00'00'00;
+ constexpr uint32_t BIC_INST = 0x0A'20'00'00;
+ constexpr uint32_t OR_INST = 0x2A'00'00'00;
+@@ -73,12 +71,6 @@ constexpr uint32_t ORN_INST = 0x2A'20'00'00;
+ constexpr uint32_t EOR_INST = 0x4A'00'00'00;
+ constexpr uint32_t EON_INST = 0x4A'20'00'00;
+ 
+-constexpr uint32_t CCMP_MASK = 0x7F'E0'0C'10;
+-constexpr uint32_t CCMP_INST = 0x7A'40'00'00;
+-
+-constexpr uint32_t CLREX_MASK = 0xFF'FF'F0'FF;
+-constexpr uint32_t CLREX_INST = 0xD5'03'30'5F;
+-
+ enum ExclusiveAtomicPairType {
+   TYPE_SWAP,
+   TYPE_ADD,
+@@ -311,32 +303,6 @@ static uint64_t DoLoad64(uint64_t Addr) {
+   }
+ }
+ 
+-static __uint128_t DoLoad128(uint64_t Addr) {
+-  // Any misalignment here means we cross a 16byte boundary
+-  // So we need two 128bit loads
+-  uint64_t Alignment = Addr & 0b1111;
+-  Addr &= ~0b1111ULL;
+-  uint64_t AddrUpper = Addr + 16;
+-
+-  union AlignedData {
+-    struct {
+-      __uint128_t Lower;
+-      __uint128_t Upper;
+-    } Large;
+-    struct {
+-      uint8_t Data[32];
+-    } Bytes;
+-  };
+-
+-  AlignedData* Data = reinterpret_cast<AlignedData*>(alloca(sizeof(AlignedData)));
+-  Data->Large.Upper = LoadAcquire128(AddrUpper);
+-  Data->Large.Lower = LoadAcquire128(Addr);
+-
+-  __uint128_t Result {};
+-  memcpy(&Result, &Data->Bytes.Data[Alignment], sizeof(Result));
+-  return Result;
+-}
+-
+ static bool RunCASPAL(uint64_t* GPRs, uint32_t Size, uint32_t DesiredReg1, uint32_t DesiredReg2, uint32_t ExpectedReg1,
+                       uint32_t ExpectedReg2, uint32_t AddressReg, uint32_t* StrictSplitLockMutex) {
+ 
+@@ -535,89 +501,42 @@ static bool HandleCASPAL(uint32_t Instr, uint64_t* GPRs, uint32_t* StrictSplitLo
+   return RunCASPAL(GPRs, Size, DesiredReg1, DesiredReg2, ExpectedReg1, ExpectedReg2, AddressReg, StrictSplitLockMutex);
+ }
+ 
+-static uint64_t HandleCASPAL_ARMv8(uint32_t Instr, uintptr_t ProgramCounter, uint64_t* GPRs, uint32_t* StrictSplitLockMutex) {
+-  // caspair
+-  // [1] ldaxp(TMP2.W(), TMP3.W(), MemOperand(MemSrc)); <-- DataReg & AddrReg
+-  // [2] cmp(TMP2.W(), Expected.first.W()); <-- ExpectedReg1
+-  // [3] ccmp(TMP3.W(), Expected.second.W(), NoFlag, Condition::eq); <-- ExpectedREg2
+-  // [4] b(&LoopNotExpected, Condition::ne);
+-  // [5] stlxp(TMP2.W(), Desired.first.W(), Desired.second.W(), MemOperand(MemSrc)); <-- DesiredReg
+-  // [6] cbnz(TMP2.W(), &LoopTop);
+-  // [7] mov(Dst.first.W(), Expected.first.W());
+-  // [8] mov(Dst.second.W(), Expected.second.W());
+-  // [9] b(&LoopExpected);
+-  // [10] mov(Dst.first.W(), TMP2.W());
+-  // [11] mov(Dst.second.W(), TMP3.W());
+-  // [12] clrex();
+-
+-  uint32_t* PC = (uint32_t*)ProgramCounter;
+-
+-  uint32_t Size = (Instr >> 30) & 1;
+-  uint32_t AddrReg = (Instr >> 5) & 0x1F;
+-  uint32_t DataReg = Instr & 0x1F;
+-  uint32_t DataReg2 = (Instr >> 10) & 0x1F;
+-
+-  uint32_t ExpectedReg1 {};
+-  uint32_t ExpectedReg2 {};
+-
+-  uint32_t DesiredReg1 {};
+-  uint32_t DesiredReg2 {};
+-
+-  if (Size == 1) {
+-    // 64-bit pair happens on paranoid vector loads
+-    // [1] ldaxp(TMP1, TMP2, MemSrc);
+-    // [2] clrex();
+-    //
+-    // 64-bit pair happens on paranoid vector stores
+-    // [1] ldaxp(xzr, TMP3, MemSrc); // <- Can hit SIGBUS
+-    // [2] stlxp(TMP3, TMP1, TMP2, MemSrc); // <- Can also hit SIGBUS
+-    // [3] cbnz(TMP3, &B); // < Overwritten with DMB
+-
+-    if (DataReg == 31) {
+-    } else {
+-      uint32_t NextInstr = PC[1];
+-      if ((NextInstr & ArchHelpers::Arm64::CLREX_MASK) == ArchHelpers::Arm64::CLREX_INST) {
+-        uint64_t Addr = GPRs[AddrReg];
+-
+-        auto Res = DoLoad128(Addr);
+-        // We set the result register if it isn't a zero register
+-        if (DataReg != 31) {
+-          GPRs[DataReg] = Res;
+-        }
+-        if (DataReg2 != 31) {
+-          GPRs[DataReg2] = Res >> 64;
+-        }
+-
+-        // Skip ldaxp and clrex
+-        return 2 * sizeof(uint32_t);
+-      }
+-    }
++static uint64_t HandleCASPair_LLSC(uint32_t Instr, uintptr_t ProgramCounter, uint64_t* GPRs, uint32_t* StrictSplitLockMutex) {
++  // Must match DEF_OP(CASPair):
++  // [0] ldxp(TMP2, TMP3, MemSrc); <-- faults; DataReg, DataReg2 & AddrReg
++  // [1] eor(TMP4, TMP2, Expected0); <-- ExpectedReg1
++  // [2] eor(TMP1, TMP3, Expected1); <-- ExpectedReg2
++  // [3] orr(TMP4, TMP4, TMP1);
++  // [4] cbnz(TMP4, &LoopNotExpected);
++  // [5] stlxp(TMP4, Desired0, Desired1, MemSrc); <-- DesiredReg1, DesiredReg2
++  // [6] cbnz(TMP4, &LoopTop);
++  // [7] b(&LoopDone);
++  // [8] stlxp(TMP4, TMP2, TMP3, MemSrc);
++  // [9] cbnz(TMP4, &LoopTop);
++  // [10] dmb ish <-- resume here with the observed value in DataReg, DataReg2
++  const uint32_t* PC = reinterpret_cast<const uint32_t*>(ProgramCounter);
++
++  // A 64-bit pair (CMPXCHG16B) faults only when misaligned, which RunCASPAL cannot emulate.
++  const uint32_t Size = (Instr >> 30) & 1;
++  if (Size != 0 || (PC[1] & ALU_OP_MASK) != EOR_INST || (PC[2] & ALU_OP_MASK) != EOR_INST ||
++      (PC[5] & STLXP_MASK) != STLXP_INST || PC[10] != DMB) {
+     return 0;
+   }
+ 
+-  // Only 32-bit pairs
+-  for (int i = 1; i < 10; i++) {
+-    uint32_t NextInstr = PC[i];
+-    if ((NextInstr & ArchHelpers::Arm64::ALU_OP_MASK) == ArchHelpers::Arm64::CMP_INST ||
+-        (NextInstr & ArchHelpers::Arm64::ALU_OP_MASK) == ArchHelpers::Arm64::CMP_SHIFT_INST) {
+-      ExpectedReg1 = GetRmReg(NextInstr);
+-    } else if ((NextInstr & ArchHelpers::Arm64::CCMP_MASK) == ArchHelpers::Arm64::CCMP_INST) {
+-      ExpectedReg2 = GetRmReg(NextInstr);
+-    } else if ((NextInstr & ArchHelpers::Arm64::STLXP_MASK) == ArchHelpers::Arm64::STLXP_INST) {
+-      DesiredReg1 = (NextInstr & 0x1F);
+-      DesiredReg2 = (NextInstr >> 10) & 0x1F;
+-    }
+-  }
++  const uint32_t AddrReg = GetRnReg(Instr);
++  const uint32_t DataReg = GetRdReg(Instr);
++  const uint32_t DataReg2 = (Instr >> 10) & REGISTER_MASK;
++  const uint32_t DesiredReg1 = GetRdReg(PC[5]);
++  const uint32_t DesiredReg2 = (PC[5] >> 10) & REGISTER_MASK;
+ 
+-  // mov expected into the temp registers used by JIT
+-  GPRs[DataReg] = GPRs[ExpectedReg1];
+-  GPRs[DataReg2] = GPRs[ExpectedReg2];
++  // RunCASPAL leaves the observed value in its expected registers, which is what ldxp would have loaded.
++  GPRs[DataReg] = GPRs[GetRmReg(PC[1])];
++  GPRs[DataReg2] = GPRs[GetRmReg(PC[2])];
+ 
+   if (RunCASPAL(GPRs, Size, DesiredReg1, DesiredReg2, DataReg, DataReg2, AddrReg, StrictSplitLockMutex)) {
+-    return 9 * sizeof(uint32_t); // skip to mov + clrex
+-  } else {
+-    return 0;
++    return 10 * sizeof(uint32_t);
+   }
++  return 0;
+ }
+ 
+ template<typename T>
+@@ -1631,47 +1550,36 @@ static bool HandleAtomicStore(uint32_t Instr, uint64_t* GPRs, int64_t Offset, ui
+   return false;
+ }
+ 
+-static uint64_t HandleCAS_NoAtomics(uintptr_t ProgramCounter, uint64_t* GPRs, uint32_t* StrictSplitLockMutex) {
+-  // ARMv8.0 CAS
+-  // [1] ldaxrb(TMP2.W(), MemOperand(MemSrc))
+-  // [2] cmp (TMP2.W(), Expected.W())
+-  // [3] b
+-  // [4] stlxrb(TMP3.W(), Desired.W(), MemOperand(MemSrc)
+-  // [5] cbnz
+-  // [6] mov
+-  // [7] b
+-  // [8] mov (.., TMP2.W());
+-  // [9] clrex
+-
+-  uint32_t* PC = (uint32_t*)ProgramCounter;
+-  uint32_t Instr = PC[0];
+-  uint32_t Size = 1 << (Instr >> 30);
+-  uint32_t AddressReg = GetRnReg(Instr);
+-  uint32_t ResultReg = GetRdReg(Instr); // TMP2
+-  uint32_t DesiredReg = 0;
+-  uint32_t ExpectedReg = 0;
+-  for (size_t i = 1; i < 6; ++i) {
+-    uint32_t NextInstr = PC[i];
+-    if ((NextInstr & ArchHelpers::Arm64::STLXR_MASK) == ArchHelpers::Arm64::STLXR_INST) {
+-#if defined(ASSERTIONS_ENABLED) && ASSERTIONS_ENABLED
+-      // Just double check that the memory destination matches
+-      const uint32_t StoreAddressReg = GetRnReg(NextInstr);
+-      LOGMAN_THROW_A_FMT(StoreAddressReg == AddressReg, "StoreExclusive memory register didn't match the store exclusive register");
+-#endif
+-      DesiredReg = GetRdReg(NextInstr);
+-    } else if ((NextInstr & ArchHelpers::Arm64::ALU_OP_MASK) == ArchHelpers::Arm64::CMP_INST ||
+-               (NextInstr & ArchHelpers::Arm64::ALU_OP_MASK) == ArchHelpers::Arm64::CMP_SHIFT_INST) {
+-      ExpectedReg = GetRmReg(NextInstr);
+-    }
++static uint64_t HandleCAS_LLSC(uintptr_t ProgramCounter, uint64_t* GPRs, uint32_t* StrictSplitLockMutex) {
++  // Must match DEF_OP(CAS):
++  // [0] ldxr(TMP2, MemSrc); <-- faults; ResultReg & AddressReg
++  // [1] sub(TMP3, TMP2, Expected{, uxtb|uxth}); <-- ExpectedReg
++  // [2] cbnz(TMP3, &LoopNotExpected);
++  // [3] stlxr(TMP3, Desired, MemSrc); <-- DesiredReg
++  // [4] cbnz(TMP3, &LoopTop);
++  // [5] b(&LoopDone);
++  // [6] stlxr(TMP3, TMP2, MemSrc);
++  // [7] cbnz(TMP3, &LoopTop);
++  // [8] dmb ish <-- resume here with the observed value in ResultReg
++  const uint32_t* PC = reinterpret_cast<const uint32_t*>(ProgramCounter);
++  const uint32_t Instr = PC[0];
++  if (((PC[1] & ALU_OP_MASK) != SUB_INST && (PC[1] & ALU_OP_MASK) != SUB_SHIFT_INST) || (PC[3] & STLXR_MASK) != STLXR_INST ||
++      PC[8] != DMB) {
++    return 0;
+   }
+-  // set up CASAL by doing mov(TMP2, Expected)
+-  GPRs[ResultReg] = GPRs[ExpectedReg];
+ 
++  const uint32_t Size = 1 << (Instr >> 30);
++  const uint32_t AddressReg = GetRnReg(Instr);
++  const uint32_t ResultReg = GetRdReg(Instr);
++  const uint32_t ExpectedReg = GetRmReg(PC[1]);
++  const uint32_t DesiredReg = GetRdReg(PC[3]);
++
++  // RunCASAL leaves the observed value in its expected register, which is what ldxr would have loaded.
++  GPRs[ResultReg] = GPRs[ExpectedReg];
+   if (RunCASAL(GPRs, Size, DesiredReg, ResultReg, AddressReg, StrictSplitLockMutex)) {
+-    return 7 * sizeof(uint32_t); // jump to mov to allocated register
+-  } else {
+-    return 0;
++    return 8 * sizeof(uint32_t);
+   }
++  return 0;
+ }
+ 
+ static uint64_t HandleAtomicLoadstoreExclusive(uintptr_t ProgramCounter, uint64_t* GPRs, uint32_t* StrictSplitLockMutex) {
+@@ -1749,9 +1657,6 @@ static uint64_t HandleAtomicLoadstoreExclusive(uintptr_t ProgramCounter, uint64_
+         AtomicOp = ExclusiveAtomicPairType::TYPE_SUB;
+       }
+       DataSourceReg = GetRmReg(NextInstr);
+-    } else if ((NextInstr & ArchHelpers::Arm64::ALU_OP_MASK) == ArchHelpers::Arm64::CMP_INST ||
+-               (NextInstr & ArchHelpers::Arm64::ALU_OP_MASK) == ArchHelpers::Arm64::CMP_SHIFT_INST) {
+-      return HandleCAS_NoAtomics(ProgramCounter, GPRs, StrictSplitLockMutex); // ARMv8.0 CAS
+     } else if ((NextInstr & ArchHelpers::Arm64::ALU_OP_MASK) == ArchHelpers::Arm64::AND_INST) {
+       AtomicOp = ExclusiveAtomicPairType::TYPE_AND;
+       DataSourceReg = GetRmReg(NextInstr);
+@@ -2090,16 +1995,18 @@ std::optional<int32_t> HandleUnalignedAccess(FEXCore::Core::InternalThreadState*
+       return BytesToSkip;
+     }
+     // Explicit fallthrough to the backpatch handler below!
+-  } else if ((Instr & ArchHelpers::Arm64::LDAXP_MASK) == ArchHelpers::Arm64::LDAXP_INST) { // LDAXP
+-    // Should be compare and swap pair only. LDAXP not used elsewhere
+-    uint64_t BytesToSkip = ArchHelpers::Arm64::HandleCASPAL_ARMv8(Instr, ProgramCounter, GPRs, StrictSplitLockMutex);
+-    if (BytesToSkip) {
+-      // Skip this instruction now
++  } else if ((Instr & ArchHelpers::Arm64::LDAXR_MASK) == ArchHelpers::Arm64::LDXR_INST) { // LDXR*, only emitted by CAS
++    if (uint64_t BytesToSkip = ArchHelpers::Arm64::HandleCAS_LLSC(ProgramCounter, GPRs, StrictSplitLockMutex)) {
+       return BytesToSkip;
+-    } else {
+-      LogMan::Msg::EFmt("Unhandled JIT SIGBUS CASPAL: PC: 0x{:x} Instruction: 0x{:08x}\n", ProgramCounter, PC[0]);
+-      return std::nullopt;
+     }
++    LogMan::Msg::EFmt("Unhandled JIT SIGBUS CAS: PC: 0x{:x} Instruction: 0x{:08x}\n", ProgramCounter, PC[0]);
++    return std::nullopt;
++  } else if ((Instr & ArchHelpers::Arm64::LDXP_MASK) == ArchHelpers::Arm64::LDXP_INST) { // LDXP, only emitted by CASPair
++    if (uint64_t BytesToSkip = ArchHelpers::Arm64::HandleCASPair_LLSC(Instr, ProgramCounter, GPRs, StrictSplitLockMutex)) {
++      return BytesToSkip;
++    }
++    LogMan::Msg::EFmt("Unhandled JIT SIGBUS CASPair: PC: 0x{:x} Instruction: 0x{:08x}\n", ProgramCounter, PC[0]);
++    return std::nullopt;
+   }
+ 
+   // Lock code mutex during any SIGBUS handling that potentially changes code.

@@ -1,0 +1,50 @@
+Subject: [PATCH] vector tso lowering
+
+Emit ordered vector accesses with the matching barriers and addressing rules.
+
+Source: local macOS Wine queue; see ../../README.md for ancestry and dependencies.
+License: ../LICENSE (MIT)
+
+diff --git a/FEXCore/Scripts/json_ir_generator.py b/FEXCore/Scripts/json_ir_generator.py
+index 4678ddd86475671bc0d0fb8cc84d7e8d33bd1b49..beb6fe5ed4dac46cf8e02d56e0cc69a76e24e9b9 100755
+--- a/FEXCore/Scripts/json_ir_generator.py
++++ b/FEXCore/Scripts/json_ir_generator.py
+@@ -797,7 +797,8 @@ def print_ir_allocator_helpers():
+                             elif inline == "Mem":
+                                 P += ["OffsetType", "OffsetScale"]
+                             elif inline == "Memtso":
+-                                P += ["OffsetType", "OffsetScale", "true /* TSO */"]
++                                # NEON TSO uses an ordinary LDR/STR with a separate barrier.
++                                P += ["OffsetType", "OffsetScale", "Class == RegClass::GPR || Size == OpSize::i256Bit"]
+                                 inline = "Mem"
+ 
+                             output_file.write(f"\t\t{arg.Name} = Inline{inline}({', '.join(P)});\n")
+diff --git a/FEXCore/Source/Interface/Core/JIT/MemoryOps.cpp b/FEXCore/Source/Interface/Core/JIT/MemoryOps.cpp
+index 055e8a7b463a5ca5c11c83dd1e0f6a82141e0e7b..6f3db22f0e5f28d7535ff470a0232cf00c9c7184 100644
+--- a/FEXCore/Source/Interface/Core/JIT/MemoryOps.cpp
++++ b/FEXCore/Source/Interface/Core/JIT/MemoryOps.cpp
+@@ -847,10 +847,8 @@ DEF_OP(LoadMemTSO) {
+     }
+     default: LOGMAN_MSG_A_FMT("Unhandled LoadMemTSO size: {}", OpSize); break;
+     }
+-    if (CTX->IsVectorAtomicTSOEnabled()) {
+-      // Half-barrier.
+-      dmb(ARMEmitter::BarrierScope::ISHLD);
+-    }
++    // The dispatcher already selected TSO, including per-instruction PE overrides.
++    dmb(ARMEmitter::BarrierScope::ISHLD);
+   }
+ }
+ 
+@@ -1840,10 +1838,7 @@ DEF_OP(StoreMemTSO) {
+       }
+     }
+   } else {
+-    if (CTX->IsVectorAtomicTSOEnabled()) {
+-      // Half-Barrier.
+-      dmb(ARMEmitter::BarrierScope::ISH);
+-    }
++    dmb(ARMEmitter::BarrierScope::ISH);
+     const auto Src = GetVReg(Op->Value);
+     const auto MemSrc = GenerateMemOperand(OpSize, MemReg, Op->Offset, Op->OffsetType, Op->OffsetScale);
+     switch (OpSize) {

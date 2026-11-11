@@ -1,0 +1,31 @@
+Subject: [PATCH] hardware tso default enabled
+
+Enable Darwin hardware TSO unless explicitly disabled.
+
+Source: local macOS Wine queue; see ../../README.md for ancestry and dependencies.
+License: ../LICENSE (MIT)
+
+diff --git a/Source/Windows/UnixLib/FEXUnixLib.cpp b/Source/Windows/UnixLib/FEXUnixLib.cpp
+index 2f809413a8d3e3e0bc223601438d2a11b6fc88cb..8637e71df837daa51ddf202333fa7565ca4ef856 100644
+--- a/Source/Windows/UnixLib/FEXUnixLib.cpp
++++ b/Source/Windows/UnixLib/FEXUnixLib.cpp
+@@ -59,9 +59,7 @@ constexpr NTSTATUS STATUS_INTERNAL_ERROR = 0xC00000E5;
+ #endif
+ 
+ #ifdef __APPLE__
+-// macOS exposes no userspace control over Apple Silicon's hardware TSO mode, has no
+-// kernel unaligned-atomic emulation and no VMA naming. Report the first two as unsupported
+-// so FEX falls back to its software implementations.
++// macOS has no prctl interface for kernel unaligned-atomic emulation or VMA naming.
+ static int prctl(int, ...) {
+   errno = ENOSYS;
+   return -1;
+@@ -77,7 +75,7 @@ extern "C" kern_return_t thread_set_x86_64_compat(uint32_t enable) __attribute__
+ static NTSTATUS FEXUnixLib_SetHardwareTSOControlHandler(void* _Args) {
+   auto Args = reinterpret_cast<const FEXUnixLib_SetHardwareTSOControlArgs*>(_Args);
+   const char* Env = getenv("HADRON_HARDWARE_TSO");
+-  if (!thread_set_x86_64_compat || !Env || strcmp(Env, "1")) {  // opt-in, see Wine's enable_hardware_tso
++  if (!thread_set_x86_64_compat || (Env && strcmp(Env, "1"))) {  // opt-out, see Wine's enable_hardware_tso
+     return STATUS_NOT_SUPPORTED;
+   }
+   return thread_set_x86_64_compat(Args->Enable) == KERN_SUCCESS ? STATUS_SUCCESS : STATUS_NOT_SUPPORTED;

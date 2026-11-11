@@ -2,12 +2,19 @@
 
 Darwin / Apple Silicon patches for native ARM64 Wine's x64 and WoW64 translators.
 This repository keeps our patch queue; FEX itself is fetched from
-[FEX-Emu/FEX](https://github.com/FEX-Emu/FEX) at the pinned FEX-2610 revision.
+[FEX-Emu/FEX](https://github.com/FEX-Emu/FEX) at commit
+`e3b30dda25342362588ed1096494bea019cde4cd`, after FEX-2611.
 
-The 18 patches include Hadron's hardware TSO and W^X JIT support, translation and
-cache optimizations, Arknights EFLAGS transport, and the REP/DIV exception fixes.
+The patch queue retains Hadron's hardware TSO and W^X JIT support, architectural
+and cache-lifetime fixes, and Arknights EFLAGS transport. REP and gather use the
+original pre-PR bulk paths, including their original address/partial-fault
+limitations. The later compromise implementation is removed; the independently
+verified block-link arena leak fix remains.
 Source revisions, patch hashes and licenses are recorded in
 [`Darwin/provenance.json`](Darwin/provenance.json).
+Local patches are organized by feature, with related frontend, backend and test
+changes kept together. The [patch map](Darwin/patches/README.md) records their
+purpose and application dependencies.
 
 ## Prepare and build
 
@@ -30,8 +37,13 @@ native Unix helpers.
 Use the paired Wine 11.20 EFLAGS transport and the companion continuation patch
 in `Darwin/patches/wine/`. With an unpaired Wine, set `LMISXH_AKMOCL_EFLAGS=0`.
 
-The existing runtime passed 23 x64 CPU checks and eight GPU readbacks, and ZZZ
-reached city loading. i386 startup and clean game shutdown remain unverified.
+Build and stage both translators and native helpers together, using
+native-host-page PE section alignment. The queue contains 55 FEX patches;
+seven former local patches now come from the upstream pin. The patch map separates
+current validation from historical receipts. A separate reproduced POPF
+single-step correction accompanies the upgrade. Extended REP/gather probes have
+known original address-size/segment limitations; see the patch map.
+i386 execution, game performance and jitter remain unverified.
 Darwin packaging and tooling are MIT-licensed under [`LICENSE`](LICENSE),
 copyright 2026 dbc-hbin. The original [FEX MIT notice](Darwin/patches/FEX-LICENSE)
 and imported Hadron (MIT) and Arknights (MPL-2.0) notices remain with the patches.

@@ -1,0 +1,56 @@
+Subject: [PATCH] lookup l2 allocation
+
+Avoid allocating disabled L2 lookup storage.
+
+Source: local macOS Wine queue; see ../../README.md for ancestry and dependencies.
+License: ../LICENSE (MIT)
+
+diff --git a/FEXCore/Source/Interface/Core/LookupCache.cpp b/FEXCore/Source/Interface/Core/LookupCache.cpp
+index 0b230306f038539587cf7ca1e390fa516a520829..6e7a43deacc05dd0fb35a86f91b2767edf23fabe 100644
+--- a/FEXCore/Source/Interface/Core/LookupCache.cpp
++++ b/FEXCore/Source/Interface/Core/LookupCache.cpp
+@@ -24,7 +24,8 @@ GuestToHostMap::GuestToHostMap()
+ LookupCache::LookupCache(FEXCore::Context::ContextImpl* CTX)
+   : ctx {CTX} {
+ 
+-  TotalCacheSize = ctx->Config.VirtualMemSize / FEXCore::Utils::FEX_PAGE_SIZE * 8 + CODE_SIZE + MAX_L1_SIZE;
++  const size_t L2CacheSize = DisableL2Cache() ? 0 : ctx->Config.VirtualMemSize / FEXCore::Utils::FEX_PAGE_SIZE * 8 + CODE_SIZE;
++  TotalCacheSize = L2CacheSize + MAX_L1_SIZE;
+ 
+   // Block cache ends up looking like this
+   // PageMemoryMap[VirtualMemoryRegion >> 12]
+@@ -44,8 +45,9 @@ LookupCache::LookupCache(FEXCore::Context::ContextImpl* CTX)
+   // Disable THP on the Lookup cache.
+   FEXCore::Allocator::VirtualTHPControl(reinterpret_cast<const void*>(PagePointer), TotalCacheSize, FEXCore::Allocator::THPControl::Disable);
+ 
+-  FEXCore::Allocator::VirtualName("FEXMem_Lookup", reinterpret_cast<void*>(PagePointer),
+-                                  ctx->Config.VirtualMemSize / FEXCore::Utils::FEX_PAGE_SIZE * 8 + CODE_SIZE);
++  if (L2CacheSize) {
++    FEXCore::Allocator::VirtualName("FEXMem_Lookup", reinterpret_cast<void*>(PagePointer), L2CacheSize);
++  }
+   CTX->SyscallHandler->MarkOvercommitRange(PagePointer, TotalCacheSize);
+ 
+   // Allocate our memory backing our pages
+@@ -53,10 +55,10 @@ LookupCache::LookupCache(FEXCore::Context::ContextImpl* CTX)
+   // XXX: We can drop down to 16KB if we store 4byte offsets from the code base
+   // We currently limit to 128MB of real memory for caching for the total cache size.
+   // Can end up being inefficient if we compile a small number of blocks per page
+-  PageMemory = PagePointer + ctx->Config.VirtualMemSize / FEXCore::Utils::FEX_PAGE_SIZE * 8;
++  PageMemory = L2CacheSize ? PagePointer + ctx->Config.VirtualMemSize / FEXCore::Utils::FEX_PAGE_SIZE * 8 : 0;
+ 
+   // L1 Cache
+-  L1Pointer = PageMemory + CODE_SIZE;
++  L1Pointer = PagePointer + L2CacheSize;
+   FEXCore::Allocator::VirtualName("FEXMem_Lookup_L1", reinterpret_cast<void*>(L1Pointer), MAX_L1_SIZE);
+ 
+   VirtualMemSize = ctx->Config.VirtualMemSize;
+@@ -79,6 +81,9 @@ LookupCache::~LookupCache() {
+ }
+ 
+ void LookupCache::ClearL2Cache(const FEXCore::LookupCacheBaseLockToken& lk) {
++  if (DisableL2Cache()) {
++    return;
++  }
+   // Clear out the page memory
+   // PagePointer and PageMemory are sequential with each other. Clear both at once.
+   FEXCore::Allocator::VirtualDontNeed(reinterpret_cast<void*>(PagePointer),

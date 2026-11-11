@@ -1,0 +1,325 @@
+Subject: [PATCH] disk cache owned work and eviction
+
+Keep queued blobs and lookup snapshots alive across synchronized eviction.
+
+Source: local macOS Wine queue; see ../../README.md for ancestry and dependencies.
+License: ../LICENSE (MIT)
+
+diff --git a/FEXCore/Source/Interface/Core/DiskCache.cpp b/FEXCore/Source/Interface/Core/DiskCache.cpp
+index 36145b61a3f45d3f49046862dd74675bad6ff805..be1584ea838cf421b3d2f852f3fdaa2129c25a93 100644
+--- a/FEXCore/Source/Interface/Core/DiskCache.cpp
++++ b/FEXCore/Source/Interface/Core/DiskCache.cpp
+@@ -555,7 +555,7 @@ namespace DiskCache {
+     WritingDiskCache = (bool)RWCacheDB;
+     ReadingDiskCache = !ROCacheDBs.empty() || RWCacheDB != nullptr;
+ 
+-    if (IsWritingDiskCache()) {
++    if (IsWritingDiskCache() || (IsReadingDiskCache() && MemoryLRUMaxSize)) {
+       FEXCore::Threads::Flags WriterThreadFlags = {.LowPriority = true, .Internal = true};
+       Writer = fextl::make_unique<WorkQueueThread>(WriterThreadFlags, "FEX:DiskCache");
+     }
+@@ -614,6 +614,7 @@ namespace DiskCache {
+         if (IndexEntry) {
+           IndexEntry->MemoryBlob.reset();
+           IndexEntry->LRUEntry.reset();
++          if (!IndexEntry->DB) Self->EraseEntryLocked(LastKey.LookupKey, IndexEntry);
+         }
+         Self->MemoryLRUCurrentSize -= LastKey.Size;
+         auto Deleted = Last;
+@@ -626,7 +627,6 @@ namespace DiskCache {
+       }
+     }
+   };
+-
+   std::optional<CodeHitData> DiskCache::Lookup(Core::InternalThreadState* Thread, std::optional<ExecutableFileSectionInfo> Region,
+                                                uint64_t GuestRIP, std::optional<uint64_t>& GuestCodeKey) {
+     if (!IsReadingDiskCache()) {
+@@ -684,11 +684,10 @@ namespace DiskCache {
+     bool TriedMainEntry = false;
+     IndexEntry MainEntry;
+     uint64_t MainEntryFootprint;
+-    fextl::multimap<uint64_t, IndexEntry>::iterator MoreEntriesIt;
+-    fextl::multimap<uint64_t, IndexEntry>* MapPointer = nullptr;
+-    IndexEntry* EntryUnderReview;
+-    fextl::shared_ptr<fextl::vector<uint8_t>> BlobRef;
+-    std::optional<fextl::list<MemoryLRUKey>::iterator> LRUIter;
++    // Eviction can erase or promote entries after IndexLock is released.
++    fextl::vector<std::pair<uint64_t, IndexEntry>> MoreEntriesSnapshot;
++    decltype(MoreEntriesSnapshot)::iterator MoreEntriesIt;
++    const IndexEntry* EntryUnderReview;
+     uint64_t CurrentFootprint = 0;
+     {
+       std::lock_guard Guard(IndexLock);
+@@ -700,19 +699,15 @@ namespace DiskCache {
+ 
+       MainEntry = It->second.MainEntry;
+       MainEntryFootprint = It->second.MainEntryFootprint;
+-      MapPointer = It->second.MoreEntries.get();
+-      if (MapPointer) {
+-        MoreEntriesIt = It->second.MoreEntries->begin();
++      if (It->second.MoreEntries) {
++        MoreEntriesSnapshot.assign(It->second.MoreEntries->begin(), It->second.MoreEntries->end());
+       }
+-      if (MapPointer && MoreEntriesIt != It->second.MoreEntries->end()) {
++      MoreEntriesIt = MoreEntriesSnapshot.begin();
++      if (MoreEntriesIt != MoreEntriesSnapshot.end()) {
+         EntryUnderReview = &MoreEntriesIt->second;
+-        BlobRef = EntryUnderReview->MemoryBlob;
+-        LRUIter = EntryUnderReview->LRUEntry;
+         CurrentFootprint = MoreEntriesIt->first;
+       } else {
+         EntryUnderReview = &MainEntry;
+-        BlobRef = EntryUnderReview->MemoryBlob;
+-        LRUIter = EntryUnderReview->LRUEntry;
+         CurrentFootprint = MainEntryFootprint;
+         TriedMainEntry = true;
+       }
+@@ -722,67 +717,53 @@ namespace DiskCache {
+     bool Advance = false;
+     while (!FoundMatchingHash) {
+       if (Advance) {
+-        std::lock_guard Guard(IndexLock);
+-
+         EntryUnderReview = nullptr;
+-        if (MapPointer && MoreEntriesIt != MapPointer->end()) {
++        if (MoreEntriesIt != MoreEntriesSnapshot.end()) {
+           // if the current footprint is also the main entry's footprint, give main entry a shot next
+           if (!TriedMainEntry && MoreEntriesIt->first == MainEntryFootprint) {
+             EntryUnderReview = &MainEntry;
+-            BlobRef = EntryUnderReview->MemoryBlob;
+-            LRUIter = EntryUnderReview->LRUEntry;
+             CurrentFootprint = MainEntryFootprint;
+             TriedMainEntry = true;
+           } else {
+             MoreEntriesIt++;
+           }
+         }
+-        if (!MapPointer || MoreEntriesIt == MapPointer->end()) {
++        if (MoreEntriesIt == MoreEntriesSnapshot.end()) {
+           if (TriedMainEntry) {
+             // ran out
+             break;
+           } else {
+             EntryUnderReview = &MainEntry;
+-            BlobRef = EntryUnderReview->MemoryBlob;
+-            LRUIter = EntryUnderReview->LRUEntry;
+             CurrentFootprint = MainEntryFootprint;
+             TriedMainEntry = true;
+           }
+         }
+-        if (!EntryUnderReview && MapPointer && MoreEntriesIt != MapPointer->end()) {
++        if (!EntryUnderReview && MoreEntriesIt != MoreEntriesSnapshot.end()) {
+           EntryUnderReview = &MoreEntriesIt->second;
+-          BlobRef = EntryUnderReview->MemoryBlob;
+-          LRUIter = EntryUnderReview->LRUEntry;
+           CurrentFootprint = MoreEntriesIt->first;
+         }
+       }
+ 
+       Advance = true;
+ 
+-      // entry not backed by anything right now - todo prune..
+-      if (!EntryUnderReview->DB && !BlobRef) {
++      // Ignore an unbacked entry in the snapshot.
++      if (!EntryUnderReview->DB && !EntryUnderReview->MemoryBlob) {
+         continue;
+       }
+-
+       // do we have enough room in our live code to even hash GuestSize worth?
+       if (Available < EntryUnderReview->GuestSize) {
+         continue;
+       }
+ 
+-      // if (Entry.GuestExtents.size()) {
+-      //   LogMan::Msg::IFmt("lookup! length {:d}", Entry.GuestSize);
+-      //   for(uint32_t i = 0; i < Entry.GuestExtents.size(); i+=2 ) {
+-      //     LogMan::Msg::IFmt("extent {} {}", Entry.GuestExtents[i], Entry.GuestExtents[i]+Entry.GuestExtents[i+1]);
+-      //   }
+-      // }
+       {
+-        IndexEntry& Entry = *EntryUnderReview;
++        const IndexEntry& Entry = *EntryUnderReview;
++        const auto& Extents = Entry.GuestExtents;
+         // only renew the hash if the candidate footprint is different than previous
+         if (FirstHash || LastFootprintHashed != CurrentFootprint) {
+           XXH3_state_t HashState;
+           XXH3_128bits_reset(&HashState);
+-          for (uint32_t i = 0; i < Entry.GuestExtents.size(); i += 2) {
+-            XXH3_128bits_update(&HashState, reinterpret_cast<uint8_t*>(GuestRIP) + Entry.GuestExtents[i], Entry.GuestExtents[i + 1]);
++          for (uint32_t i = 0; i < Extents.size(); i += 2) {
++            XXH3_128bits_update(&HashState, reinterpret_cast<uint8_t*>(GuestRIP) + Extents[i], Extents[i + 1]);
+           }
+           LiveGuestHash = XXH3_128bits_digest(&HashState);
+           LastFootprintHashed = CurrentFootprint;
+@@ -799,9 +780,9 @@ namespace DiskCache {
+             const uint8_t* LiveGuest = reinterpret_cast<const uint8_t*>(GuestRIP);
+             uint64_t DiffCount = 0;
+             uint64_t DiffOffset = 0;
+-            for (uint32_t i = 0; i < Entry.GuestExtents.size(); i += 2) {
+-              uint32_t Begin = Entry.GuestExtents[i];
+-              uint32_t End = Begin + Entry.GuestExtents[i + 1];
++            for (uint32_t i = 0; i < Extents.size(); i += 2) {
++              uint32_t Begin = Extents[i];
++              uint32_t End = Begin + Extents[i + 1];
+               bool PreviousByteDiff = false;
+               for (uint32_t Offset = Begin; Offset < End; Offset++) {
+                 if (LiveGuest[Offset] != CachedGuest[Offset]) {
+@@ -839,12 +820,15 @@ namespace DiskCache {
+       return std::nullopt;
+     }
+ 
+-    IndexEntry& Entry = *EntryUnderReview;
++    const IndexEntry& Entry = *EntryUnderReview;
++    const auto& Extents = Entry.GuestExtents;
++    const auto& BlobRef = Entry.MemoryBlob;
++    const auto& LRUIter = Entry.LRUEntry;
+ 
+     fextl::vector<uint64_t> GuestPages;
+-    for (uint32_t i = 0; i < Entry.GuestExtents.size(); i += 2) {
+-      uint64_t FirstPage = (Entry.GuestExtents[i] + GuestRIP) & Utils::FEX_PAGE_MASK;
+-      uint64_t LastPage = (Entry.GuestExtents[i] + GuestRIP + Entry.GuestExtents[i + 1] - 1) & Utils::FEX_PAGE_MASK;
++    for (uint32_t i = 0; i < Extents.size(); i += 2) {
++      uint64_t FirstPage = (Extents[i] + GuestRIP) & Utils::FEX_PAGE_MASK;
++      uint64_t LastPage = (Extents[i] + GuestRIP + Extents[i + 1] - 1) & Utils::FEX_PAGE_MASK;
+       for (uint64_t Page = FirstPage; Page <= LastPage; Page += Utils::FEX_PAGE_SIZE) {
+         if (GuestPages.size() == 0 || Page != GuestPages.back()) {
+           GuestPages.push_back(Page);
+@@ -912,7 +896,6 @@ namespace DiskCache {
+     if (StoreInMemory && MemoryLRUCurrentSize > MemoryLRUMaxSize + MemoryLRUEvictThreshold) {
+       Writer->QueueWork(fextl::make_unique<PruneMemoryLRUWorkItem>(this));
+     }
+-
+     HitData.HostCode = {HitData.Blob.data() + BlobOffset, Header.HostSize};
+     BlobOffset += Header.HostSize;
+     HitData.EntryPointRIPs = {reinterpret_cast<uint64_t*>(HitData.Blob.data() + BlobOffset), Header.EntryPointCount};
+@@ -996,43 +979,56 @@ namespace DiskCache {
+     return nullptr;
+   }
+ 
++  void DiskCache::EraseEntryLocked(uint64_t LookupKey, IndexEntry* Entry) {
++    auto It = Index.find(LookupKey);
++    auto& Head = It->second;
++    if (Entry == &Head.MainEntry) {
++      if (!Head.MoreEntries || Head.MoreEntries->empty()) {
++        Index.erase(It);
++      } else {
++        auto First = Head.MoreEntries->begin();
++        Head.MainEntryFootprint = First->first;
++        Head.MainEntry = std::move(First->second);
++        Head.MoreEntries->erase(First);
++      }
++    } else {
++      for (auto More = Head.MoreEntries->begin(); More != Head.MoreEntries->end(); ++More) {
++        if (&More->second == Entry) {
++          Head.MoreEntries->erase(More);
++          break;
++        }
++      }
++    }
++  }
+   struct DiskCache::CacheStoreWorkItem final : WorkQueueThread::WorkItem {
+     DiskCache* Self;
+     IndexedDB* DB;
+     MesaFOZ::foz_payload_key UniqueKey;
+     uint64_t LookupKey;
+-    std::span<uint8_t> Blob;
++    fextl::shared_ptr<fextl::vector<uint8_t>> Blob;
+     fextl::vector<uint8_t> IndexBlob;
+     bool StoreDisk;
+     CacheStoreWorkItem(DiskCache* Self, IndexedDB* DB, const MesaFOZ::foz_payload_key& UniqueKey, uint64_t LookupKey,
+-                       std::span<uint8_t> Blob, fextl::vector<uint8_t>&& IndexBlob, bool StoreDisk)
++                       fextl::shared_ptr<fextl::vector<uint8_t>> Blob, fextl::vector<uint8_t>&& IndexBlob, bool StoreDisk)
+       : Self(Self)
+       , DB(DB)
+       , UniqueKey(UniqueKey)
+       , LookupKey(LookupKey)
+-      , Blob(Blob)
++      , Blob(std::move(Blob))
+       , IndexBlob(std::move(IndexBlob))
+       , StoreDisk(StoreDisk) {}
+     void Run() override {
+       struct MesaFOZ::mesa_index_db_file_entry IndexHeader;
+-      bool DiskSuccess = !StoreDisk || DB->StoreCacheBlob(UniqueKey, LookupKey, Blob, IndexHeader, IndexBlob);
++      bool DiskSuccess = !StoreDisk || DB->StoreCacheBlob(UniqueKey, LookupKey, *Blob, IndexHeader, IndexBlob);
+ 
+       bool KeepEntryInMemory = true;
+       // todo possible other lru condition here like entry size?
+-      if (Blob.size() > Self->MemoryLRUMaxSize) {
++      if (Blob->size() > Self->MemoryLRUMaxSize) {
+         KeepEntryInMemory = false;
+-      } else {
+-        Self->MemoryLRUCurrentSize += Blob.size();
+       }
+ 
+       const IndexExtraBlobHeader* IndexAfterHeader = reinterpret_cast<const IndexExtraBlobHeader*>(IndexBlob.data());
+ 
+-      fextl::list<MemoryLRUKey>::iterator NewLRUEntry;
+-      if (KeepEntryInMemory) {
+-        std::lock_guard Guard(Self->MemoryLRULock);
+-        Self->MemoryLRU.push_front({LookupKey, IndexAfterHeader->GuestHash, IndexAfterHeader->GuestFootprint, (uint32_t)Blob.size()});
+-        NewLRUEntry = Self->MemoryLRU.begin();
+-      }
+       {
+         std::lock_guard Guard(Self->IndexLock);
+         auto IndexEntry = Self->LookupLocked(LookupKey, IndexAfterHeader->GuestHash, IndexAfterHeader->GuestFootprint);
+@@ -1044,8 +1040,12 @@ namespace DiskCache {
+           }
+           if (!KeepEntryInMemory) {
+             IndexEntry->MemoryBlob.reset();
++            if (!IndexEntry->DB) Self->EraseEntryLocked(LookupKey, IndexEntry);
+           } else {
+-            IndexEntry->LRUEntry = NewLRUEntry;
++            std::lock_guard LRUGuard(Self->MemoryLRULock);
++            Self->MemoryLRU.push_front({LookupKey, IndexAfterHeader->GuestHash, IndexAfterHeader->GuestFootprint, (uint32_t)Blob->size()});
++            IndexEntry->LRUEntry = Self->MemoryLRU.begin();
++            Self->MemoryLRUCurrentSize += Blob->size();
+           }
+         }
+       }
+@@ -1260,7 +1260,6 @@ namespace DiskCache {
+       Header.GuestHash = XXH3_128bits_digest(&HashState);
+     }
+     memcpy(BlobData + HeaderOffset, &Header, sizeof(Header));
+-
+     auto RangeInfo = CTX->SyscallHandler->QueryGuestExecutableRange(Thread, GuestRIP);
+     uint64_t LookupKey =
+       MakeLookupKey(Thread, GuestCodeKey, RangeInfo.Writable, GuestRIP == CTX->GetMonoBackPatcherBlock().load(std::memory_order_relaxed));
+@@ -1286,7 +1285,6 @@ namespace DiskCache {
+     }
+ 
+     memcpy(BlobData + GuestCodeOffset, GuestCode.data(), GuestCode.size());
+-
+     MesaFOZ::foz_payload_key Key = {};
+     {
+       XXH3_state_t HashState;
+@@ -1312,7 +1310,7 @@ namespace DiskCache {
+     }
+ 
+     // hand the rest off to the writer thread
+-    Writer->QueueWork(fextl::make_unique<CacheStoreWorkItem>(this, RWCacheDB.get(), Key, LookupKey, std::span(BlobData, TotalSize),
++    Writer->QueueWork(fextl::make_unique<CacheStoreWorkItem>(this, RWCacheDB.get(), Key, LookupKey, std::move(BlobRef),
+                                                              std::move(IndexBlob), StoreDisk));
+     return true;
+   }
+diff --git a/FEXCore/Source/Interface/Core/DiskCache.h b/FEXCore/Source/Interface/Core/DiskCache.h
+index 7c925c7fcb786061f543de11fde4aa6c22214940..7c899140cbb3053abc1c4db0c03a11f66e99c25a 100644
+--- a/FEXCore/Source/Interface/Core/DiskCache.h
++++ b/FEXCore/Source/Interface/Core/DiskCache.h
+@@ -15,7 +15,9 @@
+ #include <FEXCore/fextl/unordered_set.h>
+ #include <FEXCore/fextl/robin_map.h>
+ #include <FEXCore/fextl/map.h>
++#include <FEXCore/fextl/list.h>
+ #include <FEXCore/fextl/vector.h>
++#include <atomic>
+ #include <stdint.h>
+ #include <mutex>
+ #include <optional>
+@@ -216,6 +218,7 @@ namespace DiskCache {
+     bool OpenCacheDB(const fextl::string& CacheDBName, bool ReadOnly);
+     uint64_t MakeLookupKey(Core::InternalThreadState* Thread, const uint64_t ModuleOffset, bool Writable, bool MonoBackpatcher);
+     IndexEntry* LookupLocked(const uint64_t LookupKey, const XXH128_hash_t& GuestHash, const uint64_t GuestFootprint);
++    void EraseEntryLocked(uint64_t LookupKey, IndexEntry* Entry);
+ 
+     bool ReadingDiskCache {};
+     bool WritingDiskCache {};

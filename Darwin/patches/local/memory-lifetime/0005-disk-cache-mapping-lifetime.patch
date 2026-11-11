@@ -1,0 +1,232 @@
+Subject: [PATCH] disk cache mapping lifetime
+
+Release native cache mappings with the database that owns them.
+
+Source: local macOS Wine queue; see ../../README.md for ancestry and dependencies.
+License: ../LICENSE (MIT)
+
+diff --git a/FEXCore/Source/Interface/Core/DiskCache.cpp b/FEXCore/Source/Interface/Core/DiskCache.cpp
+index be1584ea838cf421b3d2f852f3fdaa2129c25a93..0706cc0bca78e3d89823f395098edb6326543a55 100644
+--- a/FEXCore/Source/Interface/Core/DiskCache.cpp
++++ b/FEXCore/Source/Interface/Core/DiskCache.cpp
+@@ -59,6 +59,7 @@ namespace DiskCache {
+   };
+ 
+   static FileMapperFunc FileMapper = nullptr;
++  static FileUnmapperFunc FileUnmapper = nullptr;
+ 
+   bool FOZFile::Open(const fextl::string& FOZFileName, bool ReadOnly) {
+     FileName = FOZFileName;
+@@ -171,6 +172,12 @@ namespace DiskCache {
+     return true;
+   }
+ 
++  IndexedDB::~IndexedDB() {
++    if (CacheFileMapping) {
++      CacheFileUnmapper(CacheFileMapping, CacheFileMappingSize);
++    }
++  }
++
+   bool IndexedDB::Open(const fextl::string& CacheDBName, bool ReadOnly) {
+     if (!CacheFOZ.Open(CacheDBName + ".foz", ReadOnly)) {
+       return false;
+@@ -183,9 +190,10 @@ namespace DiskCache {
+     const ssize_t FileSize = CacheFOZ.Size();
+     if (MapDiskCacheFiles && FileSize > 0 && CacheFileHandle != (File::File::FileHandleType)-1) {
+       CacheFileSize = FileSize;
+-      if (FileMapper) {
++      if (FileMapper && FileUnmapper) {
+         CacheFileMappingSize = ReadOnly ? FileSize : BIG_MAPPING_SIZE;
+         CacheFileMapping = reinterpret_cast<uint8_t*>(FileMapper(CacheFileHandle, CacheFileMappingSize));
++        CacheFileUnmapper = FileUnmapper;
+       }
+     }
+ 
+@@ -385,8 +393,9 @@ namespace DiskCache {
+     return true;
+   }
+ 
+-  FEX_DEFAULT_VISIBILITY void SetFileMapper(FileMapperFunc Func) {
+-    FileMapper = Func;
++  FEX_DEFAULT_VISIBILITY void SetFileMapper(FileMapperFunc Mapper, FileUnmapperFunc Unmapper) {
++    FileMapper = Mapper;
++    FileUnmapper = Unmapper;
+   }
+ 
+   static inline void PruneStaleEntries(std::string_view CacheBase, std::string_view MachineBucketHash) {
+diff --git a/FEXCore/Source/Interface/Core/DiskCache.h b/FEXCore/Source/Interface/Core/DiskCache.h
+index 7c899140cbb3053abc1c4db0c03a11f66e99c25a..b5413a2d65096bbd3542819418ee49b0b9a2e683 100644
+--- a/FEXCore/Source/Interface/Core/DiskCache.h
++++ b/FEXCore/Source/Interface/Core/DiskCache.h
+@@ -7,6 +7,7 @@
+ #include <FEXCore/Core/CodeCache.h>
+ #include <FEXCore/Core/Context.h>
+ #include <FEXCore/Core/DiskCache.h>
++#include <FEXCore/Core/DiskCacheFileMapper.h>
+ #include <FEXCore/Config/Config.h>
+ #include <FEXCore/Utils/File.h>
+ #include <FEXCore/Utils/WorkQueueThread.h>
+@@ -166,6 +167,13 @@ namespace DiskCache {
+ 
+   class IndexedDB {
+   public:
++    IndexedDB() = default;
++    ~IndexedDB();
++    IndexedDB(const IndexedDB&) = delete;
++    IndexedDB& operator=(const IndexedDB&) = delete;
++    IndexedDB(IndexedDB&&) = delete;
++    IndexedDB& operator=(IndexedDB&&) = delete;
++
+     bool Open(const fextl::string& CacheDBName, bool ReadOnly);
+     void PopulateIndex(Index& CacheIndex, bool& FoundMetadata);
+     bool ReadCacheBlob(uint64_t Offset, std::span<uint8_t> OutBlob);
+@@ -183,6 +191,7 @@ namespace DiskCache {
+     FOZFile CacheFOZ;
+     uint8_t* CacheFileMapping = nullptr;
+     uint64_t CacheFileMappingSize = 0;
++    FileUnmapperFunc CacheFileUnmapper = nullptr;
+     std::atomic<uint64_t> CacheFileSize {};
+     FOZFile IndexFOZ;
+     bool ReadOnly = false;
+diff --git a/FEXCore/include/FEXCore/Core/DiskCacheFileMapper.h b/FEXCore/include/FEXCore/Core/DiskCacheFileMapper.h
+index 6e32c07bfc7dc6b96123a259f1a7e75cb2453cdd..64ee4ad1c6733038d5d83b9cdf7abb8194c095b6 100644
+--- a/FEXCore/include/FEXCore/Core/DiskCacheFileMapper.h
++++ b/FEXCore/include/FEXCore/Core/DiskCacheFileMapper.h
+@@ -6,6 +6,8 @@
+ 
+ namespace FEXCore::DiskCache {
+ using FileMapperFunc = void* (*)(FEXCore::File::File::FileHandleType Handle, uint64_t MapSize);
++using FileUnmapperFunc = void (*)(void* Mapping, uint64_t MapSize);
+ 
+-FEX_DEFAULT_VISIBILITY void SetFileMapper(FileMapperFunc Func);
++// Successful mappings are owned by the database and released with the same size.
++FEX_DEFAULT_VISIBILITY void SetFileMapper(FileMapperFunc Mapper, FileUnmapperFunc Unmapper);
+ } // namespace FEXCore::DiskCache
+diff --git a/Source/Tools/FEXInterpreter/FEXInterpreter.cpp b/Source/Tools/FEXInterpreter/FEXInterpreter.cpp
+index 73b0bb92202755444702bc2459f3925317a410fc..024c6475101af85f87a80ff29844de41ee937ee9 100644
+--- a/Source/Tools/FEXInterpreter/FEXInterpreter.cpp
++++ b/Source/Tools/FEXInterpreter/FEXInterpreter.cpp
+@@ -203,6 +203,10 @@ static void* DiskCacheFilemapper(FEXCore::File::File::FileHandleType Handle, uin
+   return Result;
+ }
+ 
++static void DiskCacheFileUnmapper(void* Mapping, uint64_t MapSize) {
++  FEXCore::Allocator::munmap(Mapping, MapSize);
++}
++
+ bool InterpreterHandler(fextl::string* Filename, const fextl::string& RootFS, fextl::vector<fextl::string>* args) {
+   int FD {-1};
+ 
+@@ -539,7 +543,7 @@ int main(int argc, char** argv, char** const envp) {
+   // Setup Thread handlers, so FEXCore can create threads.
+   auto StackTracker = FEX::LinuxEmulation::Threads::SetupThreadHandlers();
+ 
+-  FEXCore::DiskCache::SetFileMapper(DiskCacheFilemapper);
++  FEXCore::DiskCache::SetFileMapper(DiskCacheFilemapper, DiskCacheFileUnmapper);
+ 
+   auto MemoryRegions = FEX::Allocator::InitMemoryRegions(Loader.Is64BitMode());
+   auto Allocator = FEX::Allocator::InitAllocator(Loader.Is64BitMode());
+diff --git a/Source/Windows/ARM64EC/Module.cpp b/Source/Windows/ARM64EC/Module.cpp
+index e6bae81e7e1be973ee6397c3774cdf7124911db0..c0e5c32ad29af300f0221e6bbd7130321de65597 100644
+--- a/Source/Windows/ARM64EC/Module.cpp
++++ b/Source/Windows/ARM64EC/Module.cpp
+@@ -856,7 +856,7 @@ NTSTATUS ProcessInit() {
+   FEX::Windows::UnixLib::Init(NtDll);
+   FEX::Windows::Allocator::SetupHooks();
+   if (FEX::Windows::UnixLib::Available()) {
+-    FEXCore::DiskCache::SetFileMapper(FEX::Windows::UnixLib::MapFile);
++    FEXCore::DiskCache::SetFileMapper(FEX::Windows::UnixLib::MapFile, FEX::Windows::UnixLib::UnmapFile);
+   }
+ 
+   {
+diff --git a/Source/Windows/Common/FEXUnixLib.cpp b/Source/Windows/Common/FEXUnixLib.cpp
+index 0b59dd5651381c90e5795a9748f2785639933082..5e9f2c939fdec67ed935a627cdcfd2a21ce22f6f 100644
+--- a/Source/Windows/Common/FEXUnixLib.cpp
++++ b/Source/Windows/Common/FEXUnixLib.cpp
+@@ -215,6 +215,12 @@ void* MapFile(HANDLE FileHandle, uint64_t MapSize) {
+   return nullptr;
+ }
+ 
++void UnmapFile(void* Mapping, uint64_t MapSize) {
++  FEXUnixLib_UnmapFile Args {Mapping, MapSize};
++  const auto Status = Call(FEXUnixLibFunctions::UnmapFile, &Args);
++  LOGMAN_THROW_A_FMT(Status == STATUS_SUCCESS, "Failed to unmap disk cache file: {:#x}", static_cast<uint32_t>(Status));
++}
++
+ uint32_t GetPID() {
+   if (Available()) {
+     FEXUnixLib_GetPID Args {};
+diff --git a/Source/Windows/Common/FEXUnixLib.h b/Source/Windows/Common/FEXUnixLib.h
+index 53f65c87685a7291bcfeb9944c31a9f88c97e134..31d82af91abbf69eee340d4e392a14c4bf40149c 100644
+--- a/Source/Windows/Common/FEXUnixLib.h
++++ b/Source/Windows/Common/FEXUnixLib.h
+@@ -56,6 +56,7 @@ SHMSlotResult AllocateSHMSlots(void* SHMBase, uint32_t MapSize, uint32_t MaxSize
+ void DeleteSHMStatsFile();
+ 
+ void* MapFile(HANDLE FileHandle, uint64_t MapSize);
++void UnmapFile(void* Mapping, uint64_t MapSize);
+ 
+ // Returns the process pid when unixlib is available.
+ // Or returns the process ID otherwise.
+diff --git a/Source/Windows/UnixLib/FEXUnixLib.cpp b/Source/Windows/UnixLib/FEXUnixLib.cpp
+index 8637e71df837daa51ddf202333fa7565ca4ef856..95223e00b88c2474d2815f0b2aeb32567a6ef2cb 100644
+--- a/Source/Windows/UnixLib/FEXUnixLib.cpp
++++ b/Source/Windows/UnixLib/FEXUnixLib.cpp
+@@ -213,6 +213,11 @@ static NTSTATUS FEXUnixLib_MapFileHandler(void* _Args) {
+   return STATUS_SUCCESS;
+ }
+ 
++static NTSTATUS FEXUnixLib_UnmapFileHandler(void* _Args) {
++  auto Args = reinterpret_cast<const FEXUnixLib_UnmapFile*>(_Args);
++  return munmap(Args->Mapping, Args->MapSize) == 0 ? STATUS_SUCCESS : STATUS_INTERNAL_ERROR;
++}
++
+ static NTSTATUS FEXUnixLib_GetPIDHandler(void* _Args) {
+   auto Args = reinterpret_cast<FEXUnixLib_GetPID*>(_Args);
+   Args->Result = ::getpid();
+@@ -294,6 +299,7 @@ extern "C" const unixlib_entry_t __wine_unix_call_funcs[] = {
+   FEXUnixLib_GetPIDHandler,
+   FEXUnixLib_CheckSupportsTPIDRRO_CPUHandler,
+   FEXUnixLib_JITWriteProtectHandler,
++  FEXUnixLib_UnmapFileHandler,
+ };
+ 
+ static_assert(sizeof(__wine_unix_call_funcs) / sizeof(__wine_unix_call_funcs[0]) == ToUnderlying(FEXUnixLibFunctions::MAX));
+diff --git a/Source/Windows/UnixLib/FEXUnixLib.h b/Source/Windows/UnixLib/FEXUnixLib.h
+index 7838df11596ecdff8e70d95dd216ec20ea4636c9..ad276be46cf1b2fa0dea4e8ddf8a9998ef961a61 100644
+--- a/Source/Windows/UnixLib/FEXUnixLib.h
++++ b/Source/Windows/UnixLib/FEXUnixLib.h
+@@ -14,6 +14,7 @@ enum class FEXUnixLibFunctions : uint32_t {
+   GetPID,
+   CheckSupportsTPIDRRO_CPU,
+   JITWriteProtect,
++  UnmapFile,
+   MAX,
+ };
+ 
+@@ -63,6 +64,12 @@ struct FEXUnixLib_MapFile {
+ };
+ static_assert(sizeof(FEXUnixLib_MapFile) == 24);
+ 
++struct FEXUnixLib_UnmapFile {
++  void* Mapping;
++  uint64_t MapSize;
++};
++static_assert(sizeof(FEXUnixLib_UnmapFile) == 16);
++
+ struct FEXUnixLib_GetPID {
+   uint32_t Result;
+ };
+diff --git a/Source/Windows/WOW64/Module.cpp b/Source/Windows/WOW64/Module.cpp
+index 0b77a33ab6985e813753462558af558d33a0b7b3..517c03aaf48fe15cdc634f6e10765c0f21ac3e02 100644
+--- a/Source/Windows/WOW64/Module.cpp
++++ b/Source/Windows/WOW64/Module.cpp
+@@ -604,7 +604,7 @@ void BTCpuProcessInit() {
+   FEX::Windows::UnixLib::Init(NtDll);
+   FEX::Windows::Allocator::SetupHooks();
+   if (FEX::Windows::UnixLib::Available()) {
+-    FEXCore::DiskCache::SetFileMapper(FEX::Windows::UnixLib::MapFile);
++    FEXCore::DiskCache::SetFileMapper(FEX::Windows::UnixLib::MapFile, FEX::Windows::UnixLib::UnmapFile);
+   }
+ 
+   {

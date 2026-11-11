@@ -1,0 +1,132 @@
+Subject: [PATCH] disk cache file and blob bounds
+
+Bound cache mappings, file growth and decoded blob arithmetic.
+
+Source: local macOS Wine queue; see ../../README.md for ancestry and dependencies.
+License: ../LICENSE (MIT)
+
+diff --git a/FEXCore/Source/Interface/Core/DiskCache.cpp b/FEXCore/Source/Interface/Core/DiskCache.cpp
+index 3c78b22dadd10a36fa72d2ae20b5d321f92237e5..aef1e3dba86760c02bfd341d3f9b45acf6e04110 100644
+--- a/FEXCore/Source/Interface/Core/DiskCache.cpp
++++ b/FEXCore/Source/Interface/Core/DiskCache.cpp
+@@ -3,10 +3,10 @@
+ #define XXH_STATIC_LINKING_ONLY
+ 
+ #include "Interface/Core/Frontend.h"
++#include "Interface/Core/DiskCache.h"
+ #include "Interface/Context/Context.h"
+ 
+ #include <FEXCore/Config/Config.h>
+-#include <FEXCore/Core/DiskCache.h>
+ #include <FEXCore/Core/DiskCacheFileMapper.h>
+ #include <FEXCore/fextl/memory.h>
+ #include <FEXCore/fextl/string.h>
+@@ -176,15 +176,20 @@ namespace DiskCache {
+     }
+ 
+     File::File::FileHandleType CacheFileHandle = CacheFOZ.GetHandle();
+-    if (FileMapper && CacheFileHandle != (File::File::FileHandleType)-1) {
+-      CacheFileMapping = reinterpret_cast<uint8_t*>(FileMapper(CacheFileHandle, ReadOnly ? CacheFOZ.Size() : BIG_MAPPING_SIZE));
+-      CacheFileSize = CacheFOZ.Size();
++    const ssize_t FileSize = CacheFOZ.Size();
++    if (MapDiskCacheFiles && FileSize > 0 && CacheFileHandle != (File::File::FileHandleType)-1) {
++      CacheFileSize = FileSize;
++      if (FileMapper) {
++        CacheFileMappingSize = ReadOnly ? FileSize : BIG_MAPPING_SIZE;
++        CacheFileMapping = reinterpret_cast<uint8_t*>(FileMapper(CacheFileHandle, CacheFileMappingSize));
++      }
+     }
+ 
+     this->ReadOnly = ReadOnly;
+     return true;
+   }
+ 
++
+   void IndexedDB::PopulateIndex(Index& CacheIndex, bool& FoundMetadata) {
+     fextl::vector<uint8_t> Data;
+     if (!IndexFOZ.ReadAll(Data)) {
+@@ -261,8 +266,12 @@ namespace DiskCache {
+   }
+ 
+   bool IndexedDB::ReadCacheBlob(uint64_t Offset, std::span<uint8_t> OutBlob) {
+-    if (CacheFileMapping && (ReadOnly || Offset + OutBlob.size() <= BIG_MAPPING_SIZE)) {
+-      if (Offset + OutBlob.size() > CacheFileSize) {
++    if (OutBlob.size() > UINT64_MAX - Offset) {
++      return false;
++    }
++    if (CacheFileMapping && (Offset <= CacheFileMappingSize && OutBlob.size() <= CacheFileMappingSize - Offset)) {
++      const uint64_t FileSize = CacheFileSize;
++      if (Offset > FileSize || OutBlob.size() > FileSize - Offset) {
+         return false;
+       }
+       // todo could reduce copies by having a private mapping for relocs, etc
+@@ -280,8 +289,7 @@ namespace DiskCache {
+       return false;
+     }
+ 
+-    if (MaxSizeReached || CacheFileSize + Blob.size() >= MaxFileSize) {
+-      MaxSizeReached = true;
++    if (MaxSizeReached) {
+       return false;
+     }
+ 
+@@ -291,6 +299,18 @@ namespace DiskCache {
+       return false;
+     }
+ 
++    // Account for the FOZ wrapper and other writers while holding the file lock.
++    const ssize_t FileSize = CacheFOZ.Size();
++    const uint64_t WrapperSize = sizeof(MesaFOZ::foz_payload_key) + sizeof(MesaFOZ::foz_payload_header);
++    if (FileSize < 0 || static_cast<uint64_t>(FileSize) > MaxFileSize ||
++        WrapperSize > MaxFileSize - static_cast<uint64_t>(FileSize) ||
++        Blob.size() > MaxFileSize - static_cast<uint64_t>(FileSize) - WrapperSize) {
++      MaxSizeReached = FileSize >= 0;
++      CacheFOZ.Unlock();
++      IndexFOZ.Unlock();
++      return false;
++    }
++
+     // write cache side first so we get offset for index
+     std::span<const uint8_t> BlobChunks[] = {Blob};
+     uint64_t BlobOffset = 0;
+@@ -802,8 +822,9 @@ namespace DiskCache {
+     memcpy(&Header, HitData.Blob.data() + BlobOffset, sizeof(Header));
+     BlobOffset += sizeof(Header);
+ 
+-    uint32_t SizeNeeded = sizeof(Header) + Header.HostSize + Header.EntryPointCount * (sizeof(uint64_t) + sizeof(uint32_t));
+-    SizeNeeded += Header.SmallRelocCount * sizeof(BlobSmallRelocation) + Header.ThunkRelocCount * sizeof(BlobThunkRelocation);
++    // Header counts come from the cache file; sum them in 64 bits so they cannot wrap past the entry size.
++    uint64_t SizeNeeded = sizeof(Header) + uint64_t {Header.HostSize} + uint64_t {Header.EntryPointCount} * (sizeof(uint64_t) + sizeof(uint32_t));
++    SizeNeeded += uint64_t {Header.SmallRelocCount} * sizeof(BlobSmallRelocation) + uint64_t {Header.ThunkRelocCount} * sizeof(BlobThunkRelocation);
+     if (EntrySizeWithoutGuestCode != SizeNeeded) {
+       return std::nullopt;
+     }
+diff --git a/FEXCore/Source/Interface/Core/DiskCache.h b/FEXCore/Source/Interface/Core/DiskCache.h
+index 2f681e98e38abb4cc56e5f231b0c4d30e8774007..7c925c7fcb786061f543de11fde4aa6c22214940 100644
+--- a/FEXCore/Source/Interface/Core/DiskCache.h
++++ b/FEXCore/Source/Interface/Core/DiskCache.h
+@@ -6,6 +6,7 @@
+ 
+ #include <FEXCore/Core/CodeCache.h>
+ #include <FEXCore/Core/Context.h>
++#include <FEXCore/Core/DiskCache.h>
+ #include <FEXCore/Config/Config.h>
+ #include <FEXCore/Utils/File.h>
+ #include <FEXCore/Utils/WorkQueueThread.h>
+@@ -179,12 +180,14 @@ namespace DiskCache {
+ 
+     FOZFile CacheFOZ;
+     uint8_t* CacheFileMapping = nullptr;
+-    std::atomic<uint64_t> CacheFileSize;
++    uint64_t CacheFileMappingSize = 0;
++    std::atomic<uint64_t> CacheFileSize {};
+     FOZFile IndexFOZ;
+     bool ReadOnly = false;
+-    bool MaxSizeReached = false;
++    std::atomic<bool> MaxSizeReached {};
+ 
+     FEX_CONFIG_OPT(MaxFileSize, DISKCACHEMAXFILESIZE);
++    FEX_CONFIG_OPT(MapDiskCacheFiles, DISKCACHEFILEMAPPING);
+   };
+ 
+   class DiskCache {

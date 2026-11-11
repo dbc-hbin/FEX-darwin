@@ -1,0 +1,20 @@
+Subject: [PATCH] jit recompile debug metadata
+
+Discard stale debug metadata when retrying JIT compilation.
+
+Source: local macOS Wine queue; see ../../README.md for ancestry and dependencies.
+License: ../LICENSE (MIT)
+
+diff --git a/FEXCore/Source/Interface/Core/JIT/JIT.cpp b/FEXCore/Source/Interface/Core/JIT/JIT.cpp
+index 6e8f50308fefcc8db3f8d7460e6ad6e3c6d5ab24..32d6a16677b5034e32050f79b193e646129a4045 100644
+--- a/FEXCore/Source/Interface/Core/JIT/JIT.cpp
++++ b/FEXCore/Source/Interface/Core/JIT/JIT.cpp
+@@ -893,6 +893,8 @@ CPUBackend::CompiledCode Arm64JITCore::EmitJITCode(uint64_t Entry, uint64_t Size
+   Relocations.resize(PrevNumAllocations, FEXCore::CPU::Relocation::Default()); // Discard any relocations generated from a previous attempt
+ 
+   CodeData.EntryPoints.clear();
++  DebugData->GuestOpcodes.clear();
++  DebugData->Subblocks.clear();
+ 
+   // Fairly excessive buffer range to make sure we don't overflow
+   // One page baseline, plus SSANodeMultipler bytes, then a guard region. The usable range ends on a

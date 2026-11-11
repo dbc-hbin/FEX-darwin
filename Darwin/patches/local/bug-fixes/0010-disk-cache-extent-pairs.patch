@@ -1,0 +1,41 @@
+Subject: [PATCH] disk cache extent pairs
+
+Validate complete cache extent pairs against guest-code bounds.
+
+Source: local macOS Wine queue; see ../../README.md for ancestry and dependencies.
+License: ../LICENSE (MIT)
+
+diff --git a/FEXCore/Source/Interface/Core/DiskCache.cpp b/FEXCore/Source/Interface/Core/DiskCache.cpp
+index 373f14f908c594d3438f4965338bdcbac6853b8d..865a07bc0bcd0836f5a3e2274538fffbec4862eb 100644
+--- a/FEXCore/Source/Interface/Core/DiskCache.cpp
++++ b/FEXCore/Source/Interface/Core/DiskCache.cpp
+@@ -239,13 +239,17 @@ namespace DiskCache {
+       const auto* GuestExtents = reinterpret_cast<const uint32_t*>(IndexDataStart + ReadOffset);
+       ReadOffset += IndexBlobExtra->GuestExtentsCount * sizeof(uint32_t);
+       if (FOZKey->bytes[39] != 0xFF) {
++        // Extents are (offset, length) pairs; an odd count would read past the entry.
++        if (IndexBlobExtra->GuestExtentsCount & 1) {
++          continue;
++        }
+         IndexEntry NewEntry {this, IndexBlobCommon->cache_db_file_offset, IndexBlobCommon->size, IndexBlobExtra->GuestSize,
+                              IndexBlobExtra->GuestHash};
+-        NewEntry.GuestExtents.resize(IndexBlobExtra->GuestExtentsCount);
+-        memcpy(NewEntry.GuestExtents.data(), GuestExtents, IndexBlobExtra->GuestExtentsCount * sizeof(uint32_t));
++        fextl::vector<uint32_t> Extents(IndexBlobExtra->GuestExtentsCount);
++        memcpy(Extents.data(), GuestExtents, IndexBlobExtra->GuestExtentsCount * sizeof(uint32_t));
+         bool ExtentsValid = true;
+-        for (uint32_t i = 0; i < NewEntry.GuestExtents.size(); i += 2) {
+-          if ((uint64_t)NewEntry.GuestExtents[i] + NewEntry.GuestExtents[i + 1] > IndexBlobExtra->GuestSize) {
++        for (uint32_t i = 0; i < Extents.size(); i += 2) {
++          if ((uint64_t)Extents[i] + Extents[i + 1] > IndexBlobExtra->GuestSize) {
+             ExtentsValid = false;
+             break;
+           }
+@@ -253,6 +257,7 @@ namespace DiskCache {
+         if (!ExtentsValid) {
+           continue;
+         }
++        NewEntry.GuestExtents = std::move(Extents);
+         auto It = CacheIndex.find(IndexBlobCommon->hash);
+         if (It == CacheIndex.end()) {
+           CacheIndex.emplace(IndexBlobCommon->hash, IndexCacheHead {std::move(NewEntry), IndexBlobExtra->GuestFootprint, nullptr});

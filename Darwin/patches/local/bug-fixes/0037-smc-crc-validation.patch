@@ -1,0 +1,47 @@
+Subject: [PATCH] smc crc validation
+
+Keep CRC metadata and validation arithmetic consistent, including zero-length inputs.
+
+Source: local macOS Wine queue; see ../../README.md for ancestry and dependencies.
+License: ../LICENSE (MIT)
+
+diff --git a/FEXCore/Source/Interface/Core/JIT/ALUOps.cpp b/FEXCore/Source/Interface/Core/JIT/ALUOps.cpp
+index 7d553cd410f9b6c01f71e4adceb636a0b71356ed..1368327d37c0b0ae065a8961cce1c2392516dae8 100644
+--- a/FEXCore/Source/Interface/Core/JIT/ALUOps.cpp
++++ b/FEXCore/Source/Interface/Core/JIT/ALUOps.cpp
+@@ -76,8 +76,8 @@ DEF_OP(PatchableGuestRIP) {
+ }
+ 
+ DEF_OP(PatchableGuestCRC) {
+-  auto Op = IROp->C<IR::IROp_PatchableGuestRIP>();
+-  InsertGuestPatchableMove(RelocationTypes::RELOC_GUEST_PATCHABLE_CRC_MOVE, GetReg(Node), Op->Value, Op->SiteAddress, (uint8_t)Op->SiteSize);
++  auto Op = IROp->C<IR::IROp_PatchableGuestCRC>();
++  InsertGuestPatchableMove(RelocationTypes::RELOC_GUEST_PATCHABLE_CRC_MOVE, GetReg(Node), Op->Value, Op->GuestAddress, Op->GuestSize);
+ }
+ 
+ DEF_OP(InlineConstant) {
+diff --git a/FEXCore/Source/Interface/Core/JIT/BranchOps.cpp b/FEXCore/Source/Interface/Core/JIT/BranchOps.cpp
+index a6c7b83657f4d2ad92babc8beee5f4919da975e5..466c7c9a6a4712be38dedd9181208f0b4aa300f4 100644
+--- a/FEXCore/Source/Interface/Core/JIT/BranchOps.cpp
++++ b/FEXCore/Source/Interface/Core/JIT/BranchOps.cpp
+@@ -370,7 +370,7 @@ DEF_OP(ValidateCode) {
+     WorkingReg = TMP1;
+   }
+ 
+-  sub(ARMEmitter::Size::i32Bit, Dst, TMP1, CRC32Reg);
++  sub(ARMEmitter::Size::i32Bit, Dst, WorkingReg, CRC32Reg);
+ 
+   ARMEmitter::ForwardLabel End;
+   cbz_OrRestart(ARMEmitter::Size::i32Bit, Dst, &End);
+diff --git a/FEXCore/Source/Interface/IR/IR.json b/FEXCore/Source/Interface/IR/IR.json
+index 6c1a345fe68c9fd99b192dab5761f39905d37109..07bd701168b7285db39b643150358d088f6f8c1a 100644
+--- a/FEXCore/Source/Interface/IR/IR.json
++++ b/FEXCore/Source/Interface/IR/IR.json
+@@ -196,6 +196,7 @@
+       },
+ 
+       "GPR = ValidateCode GPR:$crc, GPR:$Address, u8:$CodeLength": {
++        "Desc": ["Returns zero when the code CRC matches and nonzero otherwise."],
+         "HasSideEffects": true,
+         "HasDest": true,
+         "DestSize": "OpSize::i64Bit"

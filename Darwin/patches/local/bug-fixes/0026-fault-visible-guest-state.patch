@@ -1,0 +1,80 @@
+Subject: [PATCH] fault visible guest state
+
+Preserve guest register and fault visibility across IR and register-allocation transforms.
+
+Source: local macOS Wine queue; see ../../README.md for ancestry and dependencies.
+License: ../LICENSE (MIT)
+
+diff --git a/FEXCore/Source/Interface/IR/Passes/RegisterAllocationPass.cpp b/FEXCore/Source/Interface/IR/Passes/RegisterAllocationPass.cpp
+index 0f0a9c8edf8d0ceb9a2c5e0bdfa604bafed0e53c..b72b334c43be49fe60a26f223c083b7b965c9497 100644
+--- a/FEXCore/Source/Interface/IR/Passes/RegisterAllocationPass.cpp
++++ b/FEXCore/Source/Interface/IR/Passes/RegisterAllocationPass.cpp
+@@ -31,6 +31,7 @@ namespace {
+     // allocated to R. Else, RegToSSA[R] is UNDEFINED, no need to clear this
+     // when freeing registers.
+     Ref RegToSSA[32];
++    uint32_t SRAEpoch[32];
+   };
+ 
+   IR::RegClass GetRegClassFromNode(const IR::IROp_Header* IROp) {
+@@ -464,7 +465,9 @@ static bool KillMove(const IROp_Header* LastOp, IROp_Header* IROp, Ref LastNode,
+     }
+   }
+ 
+-  return LastOp->Op == OP_STOREREGISTER;
++  // A faulting consumer must expose the already committed guest register.
++  // Memory broadcasts lack HasSideEffects, like the SRA epoch barriers below.
++  return LastOp->Op == OP_STOREREGISTER && !IR::HasSideEffects(IROp->Op) && IROp->Op != OP_VBROADCASTFROMMEM;
+ }
+ 
+ static bool IsSignext(const IROp_Header* IROp, OrderedNodeWrapper Src, OpSize Size) {
+@@ -500,7 +503,10 @@ bool ConstrainedRAPass::TryPostRAMerge(Ref LastNode, Ref CodeNode, IROp_Header*
+   } else if (IROp->Op == OP_POP) {
+     auto SP = PhysicalRegister(IROp->Args[0]);
+ 
+-    if (LastOp->Op == OP_POP && LastOp->Size == IROp->Size && IROp->Size >= OpSize::i32Bit && SP == PhysicalRegister(LastOp->Args[0])) {
++    // Two pops that each advance the SRA stack pointer in place belong to separate guest instructions;
++    // an `ldp` faulting on the second load would report the first one, so only merge pops through a temporary.
++    if (LastOp->Op == OP_POP && LastOp->Size == IROp->Size && IROp->Size >= OpSize::i32Bit && SP == PhysicalRegister(LastOp->Args[0]) &&
++        SP.AsRegClass() != RegClass::GPRFixed) {
+       IREmit->SetWriteCursorBefore(LastNode);
+       IREmit->_PopTwo(IROp->Size, IROp->Args[0], LastOp->Args[1], IROp->Args[1]);
+       IREmit->RemovePostRA(CodeNode);
+@@ -579,6 +585,7 @@ void ConstrainedRAPass::Run(IREmitter* IREmit_) {
+       // We grab these nodes this way so we can iterate easily
+       auto CodeBegin = IR->at(BlockIROp->Begin);
+       auto CodeLast = IR->at(BlockIROp->Last);
++      uint32_t Epoch = 0;
+ 
+       while (1) {
+         auto [CodeNode, IROp] = CodeLast();
+@@ -592,6 +599,7 @@ void ConstrainedRAPass::Run(IREmitter* IREmit_) {
+ 
+           PreferredReg[IR->GetID(Node).Value] = Reg;
+           GetClass(Reg)->RegToSSA[Reg.Reg] = CodeNode;
++          GetClass(Reg)->SRAEpoch[Reg.Reg] = Epoch;
+         }
+ 
+         // Coalescing an SRA store is equivalent to hoisting the store,
+@@ -607,11 +615,20 @@ void ConstrainedRAPass::Run(IREmitter* IREmit_) {
+           auto Node = GetClass(Reg)->RegToSSA[Reg.Reg];
+           IROp_Header* Header = IR->GetOp<IROp_Header>(Node);
+ 
+-          if (CodeNode != DecodeSRANode(Header, Node)) {
++          if (CodeNode != DecodeSRANode(Header, Node) || GetClass(Reg)->SRAEpoch[Reg.Reg] != Epoch) {
+             PreferredReg[IR->GetID(CodeNode).Value] = PhysicalRegister::Invalid();
+           }
+         }
+ 
++        // A coalesced store must not become visible before an intervening fault
++        // or guest boundary. Memory broadcasts need explicit barriers because
++        // they are not marked HasSideEffects in IR.
++        // Increment after checking this node: a faulting load may still write
++        // its own destination directly, since a failed load does not commit it.
++        if ((IR::HasSideEffects(IROp->Op) && !DecodeSRANode(IROp, CodeNode)) || IROp->Op == OP_VBROADCASTFROMMEM) {
++          ++Epoch;
++        }
++
+         const int NumArgs = IR::GetRAArgs(IROp->Op);
+         for (int i = NumArgs - 1; i >= 0; --i) {
+           const auto& Arg = IROp->Args[i];

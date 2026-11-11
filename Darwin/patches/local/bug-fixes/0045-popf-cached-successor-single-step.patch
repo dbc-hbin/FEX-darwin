@@ -1,0 +1,22 @@
+Subject: [PATCH] Honor POPF single-step before a cached successor
+
+POPF has a statically known next RIP. Use the inline successor form so the
+existing CheckTF exit path runs before a warm block can execute. A warm CPUID
+otherwise leaves the blocked TF bit pending and traps one instruction late.
+
+Source: local macOS Wine queue; see ../../README.md for runtime evidence.
+License: ../LICENSE (MIT)
+
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp b/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
+index 51e263b41629c2141ca35ae3d034170abc2fcb5f..916a56953a39fef19c069066a02a878d49525e32 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
+@@ -3776,7 +3776,7 @@ void OpDispatchBuilder::POPFOp(OpcodeArgs) {
+ 
+   SetPackedRFLAG(false, Src);
+ 
+-  auto NewRIP = GetRelocatedPC(Op);
++  auto NewRIP = _GetRelocatedPC(Op, 0, true);
+   ExitFunction(NewRIP, BranchHint::CheckTF);
+   BlockSetRIP = true;
+ }

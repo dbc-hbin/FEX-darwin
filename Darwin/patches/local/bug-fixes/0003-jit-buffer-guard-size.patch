@@ -1,0 +1,35 @@
+Subject: [PATCH] jit buffer guard size
+
+Reserve and exclude the full configured JIT guard region.
+
+Source: local macOS Wine queue; see ../../README.md for ancestry and dependencies.
+License: ../LICENSE (MIT)
+
+diff --git a/FEXCore/Source/Interface/Core/SharedCodeBufferManager.cpp b/FEXCore/Source/Interface/Core/SharedCodeBufferManager.cpp
+index eee5023649e327b86a63dc63a7472585eac9c103..68a47a9f0ef2e108e510e3b7282f4dd32748524f 100644
+--- a/FEXCore/Source/Interface/Core/SharedCodeBufferManager.cpp
++++ b/FEXCore/Source/Interface/Core/SharedCodeBufferManager.cpp
+@@ -22,8 +22,8 @@ CodeBuffer::CodeBuffer(size_t Size, bool ShouldBeNamed)
+   LOGMAN_THROW_A_FMT(!!Ptr, "Couldn't allocate code buffer");
+ 
+   // Protect the last page of the allocated buffer to trigger SIGSEGV on write access
+-  uintptr_t LastPageAddr = AlignDown(reinterpret_cast<uintptr_t>(Ptr) + Size - 1, FEXCore::Utils::FEX_PAGE_SIZE);
+-  if (!FEXCore::Allocator::VirtualProtect(reinterpret_cast<void*>(LastPageAddr), FEXCore::Utils::FEX_PAGE_SIZE,
++  uintptr_t LastPageAddr = AlignDown(reinterpret_cast<uintptr_t>(Ptr) + Size - 1, FEXCore::Utils::FEX_GUARD_SIZE);
++  if (!FEXCore::Allocator::VirtualProtect(reinterpret_cast<void*>(LastPageAddr), FEXCore::Utils::FEX_GUARD_SIZE,
+                                           FEXCore::Allocator::ProtectOptions::None)) {
+     LogMan::Msg::EFmt("Failed to mprotect last page of code buffer.");
+   }
+diff --git a/FEXCore/Source/Interface/Core/SharedCodeBufferManager.h b/FEXCore/Source/Interface/Core/SharedCodeBufferManager.h
+index be7de210bcdf7b5542e072959fa0141da423f8fc..f3a411b68f6c62714b768860d3ae9f356889a8c8 100644
+--- a/FEXCore/Source/Interface/Core/SharedCodeBufferManager.h
++++ b/FEXCore/Source/Interface/Core/SharedCodeBufferManager.h
+@@ -68,7 +68,7 @@ struct CodeBuffer {
+ 
+   // Returns the total number of bytes available for storing code
+   size_t UsableSize() const {
+-    return AllocatedSize - FEXCore::Utils::FEX_PAGE_SIZE;
++    return AllocatedSize - FEXCore::Utils::FEX_GUARD_SIZE;
+   }
+ 
+   // Returns the full size of the buffer, including the guard page.

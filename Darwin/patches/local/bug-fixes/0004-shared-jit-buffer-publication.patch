@@ -1,0 +1,61 @@
+Subject: [PATCH] shared jit buffer publication
+
+Synchronize publication of shared code-buffer generations.
+
+Source: local macOS Wine queue; see ../../README.md for ancestry and dependencies.
+License: ../LICENSE (MIT)
+
+diff --git a/FEXCore/Source/Interface/Core/SharedCodeBufferManager.cpp b/FEXCore/Source/Interface/Core/SharedCodeBufferManager.cpp
+index 68a47a9f0ef2e108e510e3b7282f4dd32748524f..81196224551cae660072ed29835bfdfb0ca8a0c0 100644
+--- a/FEXCore/Source/Interface/Core/SharedCodeBufferManager.cpp
++++ b/FEXCore/Source/Interface/Core/SharedCodeBufferManager.cpp
+@@ -89,6 +89,7 @@ fextl::shared_ptr<CodeBuffer> SharedCodeBufferManager::AllocateNew(size_t Size)
+ }
+ 
+ fextl::shared_ptr<CodeBuffer> SharedCodeBufferManager::GetLatest() {
++  std::lock_guard Lock {GenerationMutex};
+   if (!Latest) {
+     AllocateNew(INITIAL_CODE_SIZE);
+   }
+@@ -96,17 +97,19 @@ fextl::shared_ptr<CodeBuffer> SharedCodeBufferManager::GetLatest() {
+ }
+ 
+ fextl::shared_ptr<CodeBuffer> SharedCodeBufferManager::StartLargerCodeBuffer() {
++  std::lock_guard Lock {GenerationMutex};
+   if (!Latest) {
+     // Allocate initial CodeBuffer and return it
+-    return GetLatest();
++    return AllocateNew(INITIAL_CODE_SIZE);
+   }
+ 
+-  auto NewCodeBufferSize = GetLatest()->TotalAllocationSize();
++  auto NewCodeBufferSize = Latest->TotalAllocationSize();
+   NewCodeBufferSize = std::min<size_t>(NewCodeBufferSize * 2, MAX_CODE_SIZE);
+   return AllocateNew(NewCodeBufferSize);
+ }
+ 
+ fextl::shared_ptr<CodeBuffer> SharedCodeBufferManager::StartMaximalCodeBuffer() {
++  std::lock_guard Lock {GenerationMutex};
+   return AllocateNew(MAX_CODE_SIZE);
+ }
+ } // namespace FEXCore::CPU
+diff --git a/FEXCore/Source/Interface/Core/SharedCodeBufferManager.h b/FEXCore/Source/Interface/Core/SharedCodeBufferManager.h
+index f3a411b68f6c62714b768860d3ae9f356889a8c8..4531b6572f4a43ac3631284d240d59ef6f745096 100644
+--- a/FEXCore/Source/Interface/Core/SharedCodeBufferManager.h
++++ b/FEXCore/Source/Interface/Core/SharedCodeBufferManager.h
+@@ -14,6 +14,7 @@ $end_info$
+ 
+ #include <cstddef>
+ #include <cstdint>
++#include <mutex>
+ 
+ namespace FEXCore {
+ struct GuestToHostMap;
+@@ -129,6 +130,7 @@ public:
+   virtual void OnCodeBufferAllocated(const std::shared_ptr<CodeBuffer>&) {};
+ 
+ private:
++  std::mutex GenerationMutex;
+   fextl::shared_ptr<CodeBuffer> Latest;
+ 
+   fextl::shared_ptr<CodeBuffer> AllocateNew(size_t Size);

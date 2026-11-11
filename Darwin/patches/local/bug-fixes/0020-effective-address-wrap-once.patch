@@ -1,0 +1,260 @@
+Subject: [PATCH] effective address wrap once
+
+Wrap architectural effective addresses once before linear subaccesses.
+
+Source: local macOS Wine queue; see ../../README.md for ancestry and dependencies.
+License: ../LICENSE (MIT)
+
+diff --git a/FEXCore/Source/Interface/Core/Addressing.cpp b/FEXCore/Source/Interface/Core/Addressing.cpp
+index 8848dcba..df2aa528 100644
+--- a/FEXCore/Source/Interface/Core/Addressing.cpp
++++ b/FEXCore/Source/Interface/Core/Addressing.cpp
+@@ -54,9 +54,17 @@ Ref LoadEffectiveAddress(IREmitter* IREmit, const AddressMode& A, IR::OpSize GPR
+ AddressMode SelectAddressMode(IREmitter* IREmit, const AddressMode& A, IR::OpSize GPRSize, bool HostSupportsTSOImm9, bool AtomicTSO,
+                               bool Vector, IR::OpSize AccessSize) {
+   const auto Is32Bit = GPRSize == OpSize::i32Bit;
+-  const auto GPRSizeMatchesAddrSize = A.AddrSize == GPRSize;
+-  const auto OffsetIndexToLargeFor32Bit = Is32Bit && (A.Offset <= -16384 || A.Offset >= 16384);
+-  if (!GPRSizeMatchesAddrSize || OffsetIndexToLargeFor32Bit) {
++  if (Is32Bit && A.AddrSize <= OpSize::i32Bit) {
++    // Architectural displacement belongs inside the wrapping effective address.
++    // Memory-IR offsets are reserved for linear subaccesses of that operand.
++    auto Base = LoadEffectiveAddress(IREmit, A, GPRSize, true);
++    return {.Base = IREmit->_Bfe(OpSize::i64Bit, 32, 0, Base), .Index = IREmit->Invalid()};
++  }
++  if (Is32Bit && A.AddrSize == OpSize::i64Bit) {
++    // Synthetic structure offsets must never pass through another 32-bit wrap.
++    return {.Base = LoadEffectiveAddress(IREmit, A, OpSize::i64Bit, true), .Index = IREmit->Invalid()};
++  }
++  if (A.AddrSize != GPRSize) {
+     // If address size doesn't match GPR size then no optimizations can occur.
+     return {
+       .Base = LoadEffectiveAddress(IREmit, A, GPRSize, true),
+@@ -68,9 +76,7 @@ AddressMode SelectAddressMode(IREmitter* IREmit, const AddressMode& A, IR::OpSiz
+   // Non-TSO GPR:
+   // * LDR/STR:   [Reg]
+   // * LDR/STR:   [Reg + Reg, {Shift <AccessSize>}]
+-  //   * Can't use with 32-bit
+   // * LDR/STR:   [Reg + [0,4095] * <AccessSize>]
+-  //   * Imm must be smaller than 16k with 32-bit
+   // * LDUR/STUR: [Reg + [-256, 255]]
+   //
+   // TSO GPR:
+@@ -110,7 +116,7 @@ AddressMode SelectAddressMode(IREmitter* IREmit, const AddressMode& A, IR::OpSiz
+ 
+   if (AtomicTSO) {
+     // TODO: LRCPC3 support for vector Imm9.
+-  } else if (!Is32Bit && A.Base && (A.Index || A.Segment) && !A.Offset && (A.IndexScale == 1 || A.IndexScale == AccessSizeAsImm)) {
++  } else if (A.Base && (A.Index || A.Segment) && !A.Offset && (A.IndexScale == 1 || A.IndexScale == AccessSizeAsImm)) {
+     AddressMode B = A;
+ 
+     // ScaledRegisterLoadstore
+@@ -126,20 +132,16 @@ AddressMode SelectAddressMode(IREmitter* IREmit, const AddressMode& A, IR::OpSiz
+ 
+   if (Vector || !AtomicTSO) {
+     if ((A.Base || A.Segment) && A.Offset) {
+-      const bool Const_16K = A.Offset > -16384 && A.Offset < 16384 && GPRSizeMatchesAddrSize && Is32Bit;
+-
+-      if (!Is32Bit || Const_16K) {
+-        // Peel off the offset
+-        AddressMode B = A;
+-        B.Offset = 0;
+-
+-        return {
+-          .Base = LoadEffectiveAddress(IREmit, B, GPRSize, true /* AddSegmentBase */, false),
+-          .Index = IREmit->Constant(A.Offset),
+-          .IndexType = MemOffsetType::SXTX,
+-          .IndexScale = 1,
+-        };
+-      }
++      // Peel off the offset
++      AddressMode B = A;
++      B.Offset = 0;
++
++      return {
++        .Base = LoadEffectiveAddress(IREmit, B, GPRSize, true /* AddSegmentBase */, false),
++        .Index = IREmit->Constant(A.Offset),
++        .IndexType = MemOffsetType::SXTX,
++        .IndexScale = 1,
++      };
+     }
+   }
+ 
+diff --git a/FEXCore/Source/Interface/Core/JIT/MemoryOps.cpp b/FEXCore/Source/Interface/Core/JIT/MemoryOps.cpp
+index d7b716ca..055e8a7b 100644
+--- a/FEXCore/Source/Interface/Core/JIT/MemoryOps.cpp
++++ b/FEXCore/Source/Interface/Core/JIT/MemoryOps.cpp
+@@ -740,6 +740,8 @@ DEF_OP(LoadMem) {
+ 
+ DEF_OP(LoadMemPair) {
+   const auto Op = IROp->C<IR::IROp_LoadMemPair>();
++  // For a 32-bit guest Addr already includes the wrapping displacement.
++  // In long mode the pair immediate can carry an architectural displacement.
+   const auto Addr = GetReg(Op->Addr);
+ 
+   if (Op->Class == IR::RegClass::GPR) {
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp b/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
+index 901a9228..3d2b59eb 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
+@@ -2522,8 +2522,6 @@ void OpDispatchBuilder::BTOp(OpcodeArgs, uint32_t SrcIndex, BTAction Action) {
+     }
+     }
+   } else {
+-    // Load the address to the memory location
+-    Ref Dest = MakeSegmentAddress(Op, Op->Dest);
+     // Get the bit selection from the src
+     auto BitSelect = Src.Bfe(0, 3);
+ 
+@@ -2531,9 +2529,12 @@ void OpDispatchBuilder::BTOp(OpcodeArgs, uint32_t SrcIndex, BTAction Action) {
+     // Extract Signed offset
+     Src = Src.Sbfe(3, Size - 3);
+ 
+-    // Get the address offset by shifting out the size of the op (To shift out the bit selection)
+-    // Then use that to index in to the memory location by size of op
+-    AddressMode Address = {.Base = Dest, .Index = Src.Ref(), .AddrSize = OpSize::i64Bit};
++    // The signed byte displacement belongs before address-size truncation and segment addition.
++    const auto DestAddress = DecodeAddress(Op, Op->Dest, MemoryAccessType::DEFAULT, true);
++    AddressMode Address = {.Segment = DestAddress.Segment,
++                           .Base = LoadEffectiveAddress(this, DestAddress, GetGPROpSize(), false, true),
++                           .Index = Src.Ref(),
++                           .AddrSize = DestAddress.AddrSize};
+ 
+     switch (Action) {
+     case BTAction::BTNone: {
+diff --git a/unittests/32Bit_ASM/FEX_bugs/BitTestMemoryAddress.asm b/unittests/32Bit_ASM/FEX_bugs/BitTestMemoryAddress.asm
+new file mode 100644
+index 000000000..272dbfcb5
+--- /dev/null
++++ b/unittests/32Bit_ASM/FEX_bugs/BitTestMemoryAddress.asm
+@@ -0,0 +1,130 @@
++%ifdef CONFIG
++{
++  "RegData": {
++    "RAX": "0x2",
++    "RBX": "0x17D992",
++    "RCX": "0x1",
++    "RDX": "0x0",
++    "RBP": "0x64",
++    "RSI": "0xA5A50009",
++    "RDI": "0x5A5A0028"
++  },
++  "MemoryRegions": {
++    "0x10000": "4096",
++    "0x10000000": "4096",
++    "0xffff0000": "4096"
++  },
++  "Mode": "32BIT"
++}
++%endif
++
++; Register bit indices add a signed byte displacement to the effective address
++; before address-size wrapping and segment addition. Immediate indices are masked.
++; An absent offset base must not become an Invalid IR value in arithmetic.
++mov dword [0x10000000], 2
++mov dword [0x10000004], 1
++xor ebx, ebx
++
++bt dword [0x10000000], 1
++adc ebx, ebx
++bts dword [0x10000000], 3
++adc ebx, ebx
++btr dword [0x10000000], 1
++adc ebx, ebx
++btc dword [0x10000000], 3
++adc ebx, ebx
++mov edx, [0x10000000]
++
++mov esi, 32
++bt dword [0x10000000], esi
++adc ebx, ebx
++mov dword [0x10000000], 2
++mov esi, -31
++bt dword [0x10000004], esi
++adc ebx, ebx
++bt word [0x10000000], 1
++adc ebx, ebx
++
++; Dynamic byte offsets must reach both scalar TSO loads and stores.
++mov dword [0x10000008], 0
++mov esi, 64
++bts dword [0x10000000], esi
++adc ebx, ebx
++bt dword [0x10000000], esi
++adc ebx, ebx
++btc dword [0x10000000], esi
++adc ebx, ebx
++btr dword [0x10000000], esi
++adc ebx, ebx
++mov esi, -64
++bts dword [0x10000010], esi
++adc ebx, ebx
++bt dword [0x10000010], esi
++adc ebx, ebx
++btr dword [0x10000010], esi
++adc ebx, ebx
++btc dword [0x10000010], esi
++adc ebx, ebx
++
++; Locked updates use the same signed byte displacement.
++mov dword [0x10000008], 0
++mov esi, 64
++lock bts dword [0x10000000], esi
++adc ebx, ebx
++lock btc dword [0x10000000], esi
++adc ebx, ebx
++lock btr dword [0x10000000], esi
++adc ebx, ebx
++mov esi, -64
++lock bts dword [0x10000010], esi
++adc ebx, ebx
++lock btr dword [0x10000010], esi
++adc ebx, ebx
++lock btc dword [0x10000010], esi
++adc ebx, ebx
++
++; Keep each update's bit distinct so final memory proves every wrapped write.
++mov dword [0x10000], 0xA5A50002
++mov dword [0xffff0000], 0x5A5A0004
++xor ebp, ebp
++
++; Unlocked overflow: 0xffff0000 + (0x00100003 >> 3) wraps to 0x10000.
++mov edi, 0xffff0000
++mov ecx, 0x00100003
++bts dword [edi], ecx
++adc ebp, ebp
++bt dword [edi], ecx
++adc ebp, ebp
++
++; Unlocked underflow: 0x10000 + (-0x00100000 >> 3) wraps to 0xffff0000.
++mov edi, 0x10000
++mov ecx, -0x00100000 + 2
++btr dword [edi], ecx
++adc ebp, ebp
++bt dword [edi], ecx
++adc ebp, ebp
++
++; Locked overflow must wrap before the atomic address is materialized.
++mov edi, 0xffff0000
++mov ecx, 0x00100000
++lock bts dword [edi], ecx
++adc ebp, ebp
++mov ecx, 0x00100001
++lock btc dword [edi], ecx
++adc ebp, ebp
++
++; Locked negative indices must wrap underflow through the same address stage.
++mov edi, 0x10000
++mov ecx, -0x00100000 + 5
++lock bts dword [edi], ecx
++adc ebp, ebp
++mov ecx, -0x00100000 + 3
++lock btc dword [edi], ecx
++adc ebp, ebp
++
++; CF sequence is 0,1,1,0,0,1,0,0; full dwords also check untouched bits.
++mov esi, [0x10000]
++mov edi, [0xffff0000]
++mov eax, [0x10000000]
++mov ecx, [0x10000004]
++hlt

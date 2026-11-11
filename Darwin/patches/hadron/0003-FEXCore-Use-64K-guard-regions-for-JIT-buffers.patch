@@ -9,20 +9,12 @@ macOS) a 4K guard page that shares a host page with usable memory is
 mapped accessible, so a JIT buffer overflow went undetected. Size the
 usable range to end on a guard-size boundary so the guard covers whole
 host pages.
----
- FEXCore/Source/Interface/Core/JIT/JIT.cpp                 | 8 +++++---
- FEXCore/include/FEXCore/Utils/ThreadPoolAllocator.h       | 6 +++---
- FEXCore/include/FEXCore/Utils/TypeDefines.h               | 4 ++++
- .../LinuxEmulation/LinuxSyscalls/SignalDelegator.cpp      | 2 +-
- Source/Windows/Common/CallRetStack.h                      | 5 +----
- Source/Windows/Common/JITGuardPage.h                      | 4 ++--
- 6 files changed, 16 insertions(+), 13 deletions(-)
 
 diff --git a/FEXCore/Source/Interface/Core/JIT/JIT.cpp b/FEXCore/Source/Interface/Core/JIT/JIT.cpp
-index ef7e33299..4d084df4a 100644
+index 435afed5ef93d3b75a9942233110dfa8b2a154dc..640bb6d6963604e473d1aad8bcc4fd92cf35020d 100644
 --- a/FEXCore/Source/Interface/Core/JIT/JIT.cpp
 +++ b/FEXCore/Source/Interface/Core/JIT/JIT.cpp
-@@ -913,14 +913,16 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
+@@ -889,14 +889,16 @@ CPUBackend::CompiledCode Arm64JITCore::EmitJITCode(uint64_t Entry, uint64_t Size
    CodeData.EntryPoints.clear();
  
    // Fairly excessive buffer range to make sure we don't overflow
@@ -43,7 +35,7 @@ index ef7e33299..4d084df4a 100644
    SetBuffer(TempCodeBuffer, UsableBufferRange);
  
 diff --git a/FEXCore/include/FEXCore/Utils/ThreadPoolAllocator.h b/FEXCore/include/FEXCore/Utils/ThreadPoolAllocator.h
-index 69e410c1f..bdcfd22a8 100644
+index 69e410c1f7fc438ceafb8e7634a2f5c41eddccb4..bdcfd22a8505ebaf4367060805f24c38bba63efa 100644
 --- a/FEXCore/include/FEXCore/Utils/ThreadPoolAllocator.h
 +++ b/FEXCore/include/FEXCore/Utils/ThreadPoolAllocator.h
 @@ -405,7 +405,7 @@ private:
@@ -67,7 +59,7 @@ index 69e410c1f..bdcfd22a8 100644
        LogMan::Msg::EFmt("Failed to mprotect last page of code buffer.");
      }
 diff --git a/FEXCore/include/FEXCore/Utils/TypeDefines.h b/FEXCore/include/FEXCore/Utils/TypeDefines.h
-index ec03ac6cd..9162f9d86 100644
+index ec03ac6cd3c4cd8ef2560be3cd9e3f4e87b1fc45..9162f9d86286bca671b21a3ed9bd9d68227b062a 100644
 --- a/FEXCore/include/FEXCore/Utils/TypeDefines.h
 +++ b/FEXCore/include/FEXCore/Utils/TypeDefines.h
 @@ -7,6 +7,10 @@ namespace FEXCore::Utils {
@@ -82,10 +74,10 @@ index ec03ac6cd..9162f9d86 100644
  constexpr size_t FEX_PAGE_MASK = ~(FEX_PAGE_SIZE - 1);
  } // namespace FEXCore::Utils
 diff --git a/Source/Tools/LinuxEmulation/LinuxSyscalls/SignalDelegator.cpp b/Source/Tools/LinuxEmulation/LinuxSyscalls/SignalDelegator.cpp
-index 6d6c899f7..724821768 100644
+index b4c7b24b3798e904046d75a9daff1e8adc172df3..8c4d8be5c08b0fe27505901173e0615c3db07a4c 100644
 --- a/Source/Tools/LinuxEmulation/LinuxSyscalls/SignalDelegator.cpp
 +++ b/Source/Tools/LinuxEmulation/LinuxSyscalls/SignalDelegator.cpp
-@@ -578,7 +578,7 @@ bool SignalDelegator::HandleFrontendSIGSEGV(FEXCore::Core::InternalThreadState*
+@@ -592,7 +592,7 @@ bool SignalDelegator::HandleFrontendSIGSEGV(FEXCore::Core::InternalThreadState*
  #ifdef ARCHITECTURE_arm64
    if (Signal == SIGSEGV && SigInfo.si_code == SEGV_ACCERR && Thread->JITGuardPage &&
        SigInfo.si_addr >= reinterpret_cast<void*>(Thread->JITGuardPage) &&
@@ -95,7 +87,7 @@ index 6d6c899f7..724821768 100644
                                                      ArchHelpers::Context::GetArmGPRs(UContext), ArchHelpers::Context::GetArmFPRs(UContext),
                                                      ArchHelpers::Context::GetArmPc(UContext));
 diff --git a/Source/Windows/Common/CallRetStack.h b/Source/Windows/Common/CallRetStack.h
-index c7c1fb01e..ece1b5e05 100644
+index c7c1fb01ed8eb3aa6077c97adf4b13fffcfd6169..ece1b5e053c5779bc0774712800924512fcdd1f9 100644
 --- a/Source/Windows/Common/CallRetStack.h
 +++ b/Source/Windows/Common/CallRetStack.h
 @@ -7,10 +7,7 @@
@@ -111,7 +103,7 @@ index c7c1fb01e..ece1b5e05 100644
  struct CallRetStackInfo {
    uint64_t AllocationBase;
 diff --git a/Source/Windows/Common/JITGuardPage.h b/Source/Windows/Common/JITGuardPage.h
-index 007d49892..36c4d35dd 100644
+index 007d4989258a70a6f1d35dd0a51db081aa12179e..36c4d35dd08abc8dbc0e1060206ced213645cdef 100644
 --- a/Source/Windows/Common/JITGuardPage.h
 +++ b/Source/Windows/Common/JITGuardPage.h
 @@ -5,13 +5,13 @@
@@ -130,6 +122,3 @@ index 007d49892..36c4d35dd 100644
  
  static inline bool HandleJITGuardPage(FEXCore::Core::InternalThreadState* Thread, void* Address, uint64_t* GPRs, __uint128_t* FPRs, uint64_t* PC) {
    if (IsAddressInJITGuardPage(Thread->JITGuardPage, reinterpret_cast<uintptr_t>(Address))) {
--- 
-2.54.0 (Apple Git-157)
-

@@ -1,8 +1,8 @@
 {
   "upstream": {
     "repository": "https://github.com/FEX-Emu/FEX.git",
-    "tag": "FEX-2610",
-    "commit": "14c92681f4d62cf84d901460e0358de09c8847a7",
+    "tag": "FEX-2611",
+    "commit": "e3b30dda25342362588ed1096494bea019cde4cd",
     "license": "patches/FEX-LICENSE"
   },
   "packaging": {
@@ -32,75 +32,223 @@
   "patches": [
     {
       "path": "hadron/0001-Windows-UnixLib-Build-on-macOS.patch",
-      "sha256": "1d95ebfbe29b290e8a1f1b11218b6797588a4a1464ba8a4c038ba8e2dccb3086"
+      "sha256": "e6eced536d5fe278fb0cb3da244fa59f1065a81d7f320541d3baafaddc400dea"
     },
     {
       "path": "hadron/0002-Windows-Use-64K-guard-regions-for-the-call-ret-stack.patch",
-      "sha256": "b8af568cec0273043d4d7f407e860da94201e0f820f9501d00928de3c3a9058b"
+      "sha256": "0c9c8ec1eb86974082f58eaee07c0a760a84020ed7de716ee7f5fa4abeca21cb"
     },
     {
       "path": "hadron/0003-FEXCore-Use-64K-guard-regions-for-JIT-buffers.patch",
-      "sha256": "fc35ae7000107042a0a5e0b3e8f94ee7b4b6a2f8553a5a3b49cf2f9a61721e98"
+      "sha256": "d2e1e8e7513854e018b685fe38e185ac086ca72d835f80f1f6446c111d574193"
     },
     {
       "path": "hadron/0004-Windows-UnixLib-Use-thread_set_x86_64_compat-for-har.patch",
-      "sha256": "053830f17f3704a3a9faf0d08ef1282b95c60d52b5e97c68c5853542ec549b82"
+      "sha256": "8012ac1826dc827083d35503f644dff0f3e70dddd4607f6729dbb75c60493dff"
     },
     {
       "path": "hadron/0005-Windows-Use-per-thread-W-X-JIT-code-buffers-on-macOS.patch",
-      "sha256": "9d6c049b640d6d1eac524fbeb4455218c64fd1f7dc084bc43d64a0a531400aed"
+      "sha256": "28d0facc367cffbcb2ef441cbb1d90c4d4147c57cc9cca2949fd12bf08e76c07"
     },
     {
-      "path": "local/0001-Windows-Key-disk-cache-after-hardware-TSO-detection.patch",
-      "sha256": "479d9611589d293b6405cdabe1338540f09478dc0a1ef98719d4d2e83d4e1909"
+      "path": "local/bug-fixes/0046-crc-byte-input-semantics.patch",
+      "sha256": "be40a57d9019b87df924a661f4b9b47592a93fcfbfd5f9d03d23f6bd8eeb0ce3"
     },
     {
-      "path": "local/0002-Windows-Enable-cache-and-hardware-TSO-defaults.patch",
-      "sha256": "41143ae072058fdbe2eb568a6a27120eb86d82aa95431f1808143f6fa2ad5ea4"
+      "path": "local/defaults/0001-disk-cache-default-enabled.patch",
+      "sha256": "27eb51c37540cf921e7af63956686695b6303d75db29fa50191968bf00840ece"
     },
     {
-      "path": "local/0003-FEX-Harden-toolchain-and-portable-utilities.patch",
-      "sha256": "dab932695e95326df71c4165daa428bf87e56de339a888f2347262fc4c800eaa"
+      "path": "local/defaults/0002-hide-hypervisor-default-enabled.patch",
+      "sha256": "e36989bdf28eeb1cd4c36dcee898789b10e80c663856c0b6663a9d7ba0e3a4e0"
     },
     {
-      "path": "local/0004-FEX-Preserve-32-bit-address-semantics.patch",
-      "sha256": "a863e2ee55e3d1d223a6a25963750d99a3076123f5f6293fbfbe038da349da7d"
+      "path": "local/bug-fixes/0002-nested-jit-write-mode-restoration.patch",
+      "sha256": "7253a9d0cf4bc8c1014b89733050e9eb51d4ac6a936a0ba48bd49af984e7e097"
     },
     {
-      "path": "local/0005-FEX-Improve-x86-instruction-lowering.patch",
-      "sha256": "d37ec935724ebd8f34c6c08890e0d44ea1d459c50425073d695222505ce37ba8"
+      "path": "local/bug-fixes/0003-jit-buffer-guard-size.patch",
+      "sha256": "0d9275f7c432c505b85c68e0d5d58a2d367a0fd26a7f0505d72729efdd41695d"
     },
     {
-      "path": "local/0006-FEX-Optimize-IR-and-register-allocation.patch",
-      "sha256": "d8d6d90e14d2165779fef64f15e7eaebf18baa24bc2eb40a926eb4a252e30e52"
+      "path": "local/bug-fixes/0004-shared-jit-buffer-publication.patch",
+      "sha256": "c2c273c5e30c009bf8984da356c82baaedffe59e0362ff98bc38bf4b204a121f"
     },
     {
-      "path": "local/0007-FEX-Optimize-REP-string-operations.patch",
-      "sha256": "c4efe7685288ef3b7192cc5b34a91c17bf0d4f4981939e6b820cf9adc07deced"
+      "path": "local/bug-fixes/0005-darwin-code-cache-namespace.patch",
+      "sha256": "f6a458f148b1a6d8a391c48626b5e16b592230fe4af04f77ed5fe1ad15a9dd6f"
     },
     {
-      "path": "local/0008-Windows-Optimize-native-dispatch-and-exceptions.patch",
-      "sha256": "92035d90fd6191b6373a43534f116b816cf1dfaef1f5550eaa6fc2680131c9be"
+      "path": "local/bug-fixes/0001-effective-hardware-tso-cache-identity.patch",
+      "sha256": "6d4647e211e77bcfeec064d767e54d69a2b28468a810d7d6ba6db18fca3c5f26"
     },
     {
-      "path": "local/0009-FEX-Optimize-Hadron-JIT-memory-and-invalidation.patch",
-      "sha256": "2ce99094f7c9fbc99bcc040fa6bffb8d6496cada7cac19db28daa78d0432e0e0"
+      "path": "local/defaults/0003-hardware-tso-default-enabled.patch",
+      "sha256": "679bbb001421bf6c33f32ee8ac1e654fc679b1e19ad5ee5d408f0dd8f7ec6df9"
     },
     {
-      "path": "local/0010-Windows-Optimize-disk-cache-and-TSO-identity.patch",
-      "sha256": "57cbc800ee09b3491e502e612e5160ee8fec08d5ec14e8a94bd4be348bd80fbc"
+      "path": "local/bug-fixes/0006-packed-cache-relocation-bounds.patch",
+      "sha256": "58a94e3360d85ce6640de834d536b306a431950912b62c9058e54931ee1b3621"
     },
     {
-      "path": "local/0011-FEX-Fix-scalar-TSO-bit-index-addresses.patch",
-      "sha256": "200e362e573dd651904da8011c1345db918a61a115ffe26fe0907f04fd0081a0"
+      "path": "local/bug-fixes/0007-disk-cache-file-and-blob-bounds.patch",
+      "sha256": "960e8118cc436f607d3d08324352024ad0d63cdca33cd2fe4ac1e77317172669"
+    },
+    {
+      "path": "local/bug-fixes/0008-windows-directory-utf8-paths.patch",
+      "sha256": "10488c2590b820a5ca9fe77712af2936729eea1d340ce8fe69161c66f6eb9168"
+    },
+    {
+      "path": "local/memory-lifetime/0001-directory-enumeration-buffer.patch",
+      "sha256": "850ceb17a0f780ce127c93c7dd80b9fb7eed7039144b68d0b97a634872f38f7c"
+    },
+    {
+      "path": "local/bug-fixes/0009-prune-recognized-cache-files.patch",
+      "sha256": "40bb71c6b319c8739182ebfd690ad6d874467e10b35fc2c467f11216ef1742fc"
+    },
+    {
+      "path": "local/bug-fixes/0010-disk-cache-extent-pairs.patch",
+      "sha256": "2393285eca92ee48e6c9d3087cd5d3105c0660b27bb76a68b2515c4bf2f31cbf"
+    },
+    {
+      "path": "local/bug-fixes/0011-memory-cache-blob-header.patch",
+      "sha256": "a18c9fcf9f521c58ae56ad58561d0527a096ac7b8fd8a7a8d44ad1cdb015362b"
+    },
+    {
+      "path": "local/bug-fixes/0012-disk-cache-footprint-identity.patch",
+      "sha256": "76fc805c6fdb25c970ac6f2149476452a396b9caaecc32c21edee1f59b027079"
+    },
+    {
+      "path": "local/memory-lifetime/0002-disk-cache-owned-work-and-eviction.patch",
+      "sha256": "3cfb2d4d4fd7e85131158c99fe9e383a5c9dfd423ebd0fcae6deace77022f07f"
+    },
+    {
+      "path": "local/optimizations/0001-lookup-l2-allocation.patch",
+      "sha256": "7cc913f31a855f089e274673bc71d983a31a6a561c266e1f7427f60c1fd695fa"
+    },
+    {
+      "path": "local/bug-fixes/0013-lookup-tag-validity.patch",
+      "sha256": "000f76213eac5eb062d248e5c75a929e9c5f1e4a5b6d55a30c9505b580ffb558"
+    },
+    {
+      "path": "local/bug-fixes/0015-arm64ec-xstate-context-transfer.patch",
+      "sha256": "d40b4f25479c61c0d25e4b8ee4bcbb027fb091749a93e01e011d1a3540f028d1"
+    },
+    {
+      "path": "local/bug-fixes/0016-arm64ec-exception-carried-flags.patch",
+      "sha256": "a93394216a9f509947e80c57ceb858de1738f975c77b45a06fa14c165d435cc5"
+    },
+    {
+      "path": "local/bug-fixes/0019-wow64-address-wrapping.patch",
+      "sha256": "bd1a22c630bc5a13a261abe55d98d7e7a7e8b85c75e78d22ff221220abacae56"
+    },
+    {
+      "path": "local/bug-fixes/0020-effective-address-wrap-once.patch",
+      "sha256": "0cf446a5463cccdcc66e1c69a45f3ec5cc192c199d24fda5185bf37db3b473f1"
+    },
+    {
+      "path": "local/bug-fixes/0021-x87-store-complete-address.patch",
+      "sha256": "aaffaa6da3bc8c6ddc1fabaeabbcf8e3363bb81ab4fe11586b6c656d9a214964"
+    },
+    {
+      "path": "local/bug-fixes/0022-wine-shared-data-reads.patch",
+      "sha256": "71808480342d86db1306a48a9b007fd92d7cd0d2199dbfa7deadf5dceddcc3b5"
+    },
+    {
+      "path": "local/bug-fixes/0023-vector-tso-lowering.patch",
+      "sha256": "9c00b384ef05303c2ccf084f0fd00192f0b1ec6487988434743430f8559076e5"
+    },
+    {
+      "path": "local/bug-fixes/0024-pair-memory-complete-address.patch",
+      "sha256": "05d8b4f22abff22e182ad5f4e9e271a1ac24382c75b6c816a1fdbaff0f68e646"
+    },
+    {
+      "path": "local/bug-fixes/0025-volatile-tso-range-contract.patch",
+      "sha256": "caab956827a02430736952d544f8b1297b70a12e6477236bc216f7b690836fcb"
+    },
+    {
+      "path": "local/bug-fixes/0026-fault-visible-guest-state.patch",
+      "sha256": "71c09b3994159f7b6cadc2c7776274cef851f97d45defc530691dee2c5ab119c"
+    },
+    {
+      "path": "local/bug-fixes/0027-lse-cmpxchg-full-ordering.patch",
+      "sha256": "172672a0568defc2b08241ea8fad6584b12b99569f09816b8475edc135d78f9d"
+    },
+    {
+      "path": "local/bug-fixes/0028-llsc-cmpxchg-fault-contract.patch",
+      "sha256": "c6a875e45016c7beae28b85c1c55de2b83c886402f8b561bceb5aa33efd2fcc7"
+    },
+    {
+      "path": "local/regressions/0001-fxrstor-top.patch",
+      "sha256": "0670f907995b2f6f7f1472c69190ac76c62eab0c5b7a1e7935b88b5d32865523"
+    },
+    {
+      "path": "local/bug-fixes/0031-xrstor-component-state.patch",
+      "sha256": "4703443f0f2eccee19c49bff074e7084873968b69beb4bffb7d80487c8577014"
+    },
+    {
+      "path": "local/bug-fixes/0035-alu-forwarded-constant-width.patch",
+      "sha256": "2993d23754ff44605e574ccca5c2f5346a77356c78398d2e2a53c1504f6548a7"
+    },
+    {
+      "path": "local/bug-fixes/0037-smc-crc-validation.patch",
+      "sha256": "f89e09b6363508322f6cc15aa0e393096794fcda089fa5798807d2c5195b7ff7"
+    },
+    {
+      "path": "local/bug-fixes/0038-darwin-writable-code-smc-policy.patch",
+      "sha256": "f78cb838ecef6bfaad8cb89908b552ff62edb7faaecddc1c1ee78f6314fff83c"
+    },
+    {
+      "path": "local/bug-fixes/0039-jit-recompile-debug-metadata.patch",
+      "sha256": "28ad1e6ed944a9ea49a8f66aa03080f78706a63ae1e1f75bb0666ea4df3c8d06"
+    },
+    {
+      "path": "local/bug-fixes/0040-callret-invalidation-safety.patch",
+      "sha256": "1e1b6f38e69c38ada9d60f976be17e7e2fd547d61981581cde7deaa2f5c815dc"
+    },
+    {
+      "path": "local/bug-fixes/0041-memory-notification-pairing.patch",
+      "sha256": "9b2332cee77a83ca2858a1e8d7ca84fc543194c637a189c01efeca71c33d92b9"
+    },
+    {
+      "path": "local/memory-lifetime/0003-block-link-arena-lifetime.patch",
+      "sha256": "7d2f25eb4274e8029cf398f2a81ee7db1724f5c308f4f915057b22abc026bb76"
     },
     {
       "path": "arknights-macos-runtime/0001-arm64ec-restore-carried-eflags.patch",
-      "sha256": "6f4ebc271f043deac6a6938a1980fbe77bb34f09160a1079dabd40982b03d89b"
+      "sha256": "b9fdd82661aee4a2c9afcf065caefaf71a79d827bf4863e59fc2a78706c3d935"
     },
     {
-      "path": "local/0012-FEX-Preserve-fault-state-and-valid-arithmetic-immediates.patch",
-      "sha256": "94ffb080bd2cceb244152c43f33ebf94ea7af93dd4dc3dcb44550f5597c4c412"
+      "path": "local/bug-fixes/0042-cache-directory-reparse-points.patch",
+      "sha256": "48b66670751514532ff90206ba0ba675d1091c76dd4b744516efcd76c35b2a86"
+    },
+    {
+      "path": "local/bug-fixes/0043-failed-unmap-tracking.patch",
+      "sha256": "86fcfa011678e948365faf273c86ffdf3482a2731b5402ca39a7f354b0091ac5"
+    },
+    {
+      "path": "local/memory-lifetime/0004-thread-heap-retirement.patch",
+      "sha256": "e5f745ab972dc8dc7df91bad71be404f4bd890333e9b43ef9c14a7dc87deff12"
+    },
+    {
+      "path": "local/bug-fixes/0044-dep-promotion-lifetime.patch",
+      "sha256": "df5a0c1b34b9afe8d95d7e6c43398e8703d43d205c8e2f3b30cc277a5ce69b4d"
+    },
+    {
+      "path": "local/memory-lifetime/0005-disk-cache-mapping-lifetime.patch",
+      "sha256": "dfad93c44dfe32361be363276ccd872aafc47a392bafa80a95e6f5bcd59b5ad6"
+    },
+    {
+      "path": "local/optimizations/0003-full-cache-serialization.patch",
+      "sha256": "27e233cfa3bffa9c9520fe44144eb76a3abfe2e48c015a161b0abcde7556497b"
+    },
+    {
+      "path": "local/optimizations/0004-duplicate-alu-ir.patch",
+      "sha256": "3bf906ef7cf2583516fc09bc7eef0a68d8d909a22502ecb985761f3ac55ad0e1"
+    },
+    {
+      "path": "local/bug-fixes/0045-popf-cached-successor-single-step.patch",
+      "sha256": "419edf6fdc1e674dd9e251add0becd0d0d027f79fca251344451b62093bfdabc"
     }
   ],
   "wineCompanionPatches": [
@@ -110,5 +258,5 @@
       "base": "Wine 11.20 with paired PF/AF/DF transport"
     }
   ],
-  "appliedSourceTree": "ca8a669addd2c9c257a1ad19c9aeee7f6ea80d43"
+  "appliedSourceTree": "133e17a807c302fa1b2e44c92f3a0505c2502a4f"
 }

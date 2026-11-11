@@ -1,0 +1,25 @@
+Subject: [PATCH] block link arena lifetime
+
+Release owned block-link arena mappings on destruction.
+
+Source: local macOS Wine queue; see ../../README.md for ancestry and dependencies.
+License: ../LICENSE (MIT)
+
+diff --git a/FEXCore/include/FEXCore/fextl/memory_resource.h b/FEXCore/include/FEXCore/fextl/memory_resource.h
+index 686feec9f47941baecb0228c9576dc816da736cb..27798813775cef13b762d5b33ae33b1f2fddc567 100644
+--- a/FEXCore/include/FEXCore/fextl/memory_resource.h
++++ b/FEXCore/include/FEXCore/fextl/memory_resource.h
+@@ -38,6 +38,13 @@ namespace pmr {
+     explicit named_monotonic_page_buffer_resource(const char* Name)
+       : Name {Name} {}
+ 
++    ~named_monotonic_page_buffer_resource() override {
++      release();
++    }
++
++    named_monotonic_page_buffer_resource(const named_monotonic_page_buffer_resource&) = delete;
++    named_monotonic_page_buffer_resource& operator=(const named_monotonic_page_buffer_resource&) = delete;
++
+     void release() noexcept {
+       for (auto& Iter : Buffers) {
+         FEXCore::Allocator::VirtualFree(Iter.Buffer, Iter.BufferSize);

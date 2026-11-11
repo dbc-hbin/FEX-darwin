@@ -1,0 +1,103 @@
+Subject: [PATCH] failed unmap tracking
+
+Preserve executable tracking when a paired unmap fails.
+
+Source: local macOS Wine queue; see ../../README.md for ancestry and dependencies.
+License: ../LICENSE (MIT)
+
+diff --git a/Source/Windows/ARM64EC/Module.cpp b/Source/Windows/ARM64EC/Module.cpp
+index 40f207ec..1aaa80e0 100644
+--- a/Source/Windows/ARM64EC/Module.cpp
++++ b/Source/Windows/ARM64EC/Module.cpp
+@@ -1226,7 +1226,7 @@ void NotifyUnmapViewOfSection(void* Address, BOOL After, NTSTATUS Status) {
+   if (!After) {
+     InvalidationTracker->BeginUnmap(ThreadCreationMutex, GetPendingMemoryChange(), reinterpret_cast<uint64_t>(Address), HandleImageUnmap);
+   } else {
+-    InvalidationTracker->EndUnmap(ThreadCreationMutex, GetPendingMemoryChange(), !Status);
++    InvalidationTracker->EndUnmap(ThreadCreationMutex, GetPendingMemoryChange(), !Status, HandleImageUnmap);
+   }
+ }
+ 
+diff --git a/Source/Windows/Common/InvalidationTracker.h b/Source/Windows/Common/InvalidationTracker.h
+index 1099c333..eb9b4355 100644
+--- a/Source/Windows/Common/InvalidationTracker.h
++++ b/Source/Windows/Common/InvalidationTracker.h
+@@ -49,7 +49,7 @@ public:
+   // Per-thread state carried from the Before to the After callback of one memory notification.
+   struct PendingMemoryChange {
+     bool Locked {};
+-    ContainingSection Unmapped {}; // Section of an unlocked unmap
++    ContainingSection Unmapped {}; // Section captured before a paired unmap
+   };
+ 
+   // Brackets an alloc/protect/free notification. `Mutex` is the frontend lock that serializes executable tracking.
+@@ -80,43 +80,36 @@ public:
+     }
+   }
+ 
+-  // Brackets an unmap notification like Begin/EndMemoryChange. Images and sections intersecting executable intervals
+-  // are invalidated and passed to `ImageUnmap` in the Before callback, with `Mutex` held until the After callback.
++  // Paired unmaps retain tracking until success, with Mutex held across the change so a replacement cannot
++  // change the containing section's bounds or executability between the query and the unmap.
++  // Unpaired cross-process notifications retain their immediate invalidation path.
+   template<typename MutexType, typename ImageUnmapType>
+   void BeginUnmap(MutexType& Mutex, PendingMemoryChange* Pending, uint64_t Address, ImageUnmapType&& ImageUnmap) {
+-    const auto Section = QueryContainingSection(Address);
+-    if (Pending && !Section.Image && !(Section.SectionSize && MayAffectExecutable(Section.SectionStart, Section.SectionSize, PAGE_NOACCESS))) {
+-      Pending->Unmapped = Section;
+-      return;
+-    }
+-
+     if (Pending) {
+       BeginLockedChange(Mutex, Pending);
+-    } else {
+-      Mutex.lock();
++      Pending->Unmapped = QueryContainingSection(Address);
++      return;
+     }
++
++    std::scoped_lock Lock(Mutex);
++    const auto Section = QueryContainingSection(Address);
+     if (Section.SectionSize) {
+       InvalidateSection(Section);
+       ImageUnmap(Section.SectionStart, Section.SectionSize);
+     }
+-    if (!Pending) {
+-      Mutex.unlock();
+-    }
+   }
+ 
+-  template<typename MutexType>
+-  void EndUnmap(MutexType& Mutex, PendingMemoryChange* Pending, bool Succeeded) {
++  template<typename MutexType, typename ImageUnmapType>
++  void EndUnmap(MutexType& Mutex, PendingMemoryChange* Pending, bool Succeeded, ImageUnmapType&& ImageUnmap) {
+     if (!Pending) {
+       return;
+     }
+-    if (Pending->Locked) {
+-      EndLockedChange(Mutex, Pending);
+-      return;
+-    }
+     const auto Section = std::exchange(Pending->Unmapped, {});
+     if (Succeeded && Section.SectionSize) {
+-      ResyncUnlockedChange(Mutex, Section.SectionStart, Section.SectionSize, PAGE_NOACCESS);
++      InvalidateSection(Section);
++      ImageUnmap(Section.SectionStart, Section.SectionSize);
+     }
++    EndLockedChange(Mutex, Pending);
+   }
+ 
+ private:
+diff --git a/Source/Windows/WOW64/Module.cpp b/Source/Windows/WOW64/Module.cpp
+index 2d68eff7..384b4a37 100644
+--- a/Source/Windows/WOW64/Module.cpp
++++ b/Source/Windows/WOW64/Module.cpp
+@@ -959,7 +959,7 @@ void BTCpuNotifyUnmapViewOfSection(void* Address, BOOL After, ULONG Status) {
+   if (!After) {
+     InvalidationTracker->BeginUnmap(ThreadCreationMutex, GetPendingMemoryChange(), reinterpret_cast<uint64_t>(Address), HandleImageUnmap);
+   } else {
+-    InvalidationTracker->EndUnmap(ThreadCreationMutex, GetPendingMemoryChange(), !Status);
++    InvalidationTracker->EndUnmap(ThreadCreationMutex, GetPendingMemoryChange(), !Status, HandleImageUnmap);
+   }
+ }
+ 

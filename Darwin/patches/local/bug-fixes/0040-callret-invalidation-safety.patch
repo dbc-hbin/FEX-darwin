@@ -1,0 +1,131 @@
+Subject: [PATCH] callret invalidation safety
+
+Invalidate call-return caches safely for internal threads and suppress decommit callback reentry.
+
+Source: local macOS Wine queue; see ../../README.md for ancestry and dependencies.
+License: ../LICENSE (MIT)
+
+diff --git a/FEXCore/Source/Interface/Context/Context.h b/FEXCore/Source/Interface/Context/Context.h
+index 648c65ee6cf4e8009d026e43e92da7204a5bcae5..7fd5ed8781fde17bbd009e120d99226aa58b3421 100644
+--- a/FEXCore/Source/Interface/Context/Context.h
++++ b/FEXCore/Source/Interface/Context/Context.h
+@@ -230,6 +230,7 @@ public:
+   void ClearCodeCache(FEXCore::Core::InternalThreadState* Thread, bool NewCodeBuffer = true) override;
+   void InvalidateCodeBuffersCodeRange(uint64_t Start, uint64_t Length) override;
+   void InvalidateThreadCachedCodeRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) override;
++  void InvalidateCallRetStack(FEXCore::Core::InternalThreadState* Thread);
+   FEXCore::Utils::WritePriorityMutex::Mutex& GetCodeInvalidationMutex() override {
+     return CodeInvalidationMutex;
+   }
+diff --git a/FEXCore/Source/Interface/Core/Core.cpp b/FEXCore/Source/Interface/Core/Core.cpp
+index df9d26520651618dfbc879161db40712c5a7cbd0..544074c88f9354bf30c734b5bb0034acc82a3f31 100644
+--- a/FEXCore/Source/Interface/Core/Core.cpp
++++ b/FEXCore/Source/Interface/Core/Core.cpp
+@@ -502,7 +502,7 @@ void ContextImpl::ClearCodeCache(FEXCore::Core::InternalThreadState* Thread, boo
+     auto lk = Thread->LookupCache->AcquireWriteLock();
+     Thread->LookupCache->ClearCache(lk);
+   }
+-  Allocator::VirtualDontNeed(Thread->CallRetStackBase, FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE);
++  InvalidateCallRetStack(Thread);
+ }
+ 
+ static void IRDumper(FEXCore::Core::InternalThreadState* Thread, IR::IREmitter* IREmitter, uint64_t GuestRIP) {
+@@ -1074,11 +1074,19 @@ void ContextImpl::InvalidateThreadCachedCodeRange(FEXCore::Core::InternalThreadS
+   if (Thread->LookupCache->InvalidateCacheRange(Start, Length)) {
+     FEXCORE_PROFILE_SCOPED("InvalidateCallRet");
+ 
+-    // This may cause access violations in the thread on Windows as zeroing is not atomic, this is handled by the frontend
+-    Allocator::VirtualDontNeed(Thread->CallRetStackBase, FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE);
++    InvalidateCallRetStack(Thread);
+   }
+ }
+ 
++void ContextImpl::InvalidateCallRetStack(FEXCore::Core::InternalThreadState* Thread) {
++  // Threads not created by the frontend (e.g. the cache validation thread) have no call-ret stack.
++  if (!Thread->CallRetStackBase) {
++    return;
++  }
++  // This may cause access violations in a concurrently running thread as zeroing is not atomic, this is handled by the frontend
++  Allocator::VirtualDontNeed(Thread->CallRetStackBase, FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE);
++}
++
+ void ContextImpl::ThreadRemoveCodeEntryFromJit(FEXCore::Core::CpuStateFrame* Frame, uint64_t GuestRIP) {
+   static_cast<ContextImpl*>(Frame->Thread->CTX)->SyscallHandler->InvalidateGuestCodeRange(Frame->Thread, GuestRIP, 1);
+ }
+diff --git a/FEXCore/Source/Interface/Core/JIT/JIT.cpp b/FEXCore/Source/Interface/Core/JIT/JIT.cpp
+index 32d6a16677b5034e32050f79b193e646129a4045..e3ddb5f4aeedec771c888fc28aba1968f61af61d 100644
+--- a/FEXCore/Source/Interface/Core/JIT/JIT.cpp
++++ b/FEXCore/Source/Interface/Core/JIT/JIT.cpp
+@@ -837,7 +837,7 @@ CodeBuffer::CodeBufferAllocation Arm64JITCore::AllocateCodeBufferInSharedCache(s
+                                                                                                "doesn't match up!\n");
+   // Bring CodeBuffer up to date
+   if (auto Prev = CheckCodeBufferUpdate()) {
+-    Allocator::VirtualDontNeed(ThreadState->CallRetStackBase, FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE);
++    CTX->InvalidateCallRetStack(ThreadState);
+     auto lk = ThreadState->LookupCache->AcquireWriteLock();
+     ThreadState->LookupCache->ChangeGuestToHostMapping(*Prev, *CurrentCodeBuffer->LookupCache, lk);
+   }
+diff --git a/Source/Windows/ARM64EC/Module.cpp b/Source/Windows/ARM64EC/Module.cpp
+index cdb5acc072b7003886895b64357b94173b91bffd..17d9c443d3633f48411c346c319f1efbda63ba6e 100644
+--- a/Source/Windows/ARM64EC/Module.cpp
++++ b/Source/Windows/ARM64EC/Module.cpp
+@@ -362,6 +362,22 @@ void HandleImageUnmap(uint64_t Address, uint64_t Size) {
+ }
+ } // namespace
+ 
++class ScopedCallbackDisable {
++private:
++  bool Prev;
++
++public:
++  ScopedCallbackDisable() {
++    const auto CPUArea = GetCPUArea();
++    Prev = CPUArea.Area->InSyscallCallback;
++    CPUArea.Area->InSyscallCallback = true;
++  }
++
++  ~ScopedCallbackDisable() {
++    GetCPUArea().Area->InSyscallCallback = Prev;
++  }
++};
++
+ namespace Exception {
+ static std::optional<FEX::Windows::TSOHandlerConfig> HandlerConfig;
+ static uintptr_t KiUserExceptionDispatcher;
+@@ -737,9 +753,13 @@ public:
+   }
+ 
+   void InvalidateGuestCodeRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) override {
++    // Invalidating the call/return cache decommits memory. Do not reenter the
++    // memory notification callbacks while the code invalidation mutex is held.
++    ScopedCallbackDisable guard;
+     InvalidationTracker->InvalidateAlignedInterval(Start, Length, false);
+   }
+ 
++
+   void MarkOvercommitRange(uint64_t Start, uint64_t Length) override {
+     OvercommitTracker->MarkRange(Start, Length);
+   }
+@@ -860,22 +880,6 @@ NTSTATUS ProcessInit() {
+ 
+ void ProcessTerm(HANDLE Handle, BOOL After, NTSTATUS Status) {}
+ 
+-class ScopedCallbackDisable {
+-private:
+-  bool Prev;
+-
+-public:
+-  ScopedCallbackDisable() {
+-    const auto CPUArea = GetCPUArea();
+-    Prev = CPUArea.Area->InSyscallCallback;
+-    CPUArea.Area->InSyscallCallback = true;
+-  }
+-
+-  ~ScopedCallbackDisable() {
+-    GetCPUArea().Area->InSyscallCallback = Prev;
+-  }
+-};
+-
+ // Returns true if exception dispatch should be halted and the execution context restored to NativeContext
+ bool ResetToConsistentStateImpl(const ThreadCPUArea CPUArea, EXCEPTION_RECORD* Exception, CONTEXT* GuestContext, ARM64_NT_CONTEXT* NativeContext) {
+   auto Thread = CPUArea.ThreadState();

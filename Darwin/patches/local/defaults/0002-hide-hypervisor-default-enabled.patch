@@ -1,0 +1,20 @@
+Subject: [PATCH] hide hypervisor default enabled
+
+Hide the hypervisor CPUID bit by default.
+
+Source: local macOS Wine queue; see ../../README.md for ancestry and dependencies.
+License: ../LICENSE (MIT)
+
+diff --git a/FEXCore/Source/Interface/Config/Config.json.in b/FEXCore/Source/Interface/Config/Config.json.in
+index f9d3e1fba38e7a2eb1a94ff6e70f354f64dda8b8..d94c934ad2b18f6c1fd606c8f217e9db9919dc44 100644
+--- a/FEXCore/Source/Interface/Config/Config.json.in
++++ b/FEXCore/Source/Interface/Config/Config.json.in
+@@ -682,7 +682,7 @@
+       },
+       "HideHypervisorBit": {
+         "Type": "bool",
+-        "Default": "false",
++        "Default": "true",
+         "AffectsCodeGen": "false",
+         "Desc": [
+           "Hides the hypervisor CPUID bit when set.",

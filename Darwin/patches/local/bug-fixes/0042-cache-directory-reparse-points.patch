@@ -1,0 +1,113 @@
+Subject: [PATCH] cache directory reparse points
+
+Keep cache directory traversal and deletion within resolved direct children.
+
+Source: local macOS Wine queue; see ../../README.md for ancestry and dependencies.
+License: ../LICENSE (MIT)
+
+diff --git a/FEXCore/Source/Utils/FileUtils.cpp b/FEXCore/Source/Utils/FileUtils.cpp
+index b4ac70f4ce3cb2565d338af0cd7982122d525531..c57c7222a456627c07d6edd3e780dc69c8881139 100644
+--- a/FEXCore/Source/Utils/FileUtils.cpp
++++ b/FEXCore/Source/Utils/FileUtils.cpp
+@@ -23,6 +23,8 @@ extern "C" NTSTATUS WINAPI NtQueryDirectoryFile(HANDLE, HANDLE, PIO_APC_ROUTINE,
+ extern "C" NTSTATUS RtlUnicodeToUTF8N(OUT PCHAR UTF8StringDestination, IN ULONG UTF8StringMaxByteCount,
+                                       OUT PULONG UTF8StringActualByteCount, IN PCWCH UnicodeStringSource, IN ULONG UnicodeStringByteCount);
+ extern "C" NTSTATUS RtlUTF8ToUnicodeN(PWSTR, ULONG, PULONG, PCCH, ULONG);
++// Wine information class 1000 is outside MinGW's FILE_INFORMATION_CLASS enum.
++extern "C" NTSTATUS WINAPI NtQueryWineInformationFile(HANDLE, PIO_STATUS_BLOCK, PVOID, ULONG, ULONG) asm("NtQueryInformationFile");
+ #endif
+ 
+ namespace FEXCore::FileUtils {
+@@ -236,6 +238,24 @@ static inline void FreeNTPath(UNICODE_STRING Path) {
+   RtlFreeUnicodeString(&Path);
+ }
+ 
++static std::optional<fextl::string> GetWineUnixName(HANDLE Handle) {
++  // Wine's server records the resolved Unix path of an opened object.
++  // Raw Unix file symlinks are not exposed as Windows reparse points.
++  constexpr ULONG WineFileUnixNameInformation = 1000;
++  IO_STATUS_BLOCK IO {};
++  ULONG Length {};
++  const auto Status = NtQueryWineInformationFile(Handle, &IO, &Length, sizeof(Length), WineFileUnixNameInformation);
++  if (Status != STATUS_BUFFER_OVERFLOW || Length > ULONG_MAX - sizeof(Length)) {
++    return std::nullopt;
++  }
++  fextl::string Buffer(sizeof(Length) + Length, '\0');
++  if (!NT_SUCCESS(NtQueryWineInformationFile(Handle, &IO, Buffer.data(), Buffer.size(), WineFileUnixNameInformation)) ||
++      IO.Information != Buffer.size()) {
++    return std::nullopt;
++  }
++  return Buffer.substr(sizeof(Length));
++}
++
+ FEX_DEFAULT_VISIBILITY void WalkDirectory(std::string_view Directory,
+                                           fextl::move_only_function<void(std::string_view name, bool is_dir, const void* user_data)> Callback,
+                                           const void* user_data) {
+@@ -251,7 +271,8 @@ FEX_DEFAULT_VISIBILITY void WalkDirectory(std::string_view Directory,
+   IO_STATUS_BLOCK io {};
+ 
+   InitializeObjectAttributes(&attr, &*NTPath, OBJ_CASE_INSENSITIVE, nullptr, nullptr);
+-  Status = NtOpenFile(&dir_fd, FILE_LIST_DIRECTORY | SYNCHRONIZE, &attr, &io, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
++  // Hold the directory in place while callbacks operate on paths beneath it.
++  Status = NtOpenFile(&dir_fd, FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | SYNCHRONIZE, &attr, &io, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                       FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT);
+ 
+   FreeNTPath(*NTPath);
+@@ -260,6 +281,21 @@ FEX_DEFAULT_VISIBILITY void WalkDirectory(std::string_view Directory,
+     return;
+   }
+ 
++  // FILE_OPEN_REPARSE_POINT opens the link itself; it does not reject it.
++  // Query the opened object rather than checking a path that can be replaced.
++  FILE_ATTRIBUTE_TAG_INFORMATION Attributes {};
++  Status = NtQueryInformationFile(dir_fd, &io, &Attributes, sizeof(Attributes), FileAttributeTagInformation);
++  if (!NT_SUCCESS(Status) || !(Attributes.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) ||
++      (Attributes.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) {
++    NtClose(dir_fd);
++    return;
++  }
++  const auto DirectoryUnixName = GetWineUnixName(dir_fd);
++  if (!DirectoryUnixName) {
++    NtClose(dir_fd);
++    return;
++  }
++
+   BOOLEAN FirstQuery = TRUE;
+   size_t dirent_size = 4096 * 4;
+   uint8_t* dirent_buffer = reinterpret_cast<uint8_t*>(FEXCore::Allocator::malloc(dirent_size));
+@@ -310,7 +346,7 @@ FEX_DEFAULT_VISIBILITY void WalkDirectory(std::string_view Directory,
+ 
+       std::wstring_view EntryName(Info->FileName, Info->FileNameLength / sizeof(wchar_t));
+ 
+-      if (EntryName != L"." && EntryName != L"..") {
++      if (EntryName != L"." && EntryName != L".." && !(Info->FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) {
+         ULONG utf8_bytes_needed = 0;
+         ULONG actual_utf8_bytes = 0;
+         Status = RtlUnicodeToUTF8N(nullptr, 0, &utf8_bytes_needed, Info->FileName, Info->FileNameLength);
+@@ -325,8 +361,24 @@ FEX_DEFAULT_VISIBILITY void WalkDirectory(std::string_view Directory,
+             goto end;
+           }
+           std::string_view name_view(dynamic_buf, actual_utf8_bytes);
+-          bool is_dir = (Info->FileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+-          Callback(name_view, is_dir, user_data);
++          UNICODE_STRING EntryNameString {
++            static_cast<USHORT>(Info->FileNameLength), static_cast<USHORT>(Info->FileNameLength), Info->FileName};
++          OBJECT_ATTRIBUTES EntryAttributes {};
++          InitializeObjectAttributes(&EntryAttributes, &EntryNameString, OBJ_CASE_INSENSITIVE, dir_fd, nullptr);
++          HANDLE EntryHandle {};
++          Status = NtOpenFile(&EntryHandle, FILE_READ_ATTRIBUTES | SYNCHRONIZE, &EntryAttributes, &io,
++                              FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
++                              FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT);
++          if (NT_SUCCESS(Status)) {
++            const auto EntryUnixName = GetWineUnixName(EntryHandle);
++            NtClose(EntryHandle);
++            // Compare resolved handles: a hidden Unix symlink must not turn a
++            // path-based deletion into deletion of its target.
++            if (EntryUnixName && *EntryUnixName == *DirectoryUnixName + "/" + fextl::string(name_view)) {
++              bool is_dir = (Info->FileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
++              Callback(name_view, is_dir, user_data);
++            }
++          }
+           FEXCore::Allocator::free(dynamic_buf);
+         }
+       }

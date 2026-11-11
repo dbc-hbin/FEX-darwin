@@ -1,0 +1,327 @@
+Subject: [PATCH] thread heap retirement
+
+Retire the target allocator heap only after thread quiescence and teardown.
+
+Source: local macOS Wine queue; see ../../README.md for ancestry and dependencies.
+License: ../LICENSE (MIT)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 89765883ffc7a95309cd072e32fba6dedc81bf6c..dd1dbc6b910c984dc273fba68cdc6cb0ae57a469 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -380,6 +380,9 @@ endif()
+ if (ENABLE_FEX_ALLOCATOR)
+   # The rpmalloc subproject that all FEXCore fextl objects allocate through.
+   add_subdirectory(External/rpmalloc/)
++  if (MINGW)
++    set_property(TARGET rpmalloc PROPERTY SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/Source/Windows/Common/CRT/ThreadHeap.c")
++  endif()
+ elseif (NOT MINGW)
+   message (STATUS
+     " FEX allocator is disabled!\n"
+diff --git a/Source/Windows/ARM64EC/Module.cpp b/Source/Windows/ARM64EC/Module.cpp
+index adcd5e9046ca50e8bd9ca434f66f2a78be2f96bd..e6bae81e7e1be973ee6397c3774cdf7124911db0 100644
+--- a/Source/Windows/ARM64EC/Module.cpp
++++ b/Source/Windows/ARM64EC/Module.cpp
+@@ -141,6 +141,7 @@ struct ThreadCPUArea {
+ };
+ 
+ struct FrontendThreadData {
++  void* CRTHeap {};
+   bool InCrossProcessWork {};
+   FEX::Windows::InvalidationTracker::PendingMemoryChange PendingMemoryChange {};
+   bool InLockedRWXRead {};
+@@ -1312,7 +1313,7 @@ void BTCpu64NotifyReadFile(HANDLE Handle, void* Address, SIZE_T Size, BOOL After
+ 
+ NTSTATUS ThreadInit() {
+   std::scoped_lock Lock(ThreadCreationMutex);
+-  FEX::Windows::InitCRTThread();
++  auto CRTHeap = FEX::Windows::InitCRTThread();
+   const auto CPUArea = GetCPUArea();
+ 
+   static constexpr size_t EmulatorStackSize = 0x40000;
+@@ -1365,7 +1366,7 @@ NTSTATUS ThreadInit() {
+                             .AMD64_ControlWord = 0x27f};
+   Exception::LoadStateFromECContext(Thread, CPUArea.ContextAmd64().AMD64_Context);
+ 
+-  Thread->FrontendPtr = new FrontendThreadData();
++  Thread->FrontendPtr = new FrontendThreadData {CRTHeap};
+ 
+   {
+     auto ThreadTID = GetCurrentThreadId();
+@@ -1386,6 +1387,9 @@ NTSTATUS ThreadTerm(HANDLE Thread, LONG ExitCode) {
+   }
+ 
+   auto ThreadDup = FEX::Windows::DupHandle(Thread, THREAD_QUERY_INFORMATION | THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT);
++  if (!ThreadDup) {
++    return STATUS_ACCESS_DENIED;
++  }
+ 
+   THREAD_BASIC_INFORMATION Info;
+   if (auto Err = NtQueryInformationThread(*ThreadDup, ThreadBasicInformation, &Info, sizeof(Info), nullptr); Err) {
+@@ -1397,14 +1401,22 @@ NTSTATUS ThreadTerm(HANDLE Thread, LONG ExitCode) {
+   if (!Self) {
+     CONTEXT TmpContext;
+     // If we are suspending a thread that isn't ourselves, try to suspend it first so we know internal JIT locks aren't being held.
+-    NtSuspendThread(*ThreadDup, NULL);
++    if (auto Status = NtSuspendThread(*ThreadDup, NULL); Status) {
++      return Status;
++    }
+     // This will wait for the thread to be suspended
+     TmpContext.ContextFlags = CONTEXT_CONTROL;
+-    NtGetContextThread(*ThreadDup, &TmpContext);
++    if (auto Status = NtGetContextThread(*ThreadDup, &TmpContext); Status) {
++      NtResumeThread(*ThreadDup, nullptr);
++      return Status;
++    }
+   }
+ 
+   const auto [Err, CPUArea] = GetThreadCPUArea(*ThreadDup);
+   if (Err) {
++    if (!Self) {
++      NtResumeThread(*ThreadDup, nullptr);
++    }
+     return Err;
+   }
+ 
+@@ -1423,6 +1435,7 @@ NTSTATUS ThreadTerm(HANDLE Thread, LONG ExitCode) {
+   }
+   auto ThreadState = CPUArea.ThreadState();
+ 
++  auto CRTHeap = GetFrontendThreadData(ThreadState)->CRTHeap;
+   delete GetFrontendThreadData(ThreadState);
+ 
+   // GDT and LDT are mirrored, only free one.
+@@ -1431,9 +1444,7 @@ NTSTATUS ThreadTerm(HANDLE Thread, LONG ExitCode) {
+   FEX::Windows::CallRetStack::DestroyThread(ThreadState);
+   CTX->DestroyThread(ThreadState);
+   ::VirtualFree(reinterpret_cast<void*>(CPUArea.EmulatorStackLimit()), 0, MEM_RELEASE);
+-  if (ThreadTID == GetCurrentThreadId()) {
+-    FEX::Windows::DeinitCRTThread();
+-  }
++  FEX::Windows::DeinitCRTThread(CRTHeap, Self);
+ 
+   return STATUS_SUCCESS;
+ }
+diff --git a/Source/Windows/Common/CRT/CRT.cpp b/Source/Windows/Common/CRT/CRT.cpp
+index addea79d86be10cd4c8446d462620d5ad35abf43..e7dbf0ef1024f4243a8b1ac29b1242b576abe2df 100644
+--- a/Source/Windows/Common/CRT/CRT.cpp
++++ b/Source/Windows/Common/CRT/CRT.cpp
+@@ -4,6 +4,7 @@
+ #include <winternl.h>
+ #include <wine/debug.h>
+ #include <rpmalloc/rpmalloc.h>
++#include "ThreadHeap.h"
+ #include "CRT.h"
+ 
+ extern "C" {
+@@ -55,13 +56,16 @@ void InitCRTProcess() {
+   RunFuncArray(&XLA, &XLZ, nullptr, DLL_PROCESS_ATTACH, nullptr);
+ }
+ 
+-void InitCRTThread() {
++void* InitCRTThread() {
+   rpmalloc_thread_initialize();
+   RunFuncArray(&XLA, &XLZ, nullptr, DLL_THREAD_ATTACH, nullptr);
++  return fex_rpmalloc_thread_heap();
+ }
+ 
+-void DeinitCRTThread() {
+-  RunFuncArray(&XLA, &XLZ, nullptr, DLL_THREAD_DETACH, nullptr);
+-  rpmalloc_thread_finalize();
++void DeinitCRTThread(void*& Heap, bool Self) {
++  if (Self && Heap) {
++    RunFuncArray(&XLA, &XLZ, nullptr, DLL_THREAD_DETACH, nullptr);
++  }
++  fex_rpmalloc_retire_thread_heap(&Heap);
+ }
+ } // namespace FEX::Windows
+diff --git a/Source/Windows/Common/CRT/CRT.h b/Source/Windows/Common/CRT/CRT.h
+index 2283e51a4987a5811162502e28c14332edf91882..5789ee6317d6d2865548fd813707386874547cfd 100644
+--- a/Source/Windows/Common/CRT/CRT.h
++++ b/Source/Windows/Common/CRT/CRT.h
+@@ -3,6 +3,7 @@
+ 
+ namespace FEX::Windows {
+ void InitCRTProcess();
+-void InitCRTThread();
+-void DeinitCRTThread();
++void* InitCRTThread();
++// Called after target quiescence and thread-state destruction. Consumes Heap.
++void DeinitCRTThread(void*& Heap, bool Self);
+ } // namespace FEX::Windows
+diff --git a/Source/Windows/Common/CRT/ThreadHeap.c b/Source/Windows/Common/CRT/ThreadHeap.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..f48488fb14410979c05932a877817df5cf7b662a
+--- /dev/null
++++ b/Source/Windows/Common/CRT/ThreadHeap.c
+@@ -0,0 +1,26 @@
++// SPDX-License-Identifier: MIT
++// Compile the pinned allocator in this translation unit to access its thread
++// heap without changing the submodule or enabling first-class heap semantics.
++#include "rpmalloc/rpmalloc.c"
++#include "ThreadHeap.h"
++
++void* fex_rpmalloc_thread_heap(void) {
++  heap_t* heap = get_thread_heap();
++  return heap != global_heap_default ? heap : 0;
++}
++
++void fex_rpmalloc_retire_thread_heap(void** owner) {
++  heap_t* heap = *owner;
++  *owner = 0;
++  if (!heap) {
++    return;
++  }
++  // Self exit must detach TLS before publishing the heap for reuse. External
++  // exit leaves the caller's TLS alone; the quiescent target cannot use its TLS.
++  if (heap == get_thread_heap()) {
++    set_thread_heap(global_heap_default);
++  }
++  // Like rpmalloc_thread_finalize: queue the heap without freeing live blocks
++  // or changing owner_thread, so cross-thread frees still use deferred lists.
++  heap_release(heap);
++}
+diff --git a/Source/Windows/Common/CRT/ThreadHeap.h b/Source/Windows/Common/CRT/ThreadHeap.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..d45cd502d10c570a1099259e127ff8af202bbf4a
+--- /dev/null
++++ b/Source/Windows/Common/CRT/ThreadHeap.h
+@@ -0,0 +1,17 @@
++// SPDX-License-Identifier: MIT
++#pragma once
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++void* fex_rpmalloc_thread_heap(void);
++
++// The owner slot must be exclusively held, and the target must never allocate
++// again. Release only after destroying its thread state. Live blocks survive.
++// Consumes the slot; repeated retirement of the consumed slot is a no-op.
++void fex_rpmalloc_retire_thread_heap(void** owner);
++
++#ifdef __cplusplus
++}
++#endif
+diff --git a/Source/Windows/Common/Threads.cpp b/Source/Windows/Common/Threads.cpp
+index 4247ac59290254da8f49ecc2dd7e39c722daba0d..d225c1d6dcf5b208f05569b23707a9da7e4e8b4a 100644
+--- a/Source/Windows/Common/Threads.cpp
++++ b/Source/Windows/Common/Threads.cpp
+@@ -87,9 +87,9 @@ namespace WinThreadImpl {
+         NtSetInformationThread(NtCurrentThread(), ThreadBasePriority, &Priority, sizeof(Priority));
+       }
+       // do initialization we skipped earlier here around the user entrypoint
+-      FEX::Windows::InitCRTThread();
++      auto CRTHeap = FEX::Windows::InitCRTThread();
+       This->ReturnValue = This->UserFunc(This->UserArg);
+-      FEX::Windows::DeinitCRTThread();
++      FEX::Windows::DeinitCRTThread(CRTHeap, true);
+       NtTerminateThread(GetCurrentThread(), 0);
+     }
+ 
+diff --git a/Source/Windows/WOW64/Module.cpp b/Source/Windows/WOW64/Module.cpp
+index 219c706e55ec101375fa1ef82cdb50ffbef1a6d7..0b77a33ab6985e813753462558af558d33a0b7b3 100644
+--- a/Source/Windows/WOW64/Module.cpp
++++ b/Source/Windows/WOW64/Module.cpp
+@@ -115,12 +115,14 @@ WOW64_CONTEXT* GetWow64Context() {
+ }
+ 
+ struct FrontendThreadData {
++  void* CRTHeap {};
+   bool InCrossProcessWork {};
+   FEX::Windows::InvalidationTracker::PendingMemoryChange PendingMemoryChange {};
+   bool InLockedRWXRead {};
+   CHPE_V2_CPU_AREA_INFO CpuArea {};
+ 
+-  FrontendThreadData(const TLS& TLS) {
++  FrontendThreadData(const TLS& TLS, void* Heap)
++    : CRTHeap {Heap} {
+     CpuArea.SuspendDoorbell = reinterpret_cast<ULONG*>(&TLS.ThreadState()->CurrentFrame->SuspendDoorbell);
+     TLS.CpuArea() = &CpuArea;
+   }
+@@ -665,7 +667,7 @@ void BTCpuProcessTerm(HANDLE Handle, BOOL After, ULONG Status) {}
+ void BTCpuThreadInit() {
+   static constexpr size_t DefaultWow64CS {4};
+   std::scoped_lock Lock(ThreadCreationMutex);
+-  FEX::Windows::InitCRTThread();
++  auto CRTHeap = FEX::Windows::InitCRTThread();
+   auto* Thread = CTX->CreateThread();
+ 
+   // Default segment setup.
+@@ -691,7 +693,7 @@ void BTCpuThreadInit() {
+   const auto TLS = GetTLS();
+   TLS.ThreadState() = Thread;
+ 
+-  Thread->FrontendPtr = new FrontendThreadData(TLS);
++  Thread->FrontendPtr = new FrontendThreadData(TLS, CRTHeap);
+ 
+   auto ThreadTID = GetCurrentThreadId();
+   Threads.emplace(ThreadTID, Thread);
+@@ -706,6 +708,9 @@ void BTCpuThreadTerm(HANDLE Thread, LONG ExitCode) {
+   }
+ 
+   auto ThreadDup = FEX::Windows::DupHandle(Thread, THREAD_QUERY_INFORMATION | THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT);
++  if (!ThreadDup) {
++    return;
++  }
+ 
+   THREAD_BASIC_INFORMATION Info;
+   if (auto Err = NtQueryInformationThread(*ThreadDup, ThreadBasicInformation, &Info, sizeof(Info), nullptr); Err) {
+@@ -718,14 +723,22 @@ void BTCpuThreadTerm(HANDLE Thread, LONG ExitCode) {
+   if (!Self) {
+     CONTEXT TmpContext;
+     // If we are suspending a thread that isn't ourselves, try to suspend it first so we know internal JIT locks aren't being held.
+-    RtlWow64SuspendThread(*ThreadDup, NULL);
++    if (auto Status = RtlWow64SuspendThread(*ThreadDup, NULL); Status) {
++      return;
++    }
+     // This will wait for the thread to be suspended
+     TmpContext.ContextFlags = CONTEXT_CONTROL;
+-    NtGetContextThread(*ThreadDup, &TmpContext);
++    if (auto Status = NtGetContextThread(*ThreadDup, &TmpContext); Status) {
++      NtResumeThread(*ThreadDup, nullptr);
++      return;
++    }
+   }
+ 
+   auto [Err, TLS] = GetThreadTLS(*ThreadDup);
+   if (Err) {
++    if (!Self) {
++      NtResumeThread(*ThreadDup, nullptr);
++    }
+     return;
+   }
+ 
+@@ -745,6 +758,7 @@ void BTCpuThreadTerm(HANDLE Thread, LONG ExitCode) {
+   auto ThreadState = TLS.ThreadState();
+ 
+   TLS.CpuArea() = nullptr;
++  auto CRTHeap = GetFrontendThreadData(ThreadState)->CRTHeap;
+   delete GetFrontendThreadData(ThreadState);
+ 
+   // GDT and LDT are mirrored, only free one.
+@@ -752,9 +766,7 @@ void BTCpuThreadTerm(HANDLE Thread, LONG ExitCode) {
+ 
+   FEX::Windows::CallRetStack::DestroyThread(ThreadState);
+   CTX->DestroyThread(ThreadState);
+-  if (Self) {
+-    FEX::Windows::DeinitCRTThread();
+-  }
++  FEX::Windows::DeinitCRTThread(CRTHeap, Self);
+ }
+ 
+ void* BTCpuGetBopCode() {
+diff --git a/Source/Windows/include/winternl.h b/Source/Windows/include/winternl.h
+index 2534ee48119209127b473cb8b26539f21339b24b..f4d9b94e1c9315c3884233b6f0f20b0f108dd577 100644
+--- a/Source/Windows/include/winternl.h
++++ b/Source/Windows/include/winternl.h
+@@ -556,6 +556,7 @@ NTSTATUS WINAPI NtQueryVirtualMemory(HANDLE, LPCVOID, MEMORY_INFORMATION_CLASS,
+ NTSTATUS WINAPI NtRaiseException(EXCEPTION_RECORD*, CONTEXT*, BOOL);
+ NTSTATUS WINAPI NtReadFile(HANDLE, HANDLE, PIO_APC_ROUTINE, PVOID, PIO_STATUS_BLOCK, PVOID, ULONG, PLARGE_INTEGER, PULONG);
+ NTSTATUS WINAPI NtSetContextThread(HANDLE, const CONTEXT*);
++NTSTATUS WINAPI NtResumeThread(HANDLE, PULONG);
+ NTSTATUS WINAPI NtSuspendThread(HANDLE, PULONG);
+ NTSTATUS WINAPI NtTerminateProcess(HANDLE, LONG);
+ NTSTATUS WINAPI NtTerminateThread(HANDLE, LONG);

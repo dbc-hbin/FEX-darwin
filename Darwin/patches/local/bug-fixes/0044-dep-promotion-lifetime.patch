@@ -1,0 +1,45 @@
+Subject: [PATCH] dep promotion lifetime
+
+Retire stale DEP promotion metadata when protections or mappings change.
+
+Source: local macOS Wine queue; see ../../README.md for ancestry and dependencies.
+License: ../LICENSE (MIT)
+
+diff --git a/Source/Windows/Common/InvalidationTracker.cpp b/Source/Windows/Common/InvalidationTracker.cpp
+index c4218228bb123a44ae2eb1b9a445fb39d8d3829f..08fff541ce8ce7eb24d1eee998ff885b7d977015 100644
+--- a/Source/Windows/Common/InvalidationTracker.cpp
++++ b/Source/Windows/Common/InvalidationTracker.cpp
+@@ -68,6 +68,8 @@ void InvalidationTracker::HandleMemoryProtectionNotification(uint64_t Address, u
+       }
+       if (DEPDisabled && !HasExec) {
+         DEPPromotedIntervals.Insert(ProtInterval);
++      } else {
++        DEPPromotedIntervals.Remove(ProtInterval);
+       }
+       return true;
+     } else if (XIntervals.Intersect(ProtInterval)) {
+@@ -199,6 +201,7 @@ void InvalidationTracker::InvalidateSection(const ContainingSection& Section) {
+   std::unique_lock Lock(IntervalsLock);
+   XIntervals.Remove({SectionBase, SectionBase + SectionSize});
+   RWXIntervals.Remove({SectionBase, SectionBase + SectionSize});
++  DEPPromotedIntervals.Remove({SectionBase, SectionBase + SectionSize});
+ }
+ 
+ void InvalidationTracker::InvalidateAlignedInterval(uint64_t Address, uint64_t Size, bool Free) {
+@@ -216,6 +219,7 @@ void InvalidationTracker::InvalidateAlignedInterval(uint64_t Address, uint64_t S
+     std::unique_lock Lock(IntervalsLock);
+     XIntervals.Remove({AlignedBase, AlignedBase + AlignedSize});
+     RWXIntervals.Remove({AlignedBase, AlignedBase + AlignedSize});
++    DEPPromotedIntervals.Remove({AlignedBase, AlignedBase + AlignedSize});
+   }
+ }
+ 
+@@ -303,6 +307,8 @@ void InvalidationTracker::ResyncRange(uint64_t Address, uint64_t Size) {
+         }
+         if (DEPDisabled && !HasExec) {
+           DEPPromotedIntervals.Insert(Region);
++        } else {
++          DEPPromotedIntervals.Remove(Region);
+         }
+       } else {
+         XIntervals.Remove(Region);

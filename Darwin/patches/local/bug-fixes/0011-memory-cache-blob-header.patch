@@ -1,0 +1,20 @@
+Subject: [PATCH] memory cache blob header
+
+Preserve the fixed header when promoting a disk blob into memory.
+
+Source: local macOS Wine queue; see ../../README.md for ancestry and dependencies.
+License: ../LICENSE (MIT)
+
+diff --git a/FEXCore/Source/Interface/Core/DiskCache.cpp b/FEXCore/Source/Interface/Core/DiskCache.cpp
+index 865a07bc0bcd0836f5a3e2274538fffbec4862eb..1b74348b8cf75bfeadb0f297b0830478a7144c26 100644
+--- a/FEXCore/Source/Interface/Core/DiskCache.cpp
++++ b/FEXCore/Source/Interface/Core/DiskCache.cpp
+@@ -897,7 +897,7 @@ namespace DiskCache {
+ 
+     if (StoreInMemory) {
+       auto NewBlobRef = fextl::make_shared<fextl::vector<uint8_t>>(EntrySizeWithoutGuestCode);
+-      memcpy(NewBlobRef->data(), HitData.Blob.data() + BlobOffset, EntrySizeWithoutGuestCode);
++      memcpy(NewBlobRef->data(), HitData.Blob.data() + BlobOffset - sizeof(Header), EntrySizeWithoutGuestCode);
+       std::lock_guard Guard(IndexLock);
+       auto CurrentIndexEntry = LookupLocked(LookupKey, Header.GuestHash, LastFootprintHashed);
+       if (CurrentIndexEntry && !CurrentIndexEntry->MemoryBlob) {

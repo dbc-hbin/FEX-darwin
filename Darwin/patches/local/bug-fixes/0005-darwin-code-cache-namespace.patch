@@ -1,0 +1,25 @@
+Subject: [PATCH] darwin code cache namespace
+
+Separate Darwin generated-code cache identity from upstream.
+
+Source: local macOS Wine queue; see ../../README.md for ancestry and dependencies.
+License: ../LICENSE (MIT)
+
+diff --git a/FEXCore/Source/Interface/Core/DiskCache.h b/FEXCore/Source/Interface/Core/DiskCache.h
+index 67f837b2..bc31f5e9 100644
+--- a/FEXCore/Source/Interface/Core/DiskCache.h
++++ b/FEXCore/Source/Interface/Core/DiskCache.h
+@@ -246,10 +246,9 @@ namespace DiskCache {
+   };
+ 
+   static constexpr uint16_t AnonPrefixGuestBytes = 64;
+-  // The current version of the diskcache.
+-  // This must be changed any time codegen changes occur!
+-  // Be aware of the impact of changing this frequently!
+-  static constexpr uint16_t FormatVersion = 44;
++  // Darwin code generation uses a separate cache namespace from upstream.
++  // Change this whenever local or upstream code generation changes.
++  static constexpr uint16_t FormatVersion = 0xA633;
+ 
+   static constexpr uint32_t LOOKUP_KEY_MAX_BUCKET_DEPTH = 500;
+ 

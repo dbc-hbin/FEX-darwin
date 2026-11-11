@@ -1,0 +1,60 @@
+Subject: [PATCH] lookup tag validity
+
+Never treat an empty guest lookup tag as a valid code target.
+
+Source: local macOS Wine queue; see ../../README.md for ancestry and dependencies.
+License: ../LICENSE (MIT)
+
+diff --git a/FEXCore/Source/Interface/Core/JIT/BranchOps.cpp b/FEXCore/Source/Interface/Core/JIT/BranchOps.cpp
+index 66c93f09661619bdd73e7d487c4134d4cf6e5b73..2dbc1073e72975daf13692378fa852004ce73b93 100644
+--- a/FEXCore/Source/Interface/Core/JIT/BranchOps.cpp
++++ b/FEXCore/Source/Interface/Core/JIT/BranchOps.cpp
+@@ -197,9 +197,12 @@ DEF_OP(ExitFunction) {
+ 
+     if (Op->Hint == IR::BranchHint::Return) {
+       // First try to pop from the call-ret stack, otherwise follow the normal path (but ending in a ret)
++      ARMEmitter::ForwardLabel LookupL1;
+       ldp<ARMEmitter::IndexType::POST>(TMP1, TMP2, REG_CALLRET_SP, 0x10);
++      (void)cbz(ARMEmitter::Size::i64Bit, TMP1, &LookupL1);
+       sub(TMP1, TMP1, RipReg.X());
+       (void)cbz(ARMEmitter::Size::i64Bit, TMP1, &SkipFullLookup);
++      (void)Bind(&LookupL1);
+     }
+ 
+     // L1 Cache
+@@ -212,9 +215,13 @@ DEF_OP(ExitFunction) {
+ 
+     ldp<ARMEmitter::IndexType::OFFSET>(TMP2, TMP1, TMP1, 0);
+ 
++    // Zero is the invalid tag, even when the requested RIP is zero.
++    ARMEmitter::ForwardLabel L1Miss;
++    (void)cbz(ARMEmitter::Size::i64Bit, TMP1, &L1Miss);
+     // Note: sub+cbnz used over cmp+br to preserve flags.
+     sub(TMP1, TMP1, RipReg.X());
+     (void)cbz(ARMEmitter::Size::i64Bit, TMP1, &SkipFullLookup);
++    (void)Bind(&L1Miss);
+     ldr(TMP2, STATE, offsetof(FEXCore::Core::CpuStateFrame, Pointers.DispatcherLoopTop));
+     str(RipReg.X(), STATE, offsetof(FEXCore::Core::CpuStateFrame, State.rip));
+ 
+diff --git a/FEXCore/Source/Interface/Core/LookupCache.h b/FEXCore/Source/Interface/Core/LookupCache.h
+index 1849d573c76a207c3b207998fd8379a2fbbcc297..5c845d0f8a0f6a6d2fef28ad76f3caf44aa380bf 100644
+--- a/FEXCore/Source/Interface/Core/LookupCache.h
++++ b/FEXCore/Source/Interface/Core/LookupCache.h
+@@ -181,7 +181,7 @@ public:
+   uintptr_t FindBlock(FEXCore::Core::InternalThreadState* Thread, uint64_t Address) {
+     // Try L1, no lock needed
+     auto& L1Entry = reinterpret_cast<LookupCacheEntry*>(L1Pointer)[Address & L1PointerMask];
+-    if (L1Entry.GuestCode == Address) {
++    if (const auto GuestCode = L1Entry.GuestCode; GuestCode && GuestCode == Address) {
+       return L1Entry.HostCode;
+     }
+ 
+@@ -206,7 +206,7 @@ public:
+           // Find there pointer for the address in the blocks
+           auto BlockPointers = reinterpret_cast<LookupCacheEntry*>(LocalPagePointer);
+ 
+-          if (BlockPointers[PageOffset].GuestCode == Address) {
++          if (const auto GuestCode = BlockPointers[PageOffset].GuestCode; GuestCode && GuestCode == Address) {
+             L1Entry.GuestCode = Address;
+             L1Entry.HostCode = BlockPointers[PageOffset].HostCode;
+             HostPtr = L1Entry.HostCode;
